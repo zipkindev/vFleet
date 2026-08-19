@@ -161,7 +161,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -198,6 +198,16 @@ def health(request: Request) -> dict:
 @app.get("/api/version")
 def version() -> dict:
     return {"version": APP_VERSION}
+
+
+@app.get("/api/changelog")
+def changelog() -> dict:
+    changelog_path = Path(__file__).resolve().parents[2] / "CHANGELOG.md"
+    try:
+        text = changelog_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = "No changelog available."
+    return {"content": text}
 
 
 @app.get("/api/connection", response_model=ConnectionInfo, dependencies=[Depends(require_token)])

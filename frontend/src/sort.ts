@@ -161,6 +161,22 @@ function machineCellText(vm: VirtualMachine, key: MachineSortKey): string {
   }
 }
 
+function machineNumericValues(vm: VirtualMachine, key: MachineSortKey): number[] | undefined {
+  switch (key) {
+    case "cpu_count":
+      return [vm.cpu_count];
+    case "memory_mib":
+      return [vm.memory_mib / 1024];
+    case "storage_provisioned_bytes":
+      return [storageGib(vm.storage_provisioned_bytes)];
+    case "last_activity":
+      // ISO timestamp text contains many incidental numbers; block numeric operators entirely.
+      return [];
+    default:
+      return undefined;
+  }
+}
+
 function reclaimCellText(vm: VirtualMachine, key: ReclaimSortKey): string {
   switch (key) {
     case "name":
@@ -182,14 +198,29 @@ function reclaimCellText(vm: VirtualMachine, key: ReclaimSortKey): string {
   }
 }
 
-export function matchesColumnFilter(haystack: string, query: string): boolean {
+function reclaimNumericValues(vm: VirtualMachine, key: ReclaimSortKey): number[] | undefined {
+  switch (key) {
+    case "idle_score":
+      return [vm.idle_score];
+    case "memory_mib":
+      return [vm.cpu_count, vm.memory_mib / 1024];
+    case "storage_provisioned_bytes":
+      return [storageGib(vm.storage_provisioned_bytes)];
+    case "days_idle":
+      return vm.days_idle != null ? [vm.days_idle] : [];
+    default:
+      return undefined;
+  }
+}
+
+export function matchesColumnFilter(haystack: string, query: string, numericValues?: number[]): boolean {
   const raw = query.trim();
   if (!raw) return true;
   const compare = raw.match(/^(>=|<=|!=|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$/);
   if (compare) {
     const op = compare[1];
     const target = Number(compare[2]);
-    const numbers = [...haystack.matchAll(/-?\d+(?:\.\d+)?/g)].map((match) => Number(match[0]));
+    const numbers = numericValues ?? [...haystack.matchAll(/-?\d+(?:\.\d+)?/g)].map((match) => Number(match[0]));
     if (!numbers.length) return false;
     return numbers.some((value) => {
       if (op === ">") return value > target;
@@ -206,11 +237,15 @@ export function matchesColumnFilter(haystack: string, query: string): boolean {
 export function filterMachines(vms: VirtualMachine[], filters: MachineFilters): VirtualMachine[] {
   const active = (Object.entries(filters) as [MachineSortKey, string][]).filter(([, value]) => value.trim());
   if (!active.length) return vms;
-  return vms.filter((vm) => active.every(([key, query]) => matchesColumnFilter(machineCellText(vm, key), query)));
+  return vms.filter((vm) =>
+    active.every(([key, query]) => matchesColumnFilter(machineCellText(vm, key), query, machineNumericValues(vm, key))),
+  );
 }
 
 export function filterReclaimVms(vms: VirtualMachine[], filters: ReclaimFilters): VirtualMachine[] {
   const active = (Object.entries(filters) as [ReclaimSortKey, string][]).filter(([, value]) => value.trim());
   if (!active.length) return vms;
-  return vms.filter((vm) => active.every(([key, query]) => matchesColumnFilter(reclaimCellText(vm, key), query)));
+  return vms.filter((vm) =>
+    active.every(([key, query]) => matchesColumnFilter(reclaimCellText(vm, key), query, reclaimNumericValues(vm, key))),
+  );
 }

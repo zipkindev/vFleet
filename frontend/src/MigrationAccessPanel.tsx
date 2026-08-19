@@ -14,6 +14,8 @@ export function MigrationAccessPanel({ clusters, jobId, onDone }: Props) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirmScope, setConfirmScope] = useState<"cluster" | "global" | null>(null);
+  const [expanded, setExpanded] = useState(true);
+  const [showHelp, setShowHelp] = useState(false);
 
   async function load(id = clusterId) {
     setError("");
@@ -53,157 +55,181 @@ export function MigrationAccessPanel({ clusters, jobId, onDone }: Props) {
   const clusterName = status?.cluster_name || clusters.find((item) => item.id === clusterId)?.name || "the cluster";
 
   return (
-    <div className="panel">
-      <header>
-        <div>
+    <div className={`panel collapsible-panel${expanded ? " is-expanded" : ""}`}>
+      {/* Clickable header row — toggles the whole panel open/closed */}
+      <header className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+        <div className="collapsible-title">
+          <span className={`chevron${expanded ? " open" : ""}`}>›</span>
           <h2>vMotion / migration access</h2>
-          <p>
-            Host migrate is controlled by <strong>vCenter roles</strong>, not a datastore setting. A user who already
-            has Administrator (or Authorization.ModifyRoles + ModifyPermissions) can enable it in the vSphere Client
-            for everyone (global) or for one account on a cluster.
-          </p>
         </div>
-      </header>
-      {error ? <div className="banner bad">{error}</div> : null}
-      {status?.message ? <p className="migrate-summary">{status.message}</p> : null}
-
-      <div className="howto">
-        <h3>Manual setup in the vSphere Client</h3>
-        <p>
-          Sign in as an admin. Current vFleet user: <strong>{principal}</strong>. Privileges to include:
-        </p>
-        <ul className="howto-privs">
-          <li>
-            <code>Resource.HotMigrate</code> — vMotion while the VM is on
-          </li>
-          <li>
-            <code>Resource.ColdMigrate</code> — move or Thick→Thin while the VM is off
-          </li>
-          <li>
-            <code>Resource.QueryVMotion</code> — compatibility checks
-          </li>
-          <li>
-            <code>Datastore.Relocate</code> — Storage vMotion / change datastore
-          </li>
-          <li>
-            <code>Datastore.AllocateSpace</code> — allocate space on the destination datastore
-          </li>
-          <li>
-            <code>Network.Assign</code> — only if you remap NICs during migrate
-          </li>
-        </ul>
-
-        <div className="howto-cols">
-          <section>
-            <h4>1. Create or edit a role</h4>
-            <ol>
-              <li>
-                Menu → <strong>Administration</strong> → <strong>Access Control</strong> → <strong>Roles</strong>
-              </li>
-              <li>
-                Clone an existing operator role, or click <strong>New</strong> (name it e.g. <code>vFleet-Migrate</code>)
-              </li>
-              <li>
-                Enable the privileges above. They live under <strong>Resource</strong>, <strong>Datastore</strong>, and{" "}
-                <strong>Network</strong>
-              </li>
-              <li>
-                Save. Do not use the built-in Read-only role; it cannot be edited
-              </li>
-            </ol>
-          </section>
-          <section>
-            <h4>2a. One user, one cluster (typical)</h4>
-            <ol>
-              <li>
-                Hosts and Clusters → select cluster <strong>{clusterName}</strong> (or the VM folder)
-              </li>
-              <li>
-                Permissions tab → <strong>Add</strong>
-              </li>
-              <li>
-                User/group: the vFleet service account (<strong>{principal}</strong>), not your personal SSO unless that
-                is the login vFleet uses
-              </li>
-              <li>
-                Role: the role from step 1
-              </li>
-              <li>
-                Check <strong>Propagate to children</strong> so VMs inherit it
-              </li>
-              <li>
-                OK, then Recheck below. Cancel any retrying migrate job and queue it again
-              </li>
-            </ol>
-          </section>
-          <section>
-            <h4>2b. Global (every object this user can see)</h4>
-            <ol>
-              <li>
-                Menu → <strong>Administration</strong> → <strong>Access Control</strong> →{" "}
-                <strong>Global Permissions</strong>
-              </li>
-              <li>
-                Add → same user as the vFleet login → the migrate role
-              </li>
-              <li>
-                Check <strong>Propagate to children</strong>
-              </li>
-              <li>
-                This is still per-user (or AD group). It is not a cluster-wide “turn on vMotion for everyone” switch.
-                To cover a team, assign an AD/SSO <strong>group</strong> instead of a single user
-              </li>
-            </ol>
-          </section>
-        </div>
-        <p className="howto-note">
-          Host-level vMotion also needs a VMkernel adapter with vMotion enabled on the ESXi hosts. Privilege errors look
-          like <code>Resource.ColdMigrate</code> / <code>HotMigrate</code>; a missing vMotion NIC fails later with a
-          different fault.
-        </p>
-      </div>
-
-      <div className="login-grid" style={{ gridTemplateColumns: "1fr auto" }}>
-        <label>
-          Cluster
-          <select value={clusterId} onChange={(event) => setClusterId(event.target.value)}>
-            {clusters.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="header-meta-actions" style={{ alignSelf: "end" }}>
-          <button className="ghost" type="button" onClick={() => void load()} disabled={busy}>
-            Recheck
+        <div className="collapsible-header-actions" onClick={(e) => e.stopPropagation()}>
+          <button
+            className="help-btn"
+            type="button"
+            title="Manual setup instructions"
+            onClick={() => setShowHelp(true)}
+          >
+            ?
           </button>
         </div>
-      </div>
-      <ul className="priv-list">
-        {(status?.privileges ?? []).map((item) => (
-          <li key={item.id} className={item.granted ? "ok" : "missing"}>
-            <strong>{item.granted ? "Granted" : "Missing"}</strong>
-            <span>
-              {item.label}
-              <small className="sub">{item.id}</small>
-            </span>
-          </li>
-        ))}
-      </ul>
-      <p className="empty">
-        Optional: if this vSphere login already has permission-admin rights, the buttons below assign{" "}
-        <code>vFleet-Migrate</code> to <strong>{principal}</strong> without opening the vSphere Client.
-      </p>
-      <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
-        <button className="accent" type="button" disabled={busy} onClick={() => setConfirmScope("cluster")}>
-          Enable on cluster
-        </button>
-        <button className="ghost" type="button" disabled={busy} onClick={() => setConfirmScope("global")}>
-          Enable globally
-        </button>
-      </div>
-      {missing.length === 0 && status ? <p className="empty">Migrate privileges look present on this object.</p> : null}
+      </header>
+
+      {expanded && (
+        <div className="panel-body">
+          {error ? <div className="banner bad">{error}</div> : null}
+          {status?.message ? <p className="migrate-summary">{status.message}</p> : null}
+
+          <div className="login-grid" style={{ gridTemplateColumns: "1fr auto" }}>
+            <label>
+              Cluster
+              <select value={clusterId} onChange={(event) => setClusterId(event.target.value)}>
+                {clusters.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="header-meta-actions" style={{ alignSelf: "end" }}>
+              <button className="ghost" type="button" onClick={() => void load()} disabled={busy}>
+                Recheck
+              </button>
+            </div>
+          </div>
+
+          <ul className="priv-list">
+            {(status?.privileges ?? []).map((item) => (
+              <li key={item.id} className={item.granted ? "ok" : "missing"}>
+                <strong>{item.granted ? "Granted" : "Missing"}</strong>
+                <span>
+                  {item.label}
+                  <small className="sub">{item.id}</small>
+                </span>
+              </li>
+            ))}
+          </ul>
+
+          <p className="empty">
+            Optional: if this vSphere login already has permission-admin rights, the buttons below assign{" "}
+            <code>vFleet-Migrate</code> to <strong>{principal}</strong> without opening the vSphere Client.
+          </p>
+          <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
+            <button className="accent" type="button" disabled={busy} onClick={() => setConfirmScope("cluster")}>
+              Enable on cluster
+            </button>
+            <button className="ghost" type="button" disabled={busy} onClick={() => setConfirmScope("global")}>
+              Enable globally
+            </button>
+          </div>
+          {missing.length === 0 && status ? (
+            <p className="empty">Migrate privileges look present on this object.</p>
+          ) : null}
+        </div>
+      )}
+
+      {/* Help modal — nearly full-screen */}
+      {showHelp && (
+        <div className="modal-back" onClick={() => setShowHelp(false)}>
+          <div className="modal howto-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Manual setup in the vSphere Client</h3>
+              <button className="icon-btn" type="button" onClick={() => setShowHelp(false)} title="Close">
+                ✕
+              </button>
+            </div>
+            <div className="howto-modal-body">
+              <p>
+                Sign in as an admin. Current vFleet user: <strong>{principal}</strong>. Privileges to include:
+              </p>
+              <ul className="howto-privs">
+                <li>
+                  <code>Resource.HotMigrate</code> — vMotion while the VM is on
+                </li>
+                <li>
+                  <code>Resource.ColdMigrate</code> — move or Thick→Thin while the VM is off
+                </li>
+                <li>
+                  <code>Resource.QueryVMotion</code> — compatibility checks
+                </li>
+                <li>
+                  <code>Datastore.Relocate</code> — Storage vMotion / change datastore
+                </li>
+                <li>
+                  <code>Datastore.AllocateSpace</code> — allocate space on the destination datastore
+                </li>
+                <li>
+                  <code>Network.Assign</code> — only if you remap NICs during migrate
+                </li>
+              </ul>
+
+              <div className="howto-cols">
+                <section>
+                  <h4>1. Create or edit a role</h4>
+                  <ol>
+                    <li>
+                      Menu → <strong>Administration</strong> → <strong>Access Control</strong> →{" "}
+                      <strong>Roles</strong>
+                    </li>
+                    <li>
+                      Clone an existing operator role, or click <strong>New</strong> (name it e.g.{" "}
+                      <code>vFleet-Migrate</code>)
+                    </li>
+                    <li>
+                      Enable the privileges above. They live under <strong>Resource</strong>,{" "}
+                      <strong>Datastore</strong>, and <strong>Network</strong>
+                    </li>
+                    <li>Save. Do not use the built-in Read-only role; it cannot be edited</li>
+                  </ol>
+                </section>
+                <section>
+                  <h4>2a. One user, one cluster (typical)</h4>
+                  <ol>
+                    <li>
+                      Hosts and Clusters → select cluster <strong className="cluster-badge">{clusterName}</strong> (or
+                      the VM folder)
+                    </li>
+                    <li>
+                      Permissions tab → <strong>Add</strong>
+                    </li>
+                    <li>
+                      User/group: the vFleet service account (<strong>{principal}</strong>), not your personal SSO
+                      unless that is the login vFleet uses
+                    </li>
+                    <li>Role: the role from step 1</li>
+                    <li>
+                      Check <strong>Propagate to children</strong> so VMs inherit it
+                    </li>
+                    <li>OK, then Recheck below. Cancel any retrying migrate job and queue it again</li>
+                  </ol>
+                </section>
+                <section>
+                  <h4>2b. Global (every object this user can see)</h4>
+                  <ol>
+                    <li>
+                      Menu → <strong>Administration</strong> → <strong>Access Control</strong> →{" "}
+                      <strong>Global Permissions</strong>
+                    </li>
+                    <li>Add → same user as the vFleet login → the migrate role</li>
+                    <li>
+                      Check <strong>Propagate to children</strong>
+                    </li>
+                    <li>
+                      This is still per-user (or AD group). It is not a cluster-wide "turn on vMotion for everyone"
+                      switch. To cover a team, assign an AD/SSO <strong>group</strong> instead of a single user
+                    </li>
+                  </ol>
+                </section>
+              </div>
+
+              <p className="howto-note">
+                Host-level vMotion also needs a VMkernel adapter with vMotion enabled on the ESXi hosts. Privilege
+                errors look like <code>Resource.ColdMigrate</code> / <code>HotMigrate</code>; a missing vMotion NIC
+                fails later with a different fault.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {confirmScope ? (
         <div className="modal-back" onClick={() => !busy && setConfirmScope(null)}>
@@ -211,8 +237,8 @@ export function MigrationAccessPanel({ clusters, jobId, onDone }: Props) {
             <h2>Assign vFleet-Migrate?</h2>
             <p>
               This assigns role <code>vFleet-Migrate</code> to <strong>{status?.principal}</strong> on{" "}
-              {confirmScope === "global" ? "the vCenter root folder (all inventory)" : status?.cluster_name || "the cluster"},
-              propagating to child VMs. Existing Administrator on that object is left alone. If this login only has
+              {confirmScope === "global" ? "the vCenter root folder (all inventory)" : status?.cluster_name || "the cluster"}
+              , propagating to child VMs. Existing Administrator on that object is left alone. If this login only has
               ModifyPermissions on a subset of the tree, the API call will fail instead of silently escalating.
             </p>
             {jobId ? <p>After grant, the failed migrate job will be requeued.</p> : null}

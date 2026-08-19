@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.2] — 2026-08-19
+
+chore: add auto-version bump hook system
+
+- 6 files changed, 654 insertions(+), 181 deletions(-) · backend/app/main.py, frontend/src/App.tsx, frontend/src/ChangelogModal.tsx, frontend/src/MigrationAccessPanel.tsx, frontend/src/sort.ts, frontend/src/styles.css, …
+
 ## [1.0.1] — 2026-08-19
 
 release: vFleet v1.0.0 — initial major release

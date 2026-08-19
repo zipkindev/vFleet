@@ -91,7 +91,8 @@ select {
   background: var(--accent);
   border-radius: 6px;
   padding: 2px 6px;
-  text-decoration: none;
+  border: none;
+  cursor: pointer;
   opacity: 0.85;
   transition: opacity 0.15s;
   white-space: nowrap;
@@ -251,6 +252,25 @@ main {
   display: grid;
   grid-template-columns: 1fr 96px;
   gap: 10px;
+}
+
+.panel-body .login-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.panel-body .login-grid select {
+  width: auto;
+  max-width: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 7px 10px;
+  color: var(--ink);
+  appearance: auto;
 }
 
 .check {
@@ -419,61 +439,218 @@ main {
   font-weight: 400;
 }
 
-.howto {
-  margin-top: 12px;
-  padding: 14px 16px 8px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
+/* ── Collapsible panel ─────────────────────────────────────────── */
+.collapsible-panel {
+  overflow: hidden;
+}
+
+.panel .collapsible-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  cursor: pointer;
+  user-select: none;
+  gap: 10px;
+  border-bottom: 1px solid transparent;
+  transition: background 0.15s;
+}
+
+.panel.collapsible-panel.is-expanded .collapsible-header {
+  border-bottom-color: var(--line);
+}
+
+.collapsible-header:hover {
   background: var(--bg-2);
 }
 
-.howto h3 {
-  margin: 0 0 8px;
-  font-size: 15px;
+.collapsible-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
-.howto h4 {
-  margin: 0 0 8px;
-  font-size: 13px;
-}
-
-.howto ol {
+.collapsible-title h2 {
   margin: 0;
-  padding-left: 18px;
-  color: var(--muted);
-  font-size: 13px;
+  font-size: 18px;
 }
 
-.howto li {
-  margin-bottom: 6px;
+.chevron {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--muted);
+  transition: transform 0.2s;
+  transform: rotate(0deg);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.chevron.open {
+  transform: rotate(90deg);
+}
+
+.collapsible-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.panel-body {
+  padding: 0 18px 18px;
+}
+
+/* ── Help "?" button ───────────────────────────────────────────── */
+.help-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.help-btn:hover {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+
+/* ── Help modal (near-full-screen) ─────────────────────────────── */
+.howto-modal {
+  width: min(1440px, 98vw);
+  height: 94vh;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 28px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.icon-btn:hover {
+  background: var(--bg-2);
+  border-color: var(--line);
+}
+
+.howto-modal-body {
+  overflow-y: auto;
+  padding: 24px 28px 28px;
+  flex: 1;
+}
+
+.howto-modal-body > p:first-child {
+  font-size: 15px;
+  margin: 0 0 18px;
+}
+
+.howto-modal-body h4 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.howto-modal-body ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.howto-modal-body li {
+  margin-bottom: 8px;
 }
 
 .howto-privs {
-  margin: 0 0 14px;
-  padding-left: 18px;
-  font-size: 13px;
+  margin: 0 0 20px;
+  padding-left: 20px;
+  font-size: 14px;
   color: var(--muted);
+  line-height: 1.7;
 }
 
 .howto-privs code,
-.howto code {
+.howto-modal-body code {
   color: var(--ink);
+  font-size: 13px;
 }
 
 .howto-cols {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
-  gap: 14px;
-  margin-bottom: 10px;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+.howto-cols section {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.cluster-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin: 0 2px;
+  border-radius: 999px;
+  background: rgba(214, 242, 97, 0.18);
+  border: 1px solid rgba(214, 242, 97, 0.35);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .howto-note {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--muted);
-  margin: 4px 0 8px;
+  margin: 0 0 8px;
+  padding: 12px 16px;
+  background: var(--bg-2);
+  border-left: 3px solid var(--line);
+  border-radius: 0 8px 8px 0;
+  line-height: 1.6;
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 900px) {
   .howto-cols {
     grid-template-columns: 1fr;
   }
@@ -881,7 +1058,8 @@ tr.nested td:first-child {
   background: rgba(8, 10, 6, 0.72);
   display: grid;
   place-items: center;
-  padding: 24px;
+  padding: 12px;
+  z-index: 50;
 }
 
 .modal {
@@ -1060,4 +1238,119 @@ tr.clickable {
 
 tr.clickable:hover td {
   background: rgba(214, 242, 97, 0.06);
+}
+
+.changelog-modal {
+  width: min(680px, 100%);
+  max-height: min(85vh, 800px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 22px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-header h2 {
+  margin: 0;
+}
+
+.modal-header .ghost {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.modal-header .ghost:hover {
+  color: var(--ink);
+  border-color: var(--muted);
+}
+
+.changelog-body {
+  overflow-y: auto;
+  padding: 20px 22px 24px;
+  flex: 1;
+}
+
+.changelog-body h1 {
+  font-size: 17px;
+  margin: 0 0 6px;
+  color: var(--accent);
+}
+
+.changelog-body h2 {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 20px 0 6px;
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 4px;
+}
+
+.changelog-body h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 14px 0 4px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.changelog-body p {
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.changelog-body ul {
+  margin: 4px 0 10px 16px;
+  padding: 0;
+}
+
+.changelog-body li {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 3px;
+}
+
+.changelog-body strong {
+  color: var(--ink);
+}
+
+.changelog-body code {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  background: rgba(214, 242, 97, 0.1);
+  color: var(--accent);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.changelog-body a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.changelog-body a:hover {
+  text-decoration: underline;
+}
+
+.changelog-body hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 18px 0;
 }

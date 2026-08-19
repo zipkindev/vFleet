@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { fetchCatalog, fetchConnection, fetchInventory, fetchJobs, logout, runActions, setUiToken } from "./api";
 import { BatchCount } from "./BatchCount";
+import { ChangelogModal } from "./ChangelogModal";
 import { BatchLimitDialog } from "./BatchLimitDialog";
 import { BATCH_LIMIT } from "./batch";
 import { CloneVmModal } from "./CloneVmModal";
@@ -69,6 +70,7 @@ export function App() {
   const [actionTargets, setActionTargets] = useState<VirtualMachine[] | null>(null);
   const [batchIntent, setBatchIntent] = useState<"migrate" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
+  const [showChangelog, setShowChangelog] = useState(false);
 
   function openMachinesForOwner(ownerKey: string) {
     setOwnerInput(ownerKey);
@@ -284,15 +286,13 @@ export function App() {
             <strong>vFleet</strong>
             <em>vCenter control</em>
           </div>
-          <a
+          <button
             className="version-badge"
-            href="https://github.com/mizipkin/VCenter_ESXi_Remote/releases"
-            target="_blank"
-            rel="noreferrer"
+            onClick={() => setShowChangelog(true)}
             title={`vFleet v${APP_VERSION} — view release notes`}
           >
             v{APP_VERSION}
-          </a>
+          </button>
         </div>
         <nav>
           {(
@@ -506,6 +506,8 @@ export function App() {
           />
         ) : null}
       </main>
+
+      {showChangelog ? <ChangelogModal onClose={() => setShowChangelog(false)} /> : null}
 
       {showLogin ? (
         <LoginPanel
@@ -1239,6 +1241,28 @@ function ReclaimTable({
   const filtered = useMemo(() => filterReclaimVms(vms, filters), [vms, filters]);
   const sorted = useMemo(() => sortReclaimVms(filtered, sortKey, sortDir), [filtered, sortKey, sortDir]);
   const filterCount = Object.values(filters).filter((value) => value.trim()).length;
+
+  function exportCsv() {
+    const header = ["Name", "Cluster", "Owner", "Score", "vCPU", "CPU %", "Memory (GiB)", "Mem %", "Storage Provisioned (GiB)", "Storage Used (GiB)", "Disk", "Idle (days)", "Why"];
+    const rows = sorted.map((vm) => [
+      vm.name,
+      vm.cluster_name ?? "",
+      vm.owner_key ?? "",
+      String(vm.idle_score),
+      String(vm.cpu_count),
+      vm.cpu_usage_pct.toFixed(1),
+      (vm.memory_mib / 1024).toFixed(2),
+      vm.memory_usage_pct.toFixed(1),
+      (vm.storage_provisioned_bytes / 1073741824).toFixed(2),
+      (vm.storage_used_bytes / 1073741824).toFixed(2),
+      vm.disk_provisioning ?? "",
+      vm.days_idle != null ? vm.days_idle.toFixed(0) : "",
+      vm.reclaim_reason ?? "",
+    ]);
+    const csv = [header, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+    const label = filterCount ? `reclaim-filtered-${sorted.length}` : "reclaim-all";
+    downloadText(`${label}.csv`, csv);
+  }
   const memory = sorted.reduce((sum, vm) => sum + vm.memory_mib, 0);
   const cpu = sorted.reduce((sum, vm) => sum + vm.cpu_count, 0);
   const storage = sorted.reduce((sum, vm) => sum + vm.storage_provisioned_bytes, 0);
@@ -1266,6 +1290,9 @@ function ReclaimTable({
             ) : null}
             <button className="text" onClick={() => onSelectVisible(sorted)} disabled={sorted.length === 0}>
               Select all
+            </button>
+            <button className="text" onClick={exportCsv} disabled={sorted.length === 0}>
+              Export CSV
             </button>
           </div>
         </div>
