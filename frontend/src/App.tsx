@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchCatalog, fetchConnection, fetchInventory, fetchJobs, logout, runActions, setUiToken } from "./api";
 import { BatchCount } from "./BatchCount";
 import { ChangelogModal } from "./ChangelogModal";
@@ -27,6 +27,8 @@ import {
 } from "./sort";
 import type { ActionName, Catalog, ConnectionInfo, InventorySnapshot, JobList, OwnerReport, VirtualMachine } from "./types";
 import { APP_VERSION } from "./version";
+import { ThemePanel } from "./ThemePanel";
+import { ThemeProvider } from "./ThemeContext";
 
 type View = "overview" | "monitoring" | "hosts" | "machines" | "datastores" | "jobs" | "owners" | "reclaim";
 
@@ -44,6 +46,45 @@ const ACTIONS: { id: ActionName; label: string; danger?: boolean; hint: string }
     hint: "Permanently deletes the VM and its disks from the datastore. Powered-on VMs are powered off first. This cannot be undone",
   },
 ];
+
+function PassphraseField({ onSave }: { onSave: () => void }) {
+  const saved = localStorage.getItem("vfleet.uiToken") ?? "";
+  const [value, setValue] = useState(saved);
+  const dirty = value.trim() !== saved;
+
+  function save() {
+    setUiToken(value.trim());
+    onSave();
+  }
+
+  return (
+    <div className="settings-section">
+      <label
+        className="token settings-token"
+        title="Protects this dashboard from other users on the same network. Set a passphrase here and in VFLEET_UI_TOKEN on the server — the UI is blocked until the token matches."
+      >
+        <span className="settings-token-label">Dashboard passphrase</span>
+        <div className="passphrase-row">
+          <input
+            type="password"
+            placeholder="optional"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && dirty) save(); }}
+          />
+          {dirty && (
+            <button className="passphrase-save-btn" onClick={save}>
+              Save
+            </button>
+          )}
+        </div>
+        <span className="token-hint">
+          Lock this UI to a passphrase — set the same value in <code>VFLEET_UI_TOKEN</code> on the server.
+        </span>
+      </label>
+    </div>
+  );
+}
 
 export function App() {
   const [view, setView] = useState<View>("overview");
@@ -71,18 +112,31 @@ export function App() {
   const [batchIntent, setBatchIntent] = useState<"migrate" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
   const [showChangelog, setShowChangelog] = useState(false);
+  const [showTheme, setShowTheme] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const themeRef = useRef<HTMLDivElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
 
-  function openMachinesForOwner(ownerKey: string) {
+  const openMachinesForOwner = useCallback((ownerKey: string) => {
     setOwnerInput(ownerKey);
     setOwner(ownerKey);
     setView("machines");
+  }, []);
+
+  function setIfChanged<T>(setter: React.Dispatch<React.SetStateAction<T>>) {
+    return (next: T) => setter((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
   }
 
   async function load() {
+    const setDataIfChanged = setIfChanged(setData);
+    const setConnectionIfChanged = setIfChanged(setConnection);
+    const setCatalogIfChanged = setIfChanged(setCatalog);
+    const setJobsIfChanged = setIfChanged(setJobs);
+
     try {
       const snapshot = await fetchInventory({ q, owner, cluster, power });
-      setData(snapshot);
-      setConnection(snapshot.connection);
+      setDataIfChanged(snapshot);
+      setConnectionIfChanged(snapshot.connection);
       setError("");
       const neverSynced = !snapshot.connection.last_sync && snapshot.vms.length === 0;
       if (snapshot.connection.mode === "vcenter" && !snapshot.connection.connected && neverSynced) {
@@ -92,19 +146,19 @@ export function App() {
       setError(err instanceof Error ? err.message : "Failed to load inventory");
       try {
         const info = await fetchConnection();
-        setConnection(info);
+        setConnectionIfChanged(info);
         if (info.mode === "vcenter" && !info.connected && !info.last_sync) setShowLogin(true);
       } catch {
         setShowLogin(true);
       }
     }
     try {
-      setCatalog(await fetchCatalog());
+      setCatalogIfChanged(await fetchCatalog());
     } catch {
       /* catalog fills after the first successful sync */
     }
     try {
-      setJobs(await fetchJobs());
+      setJobsIfChanged(await fetchJobs());
     } catch {
       /* jobs endpoint should exist once the API is up */
     }
@@ -128,6 +182,29 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [q, owner, cluster, power, showLogin]);
 
+  useEffect(() => {
+    if (!showTheme) return;
+    function onDown(e: MouseEvent) {
+      if (themeRef.current && !themeRef.current.contains(e.target as Node)) {
+        setShowTheme(false);
+      }
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [showTheme]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+    function onDown(e: MouseEvent) {
+      if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) {
+        setShowSettings(false);
+        setShowTheme(false);
+      }
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [showSettings]);
+
   const selectedIds = useMemo(
     () => Object.entries(selected).filter(([, on]) => on).map(([id]) => id),
     [selected],
@@ -137,7 +214,7 @@ export function App() {
     return (data?.vms ?? []).filter((vm) => selected[vm.id]);
   }
 
-  function openMigrate() {
+  const openMigrate = useCallback(() => {
     const rows = selectedFromData();
     if (rows.length === 0) return;
     if (rows.length > BATCH_LIMIT) {
@@ -146,7 +223,8 @@ export function App() {
     }
     setMigrateTargets(rows);
     setShowMigrate(true);
-  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, selected]);
 
   function requestAction(action: ActionName) {
     const rows = selectedFromData();
@@ -186,18 +264,18 @@ export function App() {
     [data],
   );
 
-  function toggle(id: string) {
+  const toggle = useCallback((id: string) => {
     setSelected((current) => ({ ...current, [id]: !current[id] }));
-  }
+  }, []);
 
-  function toggleMany(vms: VirtualMachine[], on?: boolean) {
+  const toggleMany = useCallback((vms: VirtualMachine[], on?: boolean) => {
     setSelected((current) => {
       const next = { ...current };
       const enable = on ?? !vms.every((vm) => current[vm.id]);
       for (const vm of vms) next[vm.id] = enable;
       return next;
     });
-  }
+  }, []);
 
   async function confirmAction() {
     const targets = actionTargets ?? selectedFromData();
@@ -271,13 +349,34 @@ export function App() {
     downloadText("vfleet-owners.csv", lines.join("\n"));
   }
 
-  const vms = data?.vms ?? [];
-  const owners = data?.owners ?? [];
-  const hosts = data?.hosts ?? [];
-  const clusters = data?.clusters ?? [];
-  const totals = summarize(vms);
+  const vms = useMemo(() => data?.vms ?? [], [data]);
+  const owners = useMemo(() => data?.owners ?? [], [data]);
+  const hosts = useMemo(() => data?.hosts ?? [], [data]);
+  const clusters = useMemo(() => data?.clusters ?? [], [data]);
+  const totals = useMemo(() => summarize(vms), [vms]);
+
+  const onVmSelectVisible = useCallback((rows: VirtualMachine[]) => toggleMany(rows), [toggleMany]);
+  const onReclaimSelectVisible = useCallback((rows: VirtualMachine[]) => toggleMany(rows, true), [toggleMany]);
+  const onOwnerSelectGroup = useCallback((group: VirtualMachine[]) => {
+    toggleMany(group, true);
+    setView("machines");
+  }, [toggleMany]);
+  const onExportOwners = useCallback(() => exportOwners(owners), [owners]);
+  const onDatastoreQueued = useCallback((_job: unknown, message: string) => {
+    setNotice(message);
+    setView("jobs");
+    void load();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const onDatastoreNotice = useCallback((message: string) => {
+    setNotice(message);
+    void load();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const onJobsRefresh = useCallback(() => void load(), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
+  <ThemeProvider>
     <div className="shell">
       <aside className="rail">
         <div className="brand">
@@ -326,16 +425,9 @@ export function App() {
                 </button>
               ) : null}
               {connection.can_disconnect ? (
-                <>
-                  <button className="ghost wide" onClick={() => void onDisconnect(false)}>
-                    Work offline
-                  </button>
-                  {connection.env_ready ? (
-                    <button className="text" onClick={() => void onDisconnect(true)}>
-                      Forget saved credentials
-                    </button>
-                  ) : null}
-                </>
+                <button className="ghost wide" onClick={() => void onDisconnect(false)}>
+                  Work offline
+                </button>
               ) : null}
             </>
           ) : (
@@ -343,19 +435,74 @@ export function App() {
               Connect to vCenter
             </button>
           )}
-          <label className="token">
-            UI token
-            <input
-              type="password"
-              placeholder="optional"
-              defaultValue={localStorage.getItem("vfleet.uiToken") ?? ""}
-              onBlur={(event) => {
-                setUiToken(event.target.value.trim());
-                void load();
-              }}
-            />
-          </label>
         </div>
+
+        <div className="rail-settings-wrap" ref={settingsRef}>
+          <button
+            className={`rail-theme-btn${showSettings ? " active" : ""}`}
+            onClick={() => { setShowSettings((v) => !v); setShowTheme(false); }}
+            title="Settings"
+            aria-label="Settings"
+            aria-expanded={showSettings}
+          >
+            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" className="cog-icon">
+              <path d="M10 12.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" fill="currentColor"/>
+              <path fillRule="evenodd" clipRule="evenodd" d="M8.257 2.104a.75.75 0 0 1 1.486 0l.244.98a6.02 6.02 0 0 1 1.308.541l.855-.536a.75.75 0 0 1 .97.116l1.414 1.414a.75.75 0 0 1 .116.97l-.536.855c.214.41.394.845.541 1.308l.98.244a.75.75 0 0 1 0 1.486l-.98.244a6.02 6.02 0 0 1-.541 1.308l.536.855a.75.75 0 0 1-.116.97l-1.414 1.414a.75.75 0 0 1-.97.116l-.855-.536a6.02 6.02 0 0 1-1.308.541l-.244.98a.75.75 0 0 1-1.486 0l-.244-.98a6.02 6.02 0 0 1-1.308-.541l-.855.536a.75.75 0 0 1-.97-.116L3.466 14.22a.75.75 0 0 1-.116-.97l.536-.855a6.02 6.02 0 0 1-.541-1.308l-.98-.244a.75.75 0 0 1 0-1.486l.98-.244a6.02 6.02 0 0 1 .541-1.308l-.536-.855a.75.75 0 0 1 .116-.97L4.88 4.566a.75.75 0 0 1 .97-.116l.855.536a6.02 6.02 0 0 1 1.308-.541l.244-.98ZM10 13.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="currentColor"/>
+            </svg>
+            Settings
+          </button>
+
+          {showSettings && (
+            <div className="settings-panel" role="dialog" aria-label="Settings">
+              <div className="theme-panel-header">
+                <span className="theme-panel-title">Settings</span>
+                <button className="theme-panel-close" onClick={() => { setShowSettings(false); setShowTheme(false); }} aria-label="Close settings">✕</button>
+              </div>
+
+              {/* Appearance */}
+              <div className="settings-section" ref={themeRef}>
+                <button
+                  className={`settings-row-btn${showTheme ? " active" : ""}`}
+                  onClick={() => setShowTheme((v) => !v)}
+                >
+                  <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" className="cog-icon">
+                    <path d="M10 12.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" fill="currentColor"/>
+                    <path fillRule="evenodd" clipRule="evenodd" d="M8.257 2.104a.75.75 0 0 1 1.486 0l.244.98a6.02 6.02 0 0 1 1.308.541l.855-.536a.75.75 0 0 1 .97.116l1.414 1.414a.75.75 0 0 1 .116.97l-.536.855c.214.41.394.845.541 1.308l.98.244a.75.75 0 0 1 0 1.486l-.98.244a6.02 6.02 0 0 1-.541 1.308l.536.855a.75.75 0 0 1-.116.97l-1.414 1.414a.75.75 0 0 1-.97.116l-.855-.536a6.02 6.02 0 0 1-1.308.541l-.244.98a.75.75 0 0 1-1.486 0l-.244-.98a6.02 6.02 0 0 1-1.308-.541l-.855.536a.75.75 0 0 1-.97-.116L3.466 14.22a.75.75 0 0 1-.116-.97l.536-.855a6.02 6.02 0 0 1-.541-1.308l-.98-.244a.75.75 0 0 1 0-1.486l.98-.244a6.02 6.02 0 0 1 .541-1.308l-.536-.855a.75.75 0 0 1 .116-.97L4.88 4.566a.75.75 0 0 1 .97-.116l.855.536a6.02 6.02 0 0 1 1.308-.541l.244-.98ZM10 13.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="currentColor"/>
+                  </svg>
+                  Appearance
+                  <span className="settings-row-chevron">{showTheme ? "▴" : "▾"}</span>
+                </button>
+                {showTheme && <ThemePanel onClose={() => setShowTheme(false)} inline />}
+              </div>
+
+              <div className="settings-divider" />
+
+              {/* Credentials */}
+              {connection?.mode === "vcenter" && connection.can_disconnect && connection.env_ready && (
+                <div className="settings-section">
+                  <button
+                    className="settings-row-btn danger-row"
+                    onClick={() => { void onDisconnect(true); setShowSettings(false); }}
+                  >
+                    <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" className="cog-icon">
+                      <path d="M9 2a1 1 0 0 0 0 2h2a1 1 0 1 0 0-2H9Z" fill="currentColor"/>
+                      <path fillRule="evenodd" clipRule="evenodd" d="M4 5a2 2 0 0 1 2-2 3 3 0 0 0 3 3h2a3 3 0 0 0 3-3 2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5Zm3 4a1 1 0 0 0 0 2h.01a1 1 0 1 0 0-2H7Zm2 0a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2h-2a1 1 0 0 1-1-1Zm-2 4a1 1 0 1 0 0 2h.01a1 1 0 1 0 0-2H7Zm2 0a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2h-2a1 1 0 0 1-1-1Z" fill="currentColor"/>
+                    </svg>
+                    Forget saved credentials
+                  </button>
+                </div>
+              )}
+
+              {/* Passphrase */}
+              <PassphraseField onSave={() => void load()} />
+            </div>
+          )}
+        </div>
+
+        <footer className="rail-credit">
+          <a href="mailto:Michael@Zipkin.dev" className="rail-credit-email">Michael@Zipkin.dev</a>
+          <span className="rail-credit-license">GNU AGPL v3 — source must be shared if deployed as a service.</span>
+        </footer>
       </aside>
 
       <main>
@@ -456,6 +603,8 @@ export function App() {
             ownerFilter={monitorOwner}
             onOwnerFilter={setMonitorOwner}
             onOpenMachines={openMachinesForOwner}
+            hosts={hosts}
+            vms={vms}
           />
         ) : null}
         {view === "hosts" ? <HostTable hosts={hosts} /> : null}
@@ -464,37 +613,27 @@ export function App() {
             vms={vms}
             selected={selected}
             onToggle={toggle}
-            onSelectVisible={(rows) => toggleMany(rows)}
-            onMigrate={() => openMigrate()}
+            onSelectVisible={onVmSelectVisible}
+            onMigrate={openMigrate}
           />
         ) : null}
         {view === "datastores" ? (
           <DatastoresView
             catalog={catalog}
             clusters={clusters}
-            onQueued={(_job, message) => {
-              setNotice(message);
-              setView("jobs");
-              void load();
-            }}
-            onNotice={(message) => {
-              setNotice(message);
-              void load();
-            }}
+            onQueued={onDatastoreQueued}
+            onNotice={onDatastoreNotice}
           />
         ) : null}
-        {view === "jobs" ? <JobsView data={jobs} onRefresh={() => void load()} /> : null}
+        {view === "jobs" ? <JobsView data={jobs} onRefresh={onJobsRefresh} /> : null}
         {view === "owners" ? (
           <OwnerTable
             owners={owners}
             vms={vms}
             expanded={expandedOwner}
             onExpand={setExpandedOwner}
-            onSelectGroup={(group) => {
-              toggleMany(group, true);
-              setView("machines");
-            }}
-            onExport={() => exportOwners(owners)}
+            onSelectGroup={onOwnerSelectGroup}
+            onExport={onExportOwners}
           />
         ) : null}
         {view === "reclaim" ? (
@@ -502,7 +641,7 @@ export function App() {
             vms={reclaim}
             selected={selected}
             onToggle={toggle}
-            onSelectVisible={(rows) => toggleMany(rows, true)}
+            onSelectVisible={onReclaimSelectVisible}
           />
         ) : null}
       </main>
@@ -614,6 +753,7 @@ export function App() {
         </div>
       ) : null}
     </div>
+  </ThemeProvider>
   );
 }
 
@@ -662,7 +802,7 @@ function Meter({ value, warn = 80 }: { value: number; warn?: number }) {
   );
 }
 
-function Overview({
+const Overview = React.memo(function Overview({
   clusters,
   totals,
   owners,
@@ -817,9 +957,9 @@ function Overview({
       </div>
     </section>
   );
-}
+});
 
-function HostTable({ hosts }: { hosts: InventorySnapshot["hosts"] }) {
+const HostTable = React.memo(function HostTable({ hosts }: { hosts: InventorySnapshot["hosts"] }) {
   return (
     <div className="panel">
       <header>
@@ -860,9 +1000,9 @@ function HostTable({ hosts }: { hosts: InventorySnapshot["hosts"] }) {
       </table>
     </div>
   );
-}
+});
 
-function VmTable({
+const VmTable = React.memo(function VmTable({
   vms,
   selected,
   onToggle,
@@ -1073,7 +1213,7 @@ function VmTable({
       </table>
     </div>
   );
-}
+});
 
 function DiskChip({ kind }: { kind: string }) {
   return <span className={`chip disk ${kind}`}>{diskLabel(kind)}</span>;
@@ -1121,7 +1261,7 @@ function SortHeader({
   );
 }
 
-function OwnerTable({
+const OwnerTable = React.memo(function OwnerTable({
   owners,
   vms,
   expanded,
@@ -1212,9 +1352,9 @@ function OwnerTable({
       </table>
     </div>
   );
-}
+});
 
-function ReclaimTable({
+const ReclaimTable = React.memo(function ReclaimTable({
   vms,
   selected,
   onToggle,
@@ -1418,4 +1558,4 @@ function ReclaimTable({
       </table>
     </div>
   );
-}
+});

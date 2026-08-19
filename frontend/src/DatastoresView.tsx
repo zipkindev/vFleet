@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createStaging, deleteDatastoreFile, enqueueUpload, fetchDatastoreFiles, mkdir, putStagingChunk } from "./api";
 import { bytes } from "./format";
 import { MigrationAccessPanel } from "./MigrationAccessPanel";
@@ -13,7 +13,7 @@ type Props = {
 
 const CHUNK = 4 * 1024 * 1024;
 
-export function DatastoresView({ catalog, clusters, onQueued, onNotice }: Props) {
+export const DatastoresView = React.memo(function DatastoresView({ catalog, clusters, onQueued, onNotice }: Props) {
   const datastores = catalog?.datastores ?? [];
   const [selectedId, setSelectedId] = useState(datastores[0]?.id ?? "");
   const [listing, setListing] = useState<DatastoreListing | null>(null);
@@ -216,7 +216,7 @@ export function DatastoresView({ catalog, clusters, onQueued, onNotice }: Props)
       ) : null}
     </section>
   );
-}
+});
 
 function Meter({ value }: { value: number }) {
   const tone = value >= 85 ? "hot" : value >= 60 ? "warm" : "ok";

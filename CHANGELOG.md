@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.4] — 2026-08-19
+
+perf: eliminate poll-driven re-renders and harden dev tooling
+
+- 12 files changed, 1315 insertions(+), 104 deletions(-) · CHANGELOG.md, VERSION, backend/app/main.py, frontend/package.json, frontend/src/App.tsx, frontend/src/DatastoresView.tsx, …
+
+## [1.0.3] — 2026-08-19
+
+ui: collapsible vMotion panel with full-screen help modal
+
+- staged changes
+
 ## [1.0.2] — 2026-08-19
 
 chore: add auto-version bump hook system

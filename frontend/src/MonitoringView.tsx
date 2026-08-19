@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -15,15 +15,24 @@ import {
   YAxis,
 } from "recharts";
 import { fetchMetrics } from "./api";
-import { gib } from "./format";
+import { bytes, gib } from "./format";
 import { sortMonitorOwners, toggleSortDir, type MonitorOwnerSortKey, type SortDir } from "./sort";
-import type { MetricsResponse, OwnerUtilization } from "./types";
+import type { HostSummary, MetricsResponse, OwnerUtilization, VirtualMachine } from "./types";
 
 const HOUR_OPTIONS = [
   { label: "1 hour", value: 1 },
   { label: "6 hours", value: 6 },
   { label: "24 hours", value: 24 },
   { label: "7 days", value: 168 },
+];
+
+const IDLE_THRESHOLD_OPTIONS = [
+  { label: "30 days", value: 30 },
+  { label: "60 days", value: 60 },
+  { label: "90 days", value: 90 },
+  { label: "120 days", value: 120 },
+  { label: "180 days", value: 180 },
+  { label: "365 days", value: 365 },
 ];
 
 const PIE_COLORS = [
@@ -55,6 +64,8 @@ type Props = {
   ownerFilter: string;
   onOwnerFilter: (owner: string) => void;
   onOpenMachines: (owner: string) => void;
+  hosts?: HostSummary[];
+  vms?: VirtualMachine[];
 };
 
 function formatAxisTime(ts: string) {
@@ -72,14 +83,22 @@ function latestPct(series: MetricsResponse["series"], key: "cpu_pct" | "memory_p
   return series[series.length - 1][key];
 }
 
+// Groups owners below the threshold percentage into "Other (N)" so the legend stays readable.
+const PIE_MIN_PCT = 1.5;
+
 function topOwnersForPie(
   owners: OwnerUtilization[],
   metric: "cpu_share_pct" | "memory_share_pct" | "storage_share_pct",
-  limit = 20,
+  limit = 10,
 ): PieRow[] {
   const sorted = [...owners].sort((a, b) => b[metric] - a[metric]);
-  const top = sorted.slice(0, limit);
-  const rest = sorted.slice(limit);
+  // Hard limit first, then drop anything below the visibility threshold
+  const hardCapped = sorted.slice(0, limit);
+  const top = hardCapped.filter((r) => r[metric] >= PIE_MIN_PCT);
+  const rest = [
+    ...hardCapped.filter((r) => r[metric] < PIE_MIN_PCT),
+    ...sorted.slice(limit),
+  ];
   const rows: PieRow[] = top.map((row) => ({
     name: row.owner_key,
     owner_key: row.owner_key,
@@ -228,6 +247,9 @@ function OwnerPieChart({
   data: PieRow[];
   onSelect: (owner: string) => void;
 }) {
+  // Legend rows × ~18px per row + pie height. Cap legend at bottom so pie gets full width.
+  const legendRows = Math.ceil(data.length / 2);
+  const chartHeight = 200 + legendRows * 18;
   return (
     <section className="panel monitor-chart compact">
       <header>
@@ -235,14 +257,14 @@ function OwnerPieChart({
       </header>
       <div className="chart-wrap pie">
         {data.length ? (
-          <ResponsiveContainer width="100%" height={240}>
+          <ResponsiveContainer width="100%" height={chartHeight}>
             <PieChart>
               <Pie
                 data={data}
                 dataKey="value"
                 nameKey="name"
                 cx="50%"
-                cy="50%"
+                cy={100}
                 innerRadius={52}
                 outerRadius={88}
                 paddingAngle={1}
@@ -256,7 +278,15 @@ function OwnerPieChart({
                 ))}
               </Pie>
               <Tooltip content={<PieTooltip />} />
-              <Legend layout="vertical" align="right" verticalAlign="middle" wrapperStyle={{ fontSize: 11 }} />
+              <Legend
+                layout="horizontal"
+                align="center"
+                verticalAlign="bottom"
+                wrapperStyle={{ fontSize: 10, paddingTop: 8 }}
+                formatter={(value: string) =>
+                  value.length > 16 ? value.slice(0, 15) + "…" : value
+                }
+              />
             </PieChart>
           </ResponsiveContainer>
         ) : (
@@ -267,11 +297,12 @@ function OwnerPieChart({
   );
 }
 
-export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: Props) {
+export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines, hosts = [], vms = [] }: Props) {
   const [hours, setHours] = useState(24);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [error, setError] = useState("");
-  const [topLimit, setTopLimit] = useState(20);
+  const [topLimit, setTopLimit] = useState(10);
+  const [idleThreshold, setIdleThreshold] = useState(120);
   const [sortKey, setSortKey] = useState<MonitorOwnerSortKey>("cpu_share_pct");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
@@ -283,7 +314,7 @@ export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: P
   async function load() {
     try {
       const payload = await fetchMetrics({ hours, owner: ownerFilter || undefined });
-      setMetrics(payload);
+      setMetrics((prev) => (JSON.stringify(prev) === JSON.stringify(payload) ? prev : payload));
       setError("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load metrics");
@@ -320,6 +351,202 @@ export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: P
   const currentMem = latestPct(series, "memory_pct");
   const currentDisk = latestPct(series, "disk_pct");
 
+  // Storage reclaim: thick provisioned vs datastore-committed bytes.
+  // NOTE: storage_used_bytes = bytes committed on the datastore (VMDK file size),
+  // NOT bytes written by the guest OS. True written data requires guest-level metrics.
+  // For thick disks provisioned = fully pre-allocated regardless of guest writes.
+  //
+  // Thin fill ratio: thin VMs' committed/provisioned gives us the best available proxy
+  // for how much of a disk's logical size is actually in use. We apply that ratio to
+  // thick provisioned to estimate thick "actual usage" and derive a more realistic
+  // reclaimable figure when converting thick → thin.
+  const storageReclaim = useMemo(() => {
+    let thickProvisioned = 0;
+    let thickCommitted = 0;
+    let thinProvisioned = 0;
+    let thinCommitted = 0;
+    let unknownCommitted = 0;
+    for (const vm of vms) {
+      const provisioned = vm.storage_provisioned_bytes ?? 0;
+      const committed = vm.storage_used_bytes ?? 0;
+      if (vm.disk_provisioning === "thick") {
+        thickProvisioned += provisioned;
+        thickCommitted += committed;
+      } else if (vm.disk_provisioning === "thin" || vm.disk_provisioning === "mixed") {
+        thinProvisioned += provisioned;
+        thinCommitted += committed;
+      } else {
+        unknownCommitted += committed;
+      }
+    }
+    // Thin fill ratio = committed / provisioned across all thin VMs (fleet average)
+    const thinFillRatio = thinProvisioned > 0 ? thinCommitted / thinProvisioned : null;
+    // Estimated thick actual usage = thick provisioned × thin fill ratio
+    // Falls back to thickCommitted if no thin data is available
+    const thickEstActual = thinFillRatio !== null
+      ? Math.round(thickProvisioned * thinFillRatio)
+      : thickCommitted;
+    // Conservative reclaimable (raw): provisioned minus committed on datastore
+    const reclaimableRaw = Math.max(0, thickProvisioned - thickCommitted);
+    // Estimated reclaimable after conversion (more realistic): provisioned × (1 - fill ratio)
+    const reclaimableEst = Math.max(0, thickProvisioned - thickEstActual);
+    const totalCommitted = thickCommitted + thinCommitted + unknownCommitted;
+    return {
+      thickProvisioned, thickCommitted, thickEstActual,
+      thinProvisioned, thinCommitted, thinFillRatio,
+      reclaimableRaw, reclaimableEst, totalCommitted,
+      // keep reclaimable as the estimated figure for display
+      reclaimable: reclaimableEst,
+    };
+  }, [vms]);
+
+  // Idle VM reclaim: VMs with days_idle >= idleThreshold (candidate for deletion)
+  const IDLE_VM_DAYS = idleThreshold;
+  const idleVmReclaim = useMemo(() => {
+    const idleVms = vms.filter((vm) => vm.days_idle !== null && vm.days_idle >= idleThreshold);
+    let thickProvisioned = 0;
+    let thickCommitted = 0;
+    let thinProvisioned = 0;
+    let thinCommitted = 0;
+    let vmCount = 0;
+    let cpuAllocatedMhz = 0;
+    let cpuUsedMhz = 0;
+    let memAllocatedMib = 0;
+    let memUsedMib = 0;
+    for (const vm of idleVms) {
+      vmCount++;
+      const provisioned = vm.storage_provisioned_bytes ?? 0;
+      const committed = vm.storage_used_bytes ?? 0;
+      if (vm.disk_provisioning === "thick") {
+        thickProvisioned += provisioned;
+        thickCommitted += committed;
+      } else {
+        thinProvisioned += provisioned;
+        thinCommitted += committed;
+      }
+      // cpu_count × 1000 MHz = conservative 1 GHz/vCPU allocation estimate
+      cpuAllocatedMhz += vm.cpu_count * 1000;
+      cpuUsedMhz += vm.cpu_usage_mhz;
+      memAllocatedMib += vm.memory_mib;
+      memUsedMib += vm.memory_usage_mib;
+    }
+    return {
+      vmCount,
+      thickProvisioned,
+      thickCommitted,
+      thinProvisioned,
+      thinCommitted,
+      totalProvisioned: thickProvisioned + thinProvisioned,
+      totalCommitted: thickCommitted + thinCommitted,
+      cpuAllocatedMhz,
+      cpuUsedMhz,
+      memAllocatedMib,
+      memUsedMib,
+    };
+  }, [vms, idleThreshold]);
+
+  const idleVmStoragePieData = useMemo(() => {
+    const { thickProvisioned, thinCommitted } = idleVmReclaim;
+    const { thinFillRatio } = storageReclaim;
+    // Use fleet thin fill ratio to estimate thick actual use; fall back to raw committed
+    const thickEstActual = thinFillRatio !== null
+      ? Math.round(thickProvisioned * thinFillRatio)
+      : idleVmReclaim.thickCommitted;
+    const thickEstReclaimable = Math.max(0, thickProvisioned - thickEstActual);
+    const total = thickEstActual + thinCommitted + thickEstReclaimable;
+    if (total === 0) return [];
+    const GiB = 1024 * 1024 * 1024;
+    const thickLabel = thinFillRatio !== null
+      ? `Thick VMs — est. actual (${(thinFillRatio * 100).toFixed(0)}% fill)`
+      : "Thick VMs — committed on datastore";
+    return [
+      { name: thickLabel, value: Math.round(thickEstActual / GiB * 10) / 10, color: "#86c9a3" },
+      { name: "Thick VMs — est. reclaimable gap", value: Math.round(thickEstReclaimable / GiB * 10) / 10, color: "#f07178" },
+      { name: "Thin VMs — committed on datastore", value: Math.round(thinCommitted / GiB * 10) / 10, color: "#7eb8da" },
+    ].filter((d) => d.value > 0);
+  }, [idleVmReclaim, storageReclaim]);
+
+  const idleVmCpuPieData = useMemo(() => {
+    const { cpuAllocatedMhz, cpuUsedMhz, vmCount } = idleVmReclaim;
+    if (vmCount === 0 || cpuAllocatedMhz === 0) return [];
+    const reclaimable = Math.max(0, cpuAllocatedMhz - cpuUsedMhz);
+    return [
+      { name: "Currently in use", value: cpuUsedMhz, color: "#86c9a3" },
+      { name: "Reclaimable (idle VMs)", value: reclaimable, color: "#f07178" },
+    ].filter((d) => d.value > 0);
+  }, [idleVmReclaim]);
+
+  const idleVmMemPieData = useMemo(() => {
+    const { memAllocatedMib, memUsedMib, vmCount } = idleVmReclaim;
+    if (vmCount === 0 || memAllocatedMib === 0) return [];
+    const reclaimable = Math.max(0, memAllocatedMib - memUsedMib);
+    return [
+      { name: "Currently in use", value: memUsedMib, color: "#7eb8da" },
+      { name: "Reclaimable (idle VMs)", value: reclaimable, color: "#f07178" },
+    ].filter((d) => d.value > 0);
+  }, [idleVmReclaim]);
+
+  const storagePieData = useMemo(() => {
+    const { thickEstActual, thinCommitted, reclaimableEst, thinFillRatio } = storageReclaim;
+    const total = thickEstActual + thinCommitted + reclaimableEst;
+    if (total === 0) return [];
+    const GiB = 1024 * 1024 * 1024;
+    const label = thinFillRatio !== null
+      ? `Est. thick actual use (${(thinFillRatio * 100).toFixed(0)}% fill)`
+      : "Committed (thick VMs)";
+    return [
+      { name: label, value: Math.round(thickEstActual / GiB * 10) / 10, color: "#86c9a3" },
+      { name: "Thin provisioned (committed)", value: Math.round(thinCommitted / GiB * 10) / 10, color: "#7eb8da" },
+      { name: "Thick est. reclaimable (thick → thin)", value: Math.round(reclaimableEst / GiB * 10) / 10, color: "#f07178" },
+    ].filter((d) => d.value > 0);
+  }, [storageReclaim]);
+
+  // Idle hosts: hosts where all VMs have been idle ≥ 30 days (or host has no VMs and low usage)
+  const idleHosts = useMemo(() => {
+    const IDLE_DAYS = 30;
+    return hosts.filter((host) => {
+      const hostVms = vms.filter((vm) => vm.host_id === host.id);
+      if (hostVms.length === 0) {
+        // No VMs — consider idle if CPU usage is very low
+        return host.cpu_usage_pct < 5;
+      }
+      return hostVms.every((vm) => vm.days_idle !== null && vm.days_idle >= IDLE_DAYS);
+    });
+  }, [hosts, vms]);
+
+  const idleTotals = useMemo(() => {
+    const totalCpuMhz = idleHosts.reduce((sum, h) => sum + h.cpu_cores * h.cpu_mhz, 0);
+    const totalMemMib = idleHosts.reduce((sum, h) => sum + h.memory_mib, 0);
+    const usedCpuMhz = idleHosts.reduce((sum, h) => sum + h.cpu_usage_mhz, 0);
+    const usedMemMib = idleHosts.reduce((sum, h) => sum + h.memory_usage_mib, 0);
+    return { totalCpuMhz, totalMemMib, usedCpuMhz, usedMemMib };
+  }, [idleHosts]);
+
+  // For overall fleet pie: active hosts vs idle hosts CPU & Memory
+  const fleetCpuPie = useMemo(() => {
+    const idleSet = new Set(idleHosts.map((h) => h.id));
+    const activeHosts = hosts.filter((h) => !idleSet.has(h.id));
+    const activeCpu = activeHosts.reduce((sum, h) => sum + h.cpu_usage_mhz, 0);
+    const idleCpu = idleHosts.reduce((sum, h) => sum + h.cpu_cores * h.cpu_mhz, 0);
+    if (activeCpu + idleCpu === 0) return [];
+    return [
+      { name: "Active hosts CPU", value: activeCpu },
+      { name: "Idle host CPU (wasted)", value: idleCpu },
+    ];
+  }, [hosts, idleHosts]);
+
+  const fleetMemPie = useMemo(() => {
+    const idleSet = new Set(idleHosts.map((h) => h.id));
+    const activeHosts = hosts.filter((h) => !idleSet.has(h.id));
+    const activeMem = activeHosts.reduce((sum, h) => sum + h.memory_usage_mib, 0);
+    const idleMem = idleHosts.reduce((sum, h) => sum + h.memory_mib, 0);
+    if (activeMem + idleMem === 0) return [];
+    return [
+      { name: "Active hosts memory", value: activeMem },
+      { name: "Idle host memory (wasted)", value: idleMem },
+    ];
+  }, [hosts, idleHosts]);
+
   return (
     <div className="stack monitor">
       {error ? <div className="banner bad">{error}</div> : null}
@@ -353,6 +580,14 @@ export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: P
               <option value={10}>Top 10 + Other</option>
               <option value={20}>Top 20 + Other</option>
               <option value={9999}>Show all</option>
+            </select>
+          </label>
+          <label>
+            Idle / reclaim threshold
+            <select value={idleThreshold} onChange={(event) => setIdleThreshold(Number(event.target.value))}>
+              {IDLE_THRESHOLD_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
             </select>
           </label>
         </div>
@@ -399,6 +634,384 @@ export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: P
         <UtilLineChart title="Memory" dataKey="memory_pct" color="#86c9a3" data={series} />
         <UtilLineChart title="Storage" dataKey="disk_pct" color="#7eb8da" data={series} />
       </div>
+
+      {/* Storage Reclaim Section */}
+      {!ownerFilter && storageReclaim.thickProvisioned + storageReclaim.thinProvisioned > 0 ? (
+        <>
+          <header className="monitor-section-head">
+            <div>
+              <h2>Storage: thick provisioned vs actual consumption</h2>
+              <p>
+                Total thick provisioned:{" "}
+                <strong>{bytes(storageReclaim.thickProvisioned)}</strong> &nbsp;·&nbsp; Actual consumed:{" "}
+                <strong>{bytes(storageReclaim.totalCommitted)}</strong> &nbsp;·&nbsp; Est. reclaimable:{" "}
+                <strong style={{ color: "#d6f261" }}>{bytes(storageReclaim.reclaimableEst)}</strong>
+                {storageReclaim.thinFillRatio !== null && (
+                  <> &nbsp;·&nbsp; Thin fill ratio: <strong style={{ color: "#7eb8da" }}>{(storageReclaim.thinFillRatio * 100).toFixed(1)}%</strong></>
+                )}
+              </p>
+              <p style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+                ⚠ Thick disks pre-allocate their full logical size regardless of guest writes.
+                Since we cannot measure guest-written bytes directly, the estimated reclaimable space uses the
+                thin VM fill ratio ({storageReclaim.thinFillRatio !== null ? `${(storageReclaim.thinFillRatio * 100).toFixed(1)}%` : "n/a"}) as a
+                proxy for how full thick disks likely are. True written data requires guest-level metrics.
+              </p>
+            </div>
+          </header>
+          <div className="monitor-grid charts-1">
+            <section className="panel monitor-chart compact">
+              <header>
+                <h2>Storage allocation breakdown (GiB)</h2>
+                <p>Reclaimable space freed by converting thick → thin provisioned disks</p>
+              </header>
+              <div className="chart-wrap pie">
+                {storagePieData.length ? (
+                  <ResponsiveContainer width="100%" height={260}>
+                    <PieChart>
+                      <Pie
+                        data={storagePieData}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={60}
+                        outerRadius={100}
+                        paddingAngle={2}
+                        label={({ value }: { value: number }) => `${value} GiB`}
+                        labelLine
+                      >
+                        {storagePieData.map((d) => (
+                          <Cell key={d.name} fill={d.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        formatter={(value: number) => [`${value} GiB`, ""]}
+                      />
+                      <Legend layout="vertical" align="right" verticalAlign="middle" wrapperStyle={{ fontSize: 11 }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="chart-empty">No provisioning data available.</div>
+                )}
+              </div>
+            </section>
+          </div>
+          {/* Idle VM reclaim: CPU, RAM, Storage */}
+          {idleVmReclaim.vmCount > 0 ? (
+            <>
+            <div className="monitor-grid charts-3" style={{ marginTop: 0 }}>
+
+              {/* CPU reclaimable */}
+              <section className="panel monitor-chart compact">
+                <header>
+                  <h2>CPU reclaimable (&gt;{IDLE_VM_DAYS}d idle)</h2>
+                  <p>
+                    Allocated: <strong>{idleVmReclaim.cpuAllocatedMhz.toLocaleString()} MHz</strong> &nbsp;·&nbsp;
+                    In use: <strong>{idleVmReclaim.cpuUsedMhz.toLocaleString()} MHz</strong> &nbsp;·&nbsp;
+                    Reclaimable: <strong style={{ color: "#d6f261" }}>{Math.max(0, idleVmReclaim.cpuAllocatedMhz - idleVmReclaim.cpuUsedMhz).toLocaleString()} MHz</strong>
+                  </p>
+                  <p style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>Based on 1 GHz/vCPU allocation estimate</p>
+                </header>
+                <div className="chart-wrap pie">
+                  {idleVmCpuPieData.length ? (
+                    <ResponsiveContainer width="100%" height={220}>
+                      <PieChart>
+                        <Pie data={idleVmCpuPieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                          innerRadius={52} outerRadius={82} paddingAngle={2}
+                          label={({ value }: { value: number }) => `${(value / 1000).toFixed(1)} GHz`} labelLine>
+                          {idleVmCpuPieData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                        </Pie>
+                        <Tooltip formatter={(v: number) => [`${v.toLocaleString()} MHz`, ""]} />
+                        <Legend layout="horizontal" align="center" verticalAlign="bottom" wrapperStyle={{ fontSize: 10 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : <div className="chart-empty">No CPU data for idle VMs.</div>}
+                </div>
+              </section>
+
+              {/* RAM reclaimable */}
+              <section className="panel monitor-chart compact">
+                <header>
+                  <h2>RAM reclaimable (&gt;{IDLE_VM_DAYS}d idle)</h2>
+                  <p>
+                    Allocated: <strong>{gib(idleVmReclaim.memAllocatedMib)}</strong> &nbsp;·&nbsp;
+                    In use: <strong>{gib(idleVmReclaim.memUsedMib)}</strong> &nbsp;·&nbsp;
+                    Reclaimable: <strong style={{ color: "#d6f261" }}>{gib(Math.max(0, idleVmReclaim.memAllocatedMib - idleVmReclaim.memUsedMib))}</strong>
+                  </p>
+                  <p style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>Allocated = VM configured memory; in use = active balloon/swap</p>
+                </header>
+                <div className="chart-wrap pie">
+                  {idleVmMemPieData.length ? (
+                    <ResponsiveContainer width="100%" height={220}>
+                      <PieChart>
+                        <Pie data={idleVmMemPieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                          innerRadius={52} outerRadius={82} paddingAngle={2}
+                          label={({ value }: { value: number }) => gib(value)} labelLine>
+                          {idleVmMemPieData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                        </Pie>
+                        <Tooltip formatter={(v: number) => [gib(v as number), ""]} />
+                        <Legend layout="horizontal" align="center" verticalAlign="bottom" wrapperStyle={{ fontSize: 10 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : <div className="chart-empty">No memory data for idle VMs.</div>}
+                </div>
+              </section>
+
+              {/* Storage reclaimable */}
+              <section className="panel monitor-chart compact">
+                <header>
+                  <h2>Storage reclaimable (&gt;{IDLE_VM_DAYS}d idle)</h2>
+                  <p>
+                    Provisioned: <strong>{bytes(idleVmReclaim.totalProvisioned)}</strong> &nbsp;·&nbsp;
+                    Committed: <strong>{bytes(idleVmReclaim.totalCommitted)}</strong>
+                  </p>
+                  <p style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                    Thick = full provisioned freed on delete; thin = committed bytes freed
+                  </p>
+                </header>
+                <div className="chart-wrap pie">
+                  {idleVmStoragePieData.length ? (
+                    <ResponsiveContainer width="100%" height={220}>
+                      <PieChart>
+                        <Pie data={idleVmStoragePieData} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                          innerRadius={52} outerRadius={82} paddingAngle={2}
+                          label={({ value }: { value: number }) => `${value} GiB`} labelLine>
+                          {idleVmStoragePieData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                        </Pie>
+                        <Tooltip formatter={(value: number) => [`${value} GiB`, ""]} />
+                        <Legend layout="horizontal" align="center" verticalAlign="bottom" wrapperStyle={{ fontSize: 10 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : <div className="chart-empty">No storage data for idle VMs.</div>}
+                </div>
+              </section>
+            </div>
+
+            <section className="panel">
+              <header>
+                <h2>Reclaim summary by provisioning type</h2>
+                <p>Space freed on datastore if all idle VMs (&gt;{IDLE_VM_DAYS} days) are deleted</p>
+              </header>
+                <div style={{ padding: "16px 0" }}>
+                  {storageReclaim.thinFillRatio !== null && (
+                    <p style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>
+                      Fleet thin fill ratio: <strong style={{ color: "#7eb8da" }}>{(storageReclaim.thinFillRatio * 100).toFixed(1)}%</strong>
+                      {" "}— applied to thick provisioned size to estimate actual usage.
+                      Deleting a thick VM always frees its full provisioned size from the datastore.
+                    </p>
+                  )}
+                  <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr style={{ color: "var(--muted)", borderBottom: "1px solid var(--border)" }}>
+                        <th style={{ textAlign: "left", padding: "4px 8px" }}>Type</th>
+                        <th style={{ textAlign: "right", padding: "4px 8px" }}>VMs</th>
+                        <th style={{ textAlign: "right", padding: "4px 8px" }}>Provisioned</th>
+                        <th style={{ textAlign: "right", padding: "4px 8px" }}>Committed (DS)</th>
+                        <th style={{ textAlign: "right", padding: "4px 8px" }}>Est. actual use</th>
+                        <th style={{ textAlign: "right", padding: "4px 8px" }}>Freed on delete</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {idleVmReclaim.thickProvisioned > 0 ? (() => {
+                        const thickEstActual = storageReclaim.thinFillRatio !== null
+                          ? Math.round(idleVmReclaim.thickProvisioned * storageReclaim.thinFillRatio)
+                          : idleVmReclaim.thickCommitted;
+                        return (
+                          <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                            <td style={{ padding: "6px 8px" }}><span style={{ color: "#86c9a3" }}>●</span> Thick</td>
+                            <td style={{ textAlign: "right", padding: "6px 8px" }}>
+                              {vms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning === "thick").length}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thickProvisioned)}</td>
+                            <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thickCommitted)}</td>
+                            <td style={{ textAlign: "right", padding: "6px 8px", color: "#86c9a3" }}>{bytes(thickEstActual)}</td>
+                            <td style={{ textAlign: "right", padding: "6px 8px", color: "#d6f261", fontWeight: 600 }}>
+                              {bytes(idleVmReclaim.thickProvisioned)}
+                            </td>
+                          </tr>
+                        );
+                      })() : null}
+                      {idleVmReclaim.thinProvisioned > 0 ? (
+                        <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: "6px 8px" }}><span style={{ color: "#7eb8da" }}>●</span> Thin / mixed</td>
+                          <td style={{ textAlign: "right", padding: "6px 8px" }}>
+                            {vms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning !== "thick").length}
+                          </td>
+                          <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thinProvisioned)}</td>
+                          <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thinCommitted)}</td>
+                          <td style={{ textAlign: "right", padding: "6px 8px", color: "#7eb8da" }}>{bytes(idleVmReclaim.thinCommitted)}</td>
+                          <td style={{ textAlign: "right", padding: "6px 8px", color: "#d6f261", fontWeight: 600 }}>
+                            {bytes(idleVmReclaim.thinCommitted)}
+                          </td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                    <tfoot>
+                      {(() => {
+                        const thickEstActual = storageReclaim.thinFillRatio !== null
+                          ? Math.round(idleVmReclaim.thickProvisioned * storageReclaim.thinFillRatio)
+                          : idleVmReclaim.thickCommitted;
+                        return (
+                          <tr style={{ borderTop: "2px solid var(--border)" }}>
+                            <td style={{ padding: "8px 8px" }}><strong>Total</strong></td>
+                            <td style={{ textAlign: "right", padding: "8px 8px" }}><strong>{idleVmReclaim.vmCount}</strong></td>
+                            <td style={{ textAlign: "right", padding: "8px 8px" }}><strong>{bytes(idleVmReclaim.totalProvisioned)}</strong></td>
+                            <td style={{ textAlign: "right", padding: "8px 8px" }}><strong>{bytes(idleVmReclaim.totalCommitted)}</strong></td>
+                            <td style={{ textAlign: "right", padding: "8px 8px", color: "#86c9a3" }}>
+                              <strong>{bytes(thickEstActual + idleVmReclaim.thinCommitted)}</strong>
+                            </td>
+                            <td style={{ textAlign: "right", padding: "8px 8px", color: "#d6f261", fontWeight: 600 }}>
+                              <strong>
+                                {bytes(idleVmReclaim.thickProvisioned + idleVmReclaim.thinCommitted)}
+                              </strong>
+                            </td>
+                          </tr>
+                        );
+                      })()}
+                    </tfoot>
+                  </table>
+                </div>
+            </section>
+            </>
+          ) : (
+            <p style={{ padding: "8px 0", color: "var(--muted)", fontSize: 13 }}>
+              No VMs found idle for {IDLE_VM_DAYS}+ days.
+            </p>
+          )}
+        </>
+      ) : null}
+
+      {/* Idle Hosts Section */}
+      {!ownerFilter ? (
+        <>
+          <header className="monitor-section-head">
+            <div>
+              <h2>Idle hosts (&gt;30 days)</h2>
+              <p>
+                {idleHosts.length === 0
+                  ? "No hosts found with all VMs idle for more than 30 days."
+                  : <>
+                      <strong>{idleHosts.length}</strong> host{idleHosts.length !== 1 ? "s" : ""} idle &gt;30 days &nbsp;·&nbsp;
+                      Reclaimable CPU: <strong style={{ color: "#d6f261" }}>{idleTotals.totalCpuMhz.toLocaleString()} MHz</strong>
+                      &nbsp;·&nbsp;
+                      Reclaimable Memory: <strong style={{ color: "#86c9a3" }}>{gib(idleTotals.totalMemMib)}</strong>
+                      {" "}by shutting them down
+                    </>
+                }
+              </p>
+            </div>
+          </header>
+
+          {idleHosts.length > 0 ? (
+            <>
+              <div className="monitor-grid charts-2">
+                <section className="panel monitor-chart compact">
+                  <header><h2>CPU: active vs idle hosts</h2></header>
+                  <div className="chart-wrap pie">
+                    {fleetCpuPie.length ? (
+                      <ResponsiveContainer width="100%" height={240}>
+                        <PieChart>
+                          <Pie
+                            data={fleetCpuPie}
+                            dataKey="value"
+                            nameKey="name"
+                            cx="50%"
+                            cy="50%"
+                            innerRadius={52}
+                            outerRadius={88}
+                            paddingAngle={2}
+                            label={({ percent }) => `${(percent * 100).toFixed(0)}%`}
+                          >
+                            <Cell key="active" fill="#86c9a3" />
+                            <Cell key="idle" fill="#f07178" />
+                          </Pie>
+                          <Tooltip formatter={(v: number) => [`${v.toLocaleString()} MHz`, ""]} />
+                          <Legend layout="vertical" align="right" verticalAlign="middle" wrapperStyle={{ fontSize: 11 }} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="chart-empty">No host CPU data.</div>
+                    )}
+                  </div>
+                </section>
+                <section className="panel monitor-chart compact">
+                  <header><h2>Memory: active vs idle hosts</h2></header>
+                  <div className="chart-wrap pie">
+                    {fleetMemPie.length ? (
+                      <ResponsiveContainer width="100%" height={240}>
+                        <PieChart>
+                          <Pie
+                            data={fleetMemPie}
+                            dataKey="value"
+                            nameKey="name"
+                            cx="50%"
+                            cy="50%"
+                            innerRadius={52}
+                            outerRadius={88}
+                            paddingAngle={2}
+                            label={({ percent }) => `${(percent * 100).toFixed(0)}%`}
+                          >
+                            <Cell key="active" fill="#7eb8da" />
+                            <Cell key="idle" fill="#f07178" />
+                          </Pie>
+                          <Tooltip formatter={(v: number) => [gib(v), ""]} />
+                          <Legend layout="vertical" align="right" verticalAlign="middle" wrapperStyle={{ fontSize: 11 }} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="chart-empty">No host memory data.</div>
+                    )}
+                  </div>
+                </section>
+              </div>
+
+              <section className="panel">
+                <header>
+                  <h2>Idle host details</h2>
+                  <p>All VMs on these hosts have been idle for more than 30 days. Shutting them down saves the resources below.</p>
+                </header>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Host</th>
+                        <th>Cluster</th>
+                        <th>VMs</th>
+                        <th>CPU capacity</th>
+                        <th>CPU usage</th>
+                        <th>Memory capacity</th>
+                        <th>Memory usage</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {idleHosts.map((host) => (
+                        <tr key={host.id}>
+                          <td><strong>{host.name}</strong></td>
+                          <td>{host.cluster_name || "—"}</td>
+                          <td>{host.vm_count}</td>
+                          <td>{(host.cpu_cores * host.cpu_mhz).toLocaleString()} MHz</td>
+                          <td>{host.cpu_usage_mhz.toLocaleString()} MHz ({host.cpu_usage_pct.toFixed(1)}%)</td>
+                          <td>{gib(host.memory_mib)}</td>
+                          <td>{gib(host.memory_usage_mib)} ({host.memory_usage_pct.toFixed(1)}%)</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td colSpan={3}><strong>Total reclaimable</strong></td>
+                        <td><strong>{idleTotals.totalCpuMhz.toLocaleString()} MHz</strong></td>
+                        <td><strong>{idleTotals.usedCpuMhz.toLocaleString()} MHz</strong></td>
+                        <td><strong>{gib(idleTotals.totalMemMib)}</strong></td>
+                        <td><strong>{gib(idleTotals.usedMemMib)}</strong></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </section>
+            </>
+          ) : null}
+        </>
+      ) : null}
 
       {!ownerFilter ? (
         <>
@@ -492,4 +1105,4 @@ export function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines }: P
       ) : null}
     </div>
   );
-}
+});

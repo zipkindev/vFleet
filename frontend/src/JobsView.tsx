@@ -1,3 +1,4 @@
+import React from "react";
 import { cancelJob, grantMigrationAccess, retryJob } from "./api";
 import { bytes, relTime } from "./format";
 import { isPermissionJobError } from "./MigrationAccessPanel";
@@ -18,7 +19,7 @@ function progressLabel(job: Job): string {
   return job.status;
 }
 
-export function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh: () => void }) {
+export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh: () => void }) {
   const jobs = data?.jobs ?? [];
   return (
     <div className="panel">
@@ -112,4 +113,4 @@ export function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh:
       )}
     </div>
   );
-}
+});
