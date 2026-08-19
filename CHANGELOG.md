@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] — 2026-08-19
+
+release: vFleet v1.0.0 — initial major release
+
+- 2 files changed, 322 insertions(+) · scripts/bump-version.py, scripts/install-hooks.sh
+
 All notable changes to vFleet are documented here.
 
 ---
