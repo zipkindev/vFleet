@@ -138,3 +138,18 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest
 ```
+
+## License
+
+Copyright (C) 2026 Michael Zipkin
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+**GNU Affero General Public License** as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but **WITHOUT ANY WARRANTY**;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the [GNU AGPL v3](LICENSE) for details.
+
+Key restriction: if you run a modified version of this software as a network service, you must
+make the complete corresponding source code available to users of that service (AGPL §13).

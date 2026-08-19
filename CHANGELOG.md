@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.5] — 2026-08-19
+
+perf: eliminate poll-driven re-renders and harden dev tooling
+
+- 5 files changed, 876 insertions(+), 1 deletion(-) · LICENSE, README.md, frontend/index.html, frontend/src/ThemeContext.tsx, frontend/src/ThemePanel.tsx
+
 ## [1.0.4] — 2026-08-19
 
 perf: eliminate poll-driven re-renders and harden dev tooling
