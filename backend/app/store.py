@@ -56,7 +56,6 @@ CREATE TABLE IF NOT EXISTS metrics (
     datastore_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS metrics_ts_owner ON metrics (owner_key, ts);
-CREATE INDEX IF NOT EXISTS metrics_scope_ts ON metrics (owner_key, host_id, datastore_id, ts);
 """
 
 

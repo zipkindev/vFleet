@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.7] — 2026-08-19
+
+monitor: drag-zoom charts, 14-day history, and host/datastore filters
+
+- 1 file changed, 1 deletion(-) · backend/app/store.py
+
 ## [1.0.6] — 2026-08-19
 
 ui: add theme customization and AGPL license
