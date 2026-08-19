@@ -9,6 +9,7 @@ export type ConnectionInfo = {
   last_sync: string | null;
   source: string;
   env_ready: boolean;
+  has_saved_password: boolean;
   saved_host: string;
   saved_user: string;
   saved_port: number;

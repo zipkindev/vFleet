@@ -43,7 +43,7 @@ from .reclaim import build_owner_reports
 from .metrics import build_owner_utilization
 from .power import normalize_power_state
 from .relay import RelayWorker
-from .session import apply_runtime, forget_vcenter, parse_endpoint, persist_vcenter
+from .session import apply_runtime, forget_vcenter, parse_endpoint, persist_vcenter, resolve_login_password
 from .store import LocalStore
 from .vm_storage import normalize_disk_transform
 
@@ -88,6 +88,7 @@ def decorate_connection(conn: ConnectionInfo, request: Request) -> ConnectionInf
         update={
             "source": _source(request),
             "env_ready": settings.has_vcenter_creds,
+            "has_saved_password": bool(settings.vcenter_password),
             "saved_host": settings.vcenter_host,
             "saved_user": settings.vcenter_user,
             "saved_port": settings.vcenter_port,
@@ -162,7 +163,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -233,20 +234,25 @@ def connection(request: Request, adapter: InventoryAdapter = Depends(get_adapter
 def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     host = body.host.strip()
     user = body.user.strip()
-    password = body.password
-    if not host or not user or not password:
+    if not host or not user:
         raise HTTPException(status_code=400, detail="Host, username, and password are required")
     try:
         endpoint, port = parse_endpoint(host, body.port)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    password = resolve_login_password(body.password or "", endpoint, user, port, settings)
+    if not password:
+        raise HTTPException(status_code=400, detail="Host, username, and password are required")
 
     live = apply_runtime(settings, endpoint, user, password, port, body.insecure)
     candidate = VCenterAdapter(live)
     info = candidate.connection()
     if not info.connected:
         _close(candidate)
-        raise HTTPException(status_code=401, detail=info.message or "Could not sign in to vCenter")
+        detail = info.message or "Could not sign in to vCenter"
+        lowered = detail.lower()
+        status = 401 if ("password" in lowered or "cannot complete login" in lowered or "incorrect user" in lowered) else 503
+        raise HTTPException(status_code=status, detail=detail)
 
     with request.app.state.swap_lock:
         previous = request.app.state.adapter
@@ -254,9 +260,8 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         request.app.state.session_source = "ui"
         _close(previous)
 
-    if body.remember:
-        persist_vcenter(settings, endpoint, user, password, port, body.insecure)
-        info.message = f"{info.message}. Saved on this machine for the next start."
+    persist_vcenter(settings, endpoint, user, password, port, body.insecure)
+    info.message = f"{info.message}. Saved on this machine for the next start."
     request.app.state.worker.wake()
     return decorate_connection(info, request)
 

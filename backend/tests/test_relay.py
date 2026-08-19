@@ -3,8 +3,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.errors import TransientError, is_permanent, is_transient
 from app.main import app
+from app.models import ConnectionInfo
+from app.relay import RelayWorker
 from app.store import LocalStore, backoff_seconds
 
 
@@ -13,6 +16,20 @@ def test_transient_and_permanent_classification():
     assert is_transient(TransientError("vpn dropped"))
     assert is_permanent(ValueError("file already exists"))
     assert not is_transient(ValueError("duplicate name"))
+
+
+def test_overlay_stale_only_when_unreachable(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path, vcenter_host="vc.example")
+    store = LocalStore(tmp_path / "vfleet.db")
+    worker = RelayWorker(settings, store, lambda: None)
+    conn = ConnectionInfo(mode="vcenter", connected=True, host="vc.example")
+    worker.reachable = True
+    worker.syncing = False
+    assert worker.overlay(conn).stale is False
+    worker.reachable = False
+    assert worker.overlay(conn).stale is True
+    worker.syncing = True
+    assert worker.overlay(conn).stale is False
 
 
 def test_store_job_retry_and_resume(tmp_path: Path):

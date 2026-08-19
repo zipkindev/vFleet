@@ -2,8 +2,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.main import app
-from app.session import parse_endpoint, quote_env_value, upsert_env
+from app.session import parse_endpoint, quote_env_value, resolve_login_password, upsert_env
 
 
 def test_parse_endpoint_strips_scheme_and_port():
@@ -19,6 +20,18 @@ def test_upsert_env_quotes_password(tmp_path: Path):
     assert "VCENTER_HOST=vc.example" in text
     assert "VCENTER_PASSWORD=" + quote_env_value("p@ss#word") in text
     assert "APP_MODE=demo" in text
+
+
+def test_resolve_login_password_reuses_saved_secret():
+    settings = Settings(
+        vcenter_host="vc.example",
+        vcenter_user="user@vsphere.local",
+        vcenter_password="saved-secret",
+        vcenter_port=443,
+    )
+    assert resolve_login_password("", "vc.example", "user@vsphere.local", 443, settings) == "saved-secret"
+    assert resolve_login_password("typed", "vc.example", "user@vsphere.local", 443, settings) == "typed"
+    assert resolve_login_password("", "other.example", "user@vsphere.local", 443, settings) == ""
 
 
 def test_login_requires_fields():
@@ -40,7 +53,7 @@ def test_login_rejects_unreachable_host():
                 "remember": False,
             },
         )
-        assert response.status_code == 401
+        assert response.status_code == 503
         assert client.get("/api/health").json()["mode"] == "demo"
 
 

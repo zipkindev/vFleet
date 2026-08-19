@@ -40,6 +40,7 @@ class RelayWorker(threading.Thread):
         self.sync_now(force=True)
         while not self._halt.is_set():
             self.sync_now(force=False)
+            self._heartbeat()
             self._drain()
             self._wake.wait(self.settings.relay_tick_seconds)
             self._wake.clear()
@@ -108,7 +109,9 @@ class RelayWorker(threading.Thread):
         if conn.mode == "vcenter":
             if self.reachable is False:
                 conn = conn.model_copy(update={"connected": False})
-            stale = (not conn.connected) or (age is not None and age > self.settings.sync_interval_seconds * 2)
+            # A full inventory pull of a large vCenter can exceed sync_interval.
+            # Only treat the relay as stale when the session is actually down.
+            stale = self.reachable is False and not self.syncing
         message = conn.message
         if stale and saved_at is not None:
             message = self.last_error or conn.message or "vCenter unreachable; showing last local snapshot"
@@ -146,6 +149,21 @@ class RelayWorker(threading.Thread):
             )
         snapshot.connection = self.overlay(live)
         return snapshot
+
+    def _heartbeat(self) -> None:
+        if self.syncing:
+            return
+        adapter = self.adapter()
+        ping = getattr(adapter, "ping", None)
+        if not callable(ping):
+            return
+        try:
+            ping()
+            self.reachable = True
+            self.last_error = ""
+        except Exception as exc:
+            self.last_error = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
+            self.reachable = False
 
     def _drain(self) -> None:
         job = self.store.claim_next()

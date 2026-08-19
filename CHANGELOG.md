@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.8] — 2026-08-19
+
+fix: migrate host/datastore metric columns before creating their index
+
+- 13 files changed, 171 insertions(+), 19 deletions(-) · backend/app/adapters/base.py, backend/app/adapters/vcenter.py, backend/app/main.py, backend/app/models.py, backend/app/relay.py, backend/app/session.py, …
+
 ## [1.0.7] — 2026-08-19
 
 monitor: drag-zoom charts, 14-day history, and host/datastore filters

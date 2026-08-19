@@ -440,6 +440,9 @@ class VCenterAdapter(InventoryAdapter):
         self._si = self._connect()
         return self._si
 
+    def ping(self) -> None:
+        self._session()
+
     def _connect(self):
         from pyVim.connect import SmartConnect
 

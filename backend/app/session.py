@@ -58,6 +58,19 @@ def upsert_env(path: Path, updates: Dict[str, str]) -> None:
         pass
 
 
+def resolve_login_password(provided: str, host: str, user: str, port: int, settings: Settings) -> str:
+    if provided:
+        return provided
+    if (
+        settings.vcenter_password
+        and host == settings.vcenter_host
+        and user == settings.vcenter_user
+        and port == settings.vcenter_port
+    ):
+        return settings.vcenter_password
+    return ""
+
+
 def persist_vcenter(settings: Settings, host: str, user: str, password: str, port: int, insecure: bool) -> None:
     upsert_env(
         ROOT / ".env",

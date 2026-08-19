@@ -15,6 +15,7 @@ class ConnectionInfo(BaseModel):
     last_sync: Optional[datetime] = None
     source: str = "demo"
     env_ready: bool = False
+    has_saved_password: bool = False
     saved_host: str = ""
     saved_user: str = ""
     saved_port: int = 443
@@ -31,7 +32,7 @@ class ConnectionInfo(BaseModel):
 class LoginRequest(BaseModel):
     host: str
     user: str
-    password: str
+    password: str = ""
     port: int = 443
     insecure: bool = True
     remember: bool = False

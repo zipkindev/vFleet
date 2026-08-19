@@ -73,6 +73,9 @@ class InventoryAdapter(ABC):
     def historical_metrics(self, snapshot: InventorySnapshot, catalog: Optional[Catalog] = None):
         return []
 
+    def ping(self) -> None:
+        return None
+
     def mkdir(self, datastore_id: str, path: str) -> None:
         raise NotImplementedError(f"{type(self).__name__} cannot create datastore folders")
 

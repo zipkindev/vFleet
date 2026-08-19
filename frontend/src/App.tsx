@@ -775,7 +775,15 @@ function StatusPill({ connection, loading }: { connection: ConnectionInfo | null
   const tone = connection.stale ? "warm" : connection.connected ? "ok" : "bad";
   return (
     <div className={`pill ${tone}`}>
-      <span>{connection.mode === "vcenter" ? (connection.stale ? "Relay · stale" : "vCenter") : "Demo"}</span>
+      <span>
+        {connection.mode === "vcenter"
+          ? connection.stale
+            ? "Relay · stale"
+            : connection.syncing
+              ? "vCenter · syncing"
+              : "vCenter"
+          : "Demo"}
+      </span>
       <small>{connection.host || "local demo"}</small>
       <small>
         {connection.stale

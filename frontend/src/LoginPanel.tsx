@@ -17,9 +17,19 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
   const [busy, setBusy] = useState<"test" | "save" | null>(null);
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
+  const savedPassword = Boolean(
+    connection?.has_saved_password &&
+      host.trim() === (connection?.saved_host || "") &&
+      user.trim() === (connection?.saved_user || "") &&
+      (Number(port) || 443) === (connection?.saved_port || 443)
+  );
 
   async function submit(kind: "test" | "save") {
-    if (!host.trim() || !user.trim() || !password) {
+    if (!host.trim() || !user.trim()) {
+      setError("Host, username, and password are required");
+      return;
+    }
+    if (!password && !savedPassword) {
       setError("Host, username, and password are required");
       return;
     }
@@ -33,14 +43,13 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
         password,
         port: Number(port) || 443,
         insecure,
-        remember: kind === "save",
-        connect: kind === "save",
+        remember: true,
+        connect: true,
       });
       if (kind === "save") {
-        setPassword("");
         onConnected(info);
       } else {
-        setOk(info.message || "Credentials work.");
+        setOk(info.message || "Credentials work. Password is saved on this machine.");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign-in failed");
@@ -61,8 +70,9 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
       >
         <h2>Connect to vCenter</h2>
         <p>
-          Test checks the server and account without leaving demo. Save validates first, then stores the endpoint in local{" "}
-          <code>.env</code> and switches to live inventory.
+          Test verifies the account and keeps the password. Save stores the endpoint in local{" "}
+          <code>.env</code> and switches to live inventory. A saved password stays on this machine
+          and does not need to be retyped.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
         {ok ? <div className="banner ok">{ok}</div> : null}
@@ -101,6 +111,7 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
             onChange={(event) => setPassword(event.target.value)}
             autoComplete="off"
             name="vcenter-password"
+            placeholder={savedPassword && !password ? "Saved on this machine" : ""}
           />
         </label>
         <label className="check">

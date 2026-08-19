@@ -13,6 +13,8 @@ ProgressFn = Callable[[int, Dict[str, Any]], None]
 
 
 class OffsetReader:
+    """File-like byte iterator so httpx 0.28+ can stream `content=`."""
+
     def __init__(self, path: Path, start: int, on_read: Optional[Callable[[int], None]] = None) -> None:
         self._handle = path.open("rb")
         self._handle.seek(start)
@@ -26,6 +28,13 @@ class OffsetReader:
             if self._on_read:
                 self._on_read(self._sent)
         return data
+
+    def __iter__(self):
+        while True:
+            chunk = self.read()
+            if not chunk:
+                break
+            yield chunk
 
     def close(self) -> None:
         self._handle.close()
