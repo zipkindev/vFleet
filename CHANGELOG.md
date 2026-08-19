@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.6] — 2026-08-19
+
+ui: add theme customization and AGPL license
+
+- 15 files changed, 902 insertions(+), 96 deletions(-) · backend/app/adapters/base.py, backend/app/adapters/demo.py, backend/app/adapters/vcenter.py, backend/app/main.py, backend/app/metrics.py, backend/app/models.py, …
+
 ## [1.0.5] — 2026-08-19
 
 perf: eliminate poll-driven re-renders and harden dev tooling

@@ -230,6 +230,8 @@ export type MetricsResponse = {
   owners: OwnerUtilization[];
   hours: number;
   owner: string;
+  host: string;
+  datastore: string;
   points: number;
 };
 

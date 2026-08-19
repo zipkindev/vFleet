@@ -605,6 +605,7 @@ export function App() {
             onOpenMachines={openMachinesForOwner}
             hosts={hosts}
             vms={vms}
+            catalog={catalog}
           />
         ) : null}
         {view === "hosts" ? <HostTable hosts={hosts} /> : null}

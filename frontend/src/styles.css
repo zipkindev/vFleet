@@ -630,9 +630,10 @@ main {
 
 /* ── Help modal (near-full-screen) ─────────────────────────────── */
 .howto-modal {
-  width: min(1440px, 98vw);
+  width: min(84vw, 1440px);
+  min-width: min(1120px, calc(100vw - 24px));
   height: 94vh;
-  max-width: 100%;
+  max-width: calc(100vw - 24px);
   display: flex;
   flex-direction: column;
   padding: 0;
@@ -1252,7 +1253,7 @@ tr.nested td:first-child {
 
 .monitor-controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
 }
 
@@ -1314,6 +1315,27 @@ tr.nested td:first-child {
 .monitor-chart .chart-wrap {
   padding: 0 12px 16px;
   min-height: 220px;
+}
+
+.chart-wrap.zoomable {
+  cursor: crosshair;
+  user-select: none;
+}
+
+.chart-inline-filter {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 160px;
+}
+
+.chart-inline-filter select {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: var(--ink);
 }
 
 .monitor-chart.compact .chart-wrap.pie {

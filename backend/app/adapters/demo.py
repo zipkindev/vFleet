@@ -8,6 +8,7 @@ from ..grouping import resolve_owner
 from ..errors import PermanentError
 from ..models import (
     ActionResult,
+    Catalog,
     CloneVmRequest,
     ClusterSummary,
     ConnectionInfo,
@@ -164,6 +165,11 @@ class DemoAdapter(InventoryAdapter):
 
     def list_datastores(self) -> List[DatastoreSummary]:
         return [item.model_copy(deep=True) for item in self._datastores.values()]
+
+    def historical_metrics(self, snapshot: InventorySnapshot, catalog: Optional[Catalog] = None):
+        from ..metrics import HISTORY_DAYS, build_metric_samples, synthesize_history
+
+        return synthesize_history(build_metric_samples(snapshot, catalog or Catalog(datastores=self.list_datastores())), days=HISTORY_DAYS)
 
     def list_templates(self) -> List[VmTemplate]:
         return [item.model_copy(deep=True) for item in self._templates.values()]

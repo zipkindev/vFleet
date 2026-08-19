@@ -14,6 +14,7 @@ from ..errors import PermanentError, TransientError, humanize_vcenter_error, is_
 from ..grouping import resolve_owner
 from ..models import (
     ActionResult,
+    Catalog,
     CloneVmRequest,
     ClusterSummary,
     ConnectionInfo,
@@ -129,6 +130,198 @@ class VCenterAdapter(InventoryAdapter):
             self._cache = snapshot
             self._cache_at = time.time()
         return snapshot
+
+    def historical_metrics(self, snapshot: InventorySnapshot, catalog: Optional[Catalog] = None):
+        """Pull vCenter historical performance (about 2 weeks) when the stats service has it."""
+        from pyVmomi import vim
+
+        from ..metrics import HISTORY_DAYS, MetricSample
+
+        si = self._session()
+        perf = si.content.perfManager
+        counter_map: Dict[str, tuple[int, str]] = {}
+        for counter in perf.perfCounter or []:
+            group = getattr(getattr(counter, "groupInfo", None), "key", "")
+            name = getattr(getattr(counter, "nameInfo", None), "key", "")
+            rollup = str(getattr(counter, "rollupType", "")).split(".")[-1].lower()
+            unit = getattr(getattr(counter, "unitInfo", None), "key", "") or ""
+            if group and name:
+                counter_map[f"{group}.{name}.{rollup}"] = (int(counter.key), unit)
+
+        cpu_meta = counter_map.get("cpu.usage.average")
+        mem_meta = counter_map.get("mem.usage.average")
+        disk_used_meta = counter_map.get("disk.used.latest") or counter_map.get("disk.capacity.latest")
+        disk_cap_meta = counter_map.get("disk.capacity.latest") or counter_map.get("disk.provisioned.latest")
+        if not cpu_meta and not mem_meta and not disk_used_meta:
+            return []
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=HISTORY_DAYS)
+        interval = 1800
+        naive_start = start.replace(tzinfo=None)
+        naive_end = end.replace(tzinfo=None)
+
+        def metric_ids(*metas: Optional[tuple[int, str]]) -> List[Any]:
+            ids = []
+            for meta in metas:
+                if meta:
+                    ids.append(vim.PerformanceManager.MetricId(counterId=meta[0], instance=""))
+            return ids
+
+        specs: List[Any] = []
+        kinds: List[tuple[str, str]] = []
+        for host in snapshot.hosts:
+            ids = metric_ids(cpu_meta, mem_meta)
+            if not ids:
+                break
+            try:
+                specs.append(
+                    vim.PerformanceManager.QuerySpec(
+                        entity=self._obj(vim.HostSystem, host.id),
+                        metricId=ids,
+                        startTime=naive_start,
+                        endTime=naive_end,
+                        intervalId=interval,
+                    )
+                )
+                kinds.append(("host", host.id))
+            except Exception:
+                continue
+        stores = list(catalog.datastores) if catalog is not None else []
+        for store in stores:
+            ids = metric_ids(disk_used_meta, disk_cap_meta)
+            if not ids:
+                break
+            try:
+                specs.append(
+                    vim.PerformanceManager.QuerySpec(
+                        entity=self._obj(vim.Datastore, store.id),
+                        metricId=ids,
+                        startTime=naive_start,
+                        endTime=naive_end,
+                        intervalId=interval,
+                    )
+                )
+                kinds.append(("datastore", store.id))
+            except Exception:
+                continue
+        if not specs:
+            return []
+
+        results: List[Any] = []
+        for offset in range(0, len(specs), 8):
+            chunk = specs[offset : offset + 8]
+            try:
+                results.extend(perf.QueryPerf(querySpec=chunk) or [])
+            except Exception:
+                try:
+                    for spec in chunk:
+                        spec.intervalId = 300
+                    results.extend(perf.QueryPerf(querySpec=chunk) or [])
+                except Exception:
+                    continue
+
+        host_by_id = {host.id: host for host in snapshot.hosts}
+        store_by_id = {store.id: store for store in stores}
+        entity_kind = {entity_id: kind for kind, entity_id in kinds}
+
+        def as_pct(raw: float, unit: str) -> float:
+            value = float(raw)
+            if unit == "percent" and value > 100:
+                value = value / 100.0
+            return round(max(0.0, min(100.0, value)), 2)
+
+        samples: List[MetricSample] = []
+        host_points: Dict[datetime, List[MetricSample]] = {}
+        for entity_metric in results:
+            entity = getattr(entity_metric, "entity", None)
+            moid = _moid(entity)
+            kind = entity_kind.get(moid)
+            if kind is None:
+                type_name = type(entity).__name__ if entity is not None else ""
+                if "Host" in type_name:
+                    kind = "host"
+                elif "Datastore" in type_name:
+                    kind = "datastore"
+                else:
+                    continue
+            times = [item.timestamp.replace(tzinfo=timezone.utc) if getattr(item.timestamp, "tzinfo", None) is None else item.timestamp.astimezone(timezone.utc) for item in (entity_metric.sampleInfo or [])]
+            series: Dict[int, List[int]] = {}
+            for value in entity_metric.value or []:
+                series[int(value.id.counterId)] = list(value.value or [])
+            if kind == "host":
+                host = host_by_id.get(moid)
+                cpu_id = cpu_meta[0] if cpu_meta else -1
+                mem_id = mem_meta[0] if mem_meta else -1
+                cpu_unit = cpu_meta[1] if cpu_meta else ""
+                mem_unit = mem_meta[1] if mem_meta else ""
+                for index, ts in enumerate(times):
+                    cpu_vals = series.get(cpu_id) or []
+                    mem_vals = series.get(mem_id) or []
+                    cpu_pct = as_pct(cpu_vals[index], cpu_unit) if index < len(cpu_vals) else (host.cpu_usage_pct if host else 0.0)
+                    mem_pct = as_pct(mem_vals[index], mem_unit) if index < len(mem_vals) else (host.memory_usage_pct if host else 0.0)
+                    cpu_mhz = int((cpu_pct / 100.0) * host.cpu_cores * host.cpu_mhz) if host else 0
+                    mem_mib = int((mem_pct / 100.0) * host.memory_mib) if host else 0
+                    sample = MetricSample(
+                        ts=ts,
+                        owner_key="",
+                        cpu_pct=cpu_pct,
+                        memory_pct=mem_pct,
+                        disk_pct=0.0,
+                        cpu_usage_mhz=cpu_mhz,
+                        memory_usage_mib=mem_mib,
+                        storage_bytes=0,
+                        host_id=moid,
+                    )
+                    samples.append(sample)
+                    host_points.setdefault(ts.replace(second=0, microsecond=0), []).append(sample)
+            elif kind == "datastore":
+                store = store_by_id.get(moid)
+                used_id = disk_used_meta[0] if disk_used_meta else -1
+                cap_id = disk_cap_meta[0] if disk_cap_meta else -1
+                for index, ts in enumerate(times):
+                    used_vals = series.get(used_id) or []
+                    cap_vals = series.get(cap_id) or []
+                    used = float(used_vals[index]) if index < len(used_vals) else 0.0
+                    cap = float(cap_vals[index]) if index < len(cap_vals) else (store.capacity_bytes / 1024 if store else 0.0)
+                    if cap <= 0 and store:
+                        cap = store.capacity_bytes / 1024.0
+                    # vCenter disk counters are typically KB
+                    used_bytes = int(used * 1024)
+                    cap_bytes = int(cap * 1024) if cap else (store.capacity_bytes if store else 0)
+                    pct = (used_bytes / cap_bytes * 100.0) if cap_bytes else (store.usage_pct if store else 0.0)
+                    samples.append(
+                        MetricSample(
+                            ts=ts,
+                            owner_key="",
+                            cpu_pct=0.0,
+                            memory_pct=0.0,
+                            disk_pct=round(max(0.0, min(100.0, pct)), 2),
+                            cpu_usage_mhz=0,
+                            memory_usage_mib=0,
+                            storage_bytes=used_bytes,
+                            datastore_id=moid,
+                        )
+                    )
+
+        for ts, group in host_points.items():
+            if not group:
+                continue
+            cpu_pct = sum(item.cpu_pct for item in group) / len(group)
+            mem_pct = sum(item.memory_pct for item in group) / len(group)
+            samples.append(
+                MetricSample(
+                    ts=ts,
+                    owner_key="",
+                    cpu_pct=round(cpu_pct, 2),
+                    memory_pct=round(mem_pct, 2),
+                    disk_pct=0.0,
+                    cpu_usage_mhz=sum(item.cpu_usage_mhz for item in group),
+                    memory_usage_mib=sum(item.memory_usage_mib for item in group),
+                    storage_bytes=0,
+                )
+            )
+        return samples
 
     def apply_actions(self, vm_ids: Iterable[str], action: str) -> List[ActionResult]:
         if action not in ALLOWED_ACTIONS:

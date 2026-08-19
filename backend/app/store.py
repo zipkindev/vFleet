@@ -51,9 +51,12 @@ CREATE TABLE IF NOT EXISTS metrics (
     cpu_usage_mhz INTEGER NOT NULL DEFAULT 0,
     memory_usage_mib INTEGER NOT NULL DEFAULT 0,
     storage_bytes INTEGER NOT NULL DEFAULT 0,
-    vm_count INTEGER NOT NULL DEFAULT 0
+    vm_count INTEGER NOT NULL DEFAULT 0,
+    host_id TEXT NOT NULL DEFAULT '',
+    datastore_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS metrics_ts_owner ON metrics (owner_key, ts);
+CREATE INDEX IF NOT EXISTS metrics_scope_ts ON metrics (owner_key, host_id, datastore_id, ts);
 """
 
 
@@ -89,11 +92,26 @@ class LocalStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate_metrics()
             self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _migrate_metrics(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(metrics)").fetchall()}
+        if "host_id" not in cols:
+            self._conn.execute("ALTER TABLE metrics ADD COLUMN host_id TEXT NOT NULL DEFAULT ''")
+        if "datastore_id" not in cols:
+            self._conn.execute("ALTER TABLE metrics ADD COLUMN datastore_id TEXT NOT NULL DEFAULT ''")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS metrics_scope_ts ON metrics (owner_key, host_id, datastore_id, ts)")
+
+    def history_seeded(self) -> bool:
+        return self._get_kv("metrics_history_seeded") is not None
+
+    def mark_history_seeded(self) -> None:
+        self._put_kv("metrics_history_seeded", "1")
 
     def _put_kv(self, key: str, payload: str) -> None:
         with self._lock:
@@ -340,12 +358,12 @@ class LocalStore:
         return self.staging_dir / staging_id
 
     def record_metrics(self, samples) -> None:
-        from .metrics import MetricSample
+        from .metrics import HISTORY_DAYS, MetricSample
 
         if not samples:
             return
         now = _now()
-        cutoff = _iso(now - timedelta(days=7))
+        cutoff = _iso(now - timedelta(days=HISTORY_DAYS))
         with self._lock:
             for sample in samples:
                 if not isinstance(sample, MetricSample):
@@ -353,8 +371,9 @@ class LocalStore:
                 self._conn.execute(
                     """INSERT INTO metrics(
                            ts, owner_key, cpu_pct, memory_pct, disk_pct,
-                           cpu_usage_mhz, memory_usage_mib, storage_bytes, vm_count
-                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                           cpu_usage_mhz, memory_usage_mib, storage_bytes, vm_count,
+                           host_id, datastore_id
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         _iso(sample.ts),
                         sample.owner_key,
@@ -365,31 +384,54 @@ class LocalStore:
                         sample.memory_usage_mib,
                         sample.storage_bytes,
                         sample.vm_count,
+                        sample.host_id,
+                        sample.datastore_id,
                     ),
                 )
             self._conn.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
             self._conn.commit()
 
-    def load_metrics(self, hours: float = 24.0, owner: str = "") -> List[MetricPoint]:
-        since = _iso(_now() - timedelta(hours=hours))
+    def load_metrics(
+        self,
+        hours: float = 24.0,
+        owner: str = "",
+        host_id: str = "",
+        datastore_id: str = "",
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        max_points: int = 1200,
+    ) -> List[MetricPoint]:
         owner_key = owner.strip()
+        host = host_id.strip()
+        datastore = datastore_id.strip()
+        start = since or (_now() - timedelta(hours=hours))
+        end = until or _now()
+        cpu_mem = self._query_metric_rows(start, end, owner_key, host, "")
+        if datastore:
+            disk = self._query_metric_rows(start, end, "", "", datastore)
+            points = _stitch_disk(cpu_mem, disk)
+        else:
+            points = cpu_mem
+        return _downsample(points, max_points)
+
+    def _query_metric_rows(
+        self,
+        since: datetime,
+        until: datetime,
+        owner_key: str,
+        host_id: str,
+        datastore_id: str,
+    ) -> List[MetricPoint]:
+        since_iso, until_iso = _iso(since), _iso(until)
         with self._lock:
-            if owner_key:
-                rows = self._conn.execute(
-                    """SELECT ts, cpu_pct, memory_pct, disk_pct, cpu_usage_mhz, memory_usage_mib, storage_bytes
-                       FROM metrics
-                       WHERE LOWER(owner_key) = LOWER(?) AND ts >= ?
-                       ORDER BY ts ASC""",
-                    (owner_key, since),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    """SELECT ts, cpu_pct, memory_pct, disk_pct, cpu_usage_mhz, memory_usage_mib, storage_bytes
-                       FROM metrics
-                       WHERE owner_key = '' AND ts >= ?
-                       ORDER BY ts ASC""",
-                    (since,),
-                ).fetchall()
+            rows = self._conn.execute(
+                """SELECT ts, cpu_pct, memory_pct, disk_pct, cpu_usage_mhz, memory_usage_mib, storage_bytes
+                   FROM metrics
+                   WHERE LOWER(owner_key) = LOWER(?) AND host_id = ? AND datastore_id = ?
+                     AND ts >= ? AND ts <= ?
+                   ORDER BY ts ASC""",
+                (owner_key, host_id, datastore_id, since_iso, until_iso),
+            ).fetchall()
         points: List[MetricPoint] = []
         for row in rows:
             points.append(
@@ -436,3 +478,35 @@ class LocalStore:
             updated_at=_parse(row["updated_at"]) or _now(),
             idempotency_key=row["idempotency_key"] or "",
         )
+
+
+def _minute_key(value: datetime) -> datetime:
+    return value.replace(second=0, microsecond=0)
+
+
+def _stitch_disk(cpu_mem: List[MetricPoint], disk: List[MetricPoint]) -> List[MetricPoint]:
+    if not disk:
+        return cpu_mem
+    if not cpu_mem:
+        return disk
+    disk_map = {_minute_key(point.ts): point for point in disk}
+    stitched: List[MetricPoint] = []
+    for point in cpu_mem:
+        match = disk_map.get(_minute_key(point.ts))
+        if match is None:
+            stitched.append(point)
+            continue
+        stitched.append(
+            point.model_copy(update={"disk_pct": match.disk_pct, "storage_bytes": match.storage_bytes})
+        )
+    return stitched
+
+
+def _downsample(points: List[MetricPoint], max_points: int) -> List[MetricPoint]:
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    step = (len(points) - 1) / (max_points - 1)
+    indexes = sorted({min(len(points) - 1, int(round(i * step))) for i in range(max_points)})
+    if indexes[-1] != len(points) - 1:
+        indexes.append(len(points) - 1)
+    return [points[index] for index in indexes]

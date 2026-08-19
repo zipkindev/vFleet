@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -161,7 +162,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -302,12 +303,26 @@ def inventory(
 def metrics(
     request: Request,
     worker: RelayWorker = Depends(get_worker),
-    hours: float = Query(default=24.0, ge=0.25, le=168.0),
+    hours: float = Query(default=24.0, ge=0.25, le=336.0),
     owner: Optional[str] = Query(default=None),
+    host: Optional[str] = Query(default=None),
+    datastore: Optional[str] = Query(default=None),
+    since: Optional[datetime] = Query(default=None),
+    until: Optional[datetime] = Query(default=None),
 ) -> MetricsResponse:
     store: LocalStore = request.app.state.store
     owner_key = (owner or "").strip()
-    series = store.load_metrics(hours=hours, owner=owner_key)
+    host_id = (host or "").strip()
+    datastore_id = (datastore or "").strip()
+    series_owner = "" if host_id else owner_key
+    series = store.load_metrics(
+        hours=hours,
+        owner=series_owner,
+        host_id=host_id,
+        datastore_id=datastore_id,
+        since=since,
+        until=until,
+    )
     snapshot = worker.cached_snapshot()
     catalog = store.load_catalog()
     owners: list = []
@@ -318,6 +333,8 @@ def metrics(
         owners=owners,
         hours=hours,
         owner=owner_key,
+        host=host_id,
+        datastore=datastore_id,
         points=len(series),
     )
 

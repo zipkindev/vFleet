@@ -8,7 +8,6 @@ from .adapters.base import InventoryAdapter
 from .config import Settings
 from .errors import PermanentError, humanize_vcenter_error, is_permanent, is_transient
 from .models import Catalog, CloneVmRequest, ConnectionInfo, InventorySnapshot, Job, MigrateVmRequest
-from .metrics import build_metric_samples
 from .store import LocalStore
 
 
@@ -45,6 +44,20 @@ class RelayWorker(threading.Thread):
             self._wake.wait(self.settings.relay_tick_seconds)
             self._wake.clear()
 
+    def _record_metrics(self, adapter: InventoryAdapter, snapshot: InventorySnapshot, catalog: Optional[Catalog]) -> None:
+        from .metrics import build_metric_samples
+
+        live = build_metric_samples(snapshot, catalog)
+        if not self.store.history_seeded():
+            try:
+                history = adapter.historical_metrics(snapshot, catalog)
+                if history:
+                    self.store.record_metrics(history)
+            except Exception:
+                history = []
+            self.store.mark_history_seeded()
+        self.store.record_metrics(live)
+
     def sync_now(self, force: bool = False) -> None:
         last = self.store.inventory_saved_at()
         if not force and last is not None:
@@ -73,7 +86,7 @@ class RelayWorker(threading.Thread):
             except Exception as exc:
                 self.last_error = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
             try:
-                self.store.record_metrics(build_metric_samples(snapshot, catalog or self.store.load_catalog()))
+                self._record_metrics(adapter, snapshot, catalog or self.store.load_catalog())
             except Exception:
                 pass
             self.last_error = ""

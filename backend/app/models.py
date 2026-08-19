@@ -334,4 +334,6 @@ class MetricsResponse(BaseModel):
     owners: List[OwnerUtilization]
     hours: float
     owner: str = ""
+    host: str = ""
+    datastore: str = ""
     points: int = 0

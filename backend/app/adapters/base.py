@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..models import (
     ActionResult,
+    Catalog,
     CloneVmRequest,
     ConnectionInfo,
     DatastoreListing,
@@ -68,6 +69,9 @@ class InventoryAdapter(ABC):
 
     def wait_task(self, task_id: str) -> Any:
         return None
+
+    def historical_metrics(self, snapshot: InventorySnapshot, catalog: Optional[Catalog] = None):
+        return []
 
     def mkdir(self, datastore_id: str, path: str) -> None:
         raise NotImplementedError(f"{type(self).__name__} cannot create datastore folders")

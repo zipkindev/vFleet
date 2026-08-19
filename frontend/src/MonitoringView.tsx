@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -9,6 +9,7 @@ import {
   Legend,
   Pie,
   PieChart,
+  ReferenceArea,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -17,13 +18,14 @@ import {
 import { fetchMetrics } from "./api";
 import { bytes, gib } from "./format";
 import { sortMonitorOwners, toggleSortDir, type MonitorOwnerSortKey, type SortDir } from "./sort";
-import type { HostSummary, MetricsResponse, OwnerUtilization, VirtualMachine } from "./types";
+import type { Catalog, HostSummary, MetricsResponse, OwnerUtilization, VirtualMachine } from "./types";
 
 const HOUR_OPTIONS = [
   { label: "1 hour", value: 1 },
   { label: "6 hours", value: 6 },
   { label: "24 hours", value: 24 },
   { label: "7 days", value: 168 },
+  { label: "14 days", value: 336 },
 ];
 
 const IDLE_THRESHOLD_OPTIONS = [
@@ -60,16 +62,23 @@ const PIE_COLORS = [
 
 type PieRow = { name: string; value: number; owner_key: string };
 
+type ZoomRange = { from: string; to: string };
+
 type Props = {
   ownerFilter: string;
   onOwnerFilter: (owner: string) => void;
   onOpenMachines: (owner: string) => void;
   hosts?: HostSummary[];
   vms?: VirtualMachine[];
+  catalog?: Catalog | null;
 };
 
-function formatAxisTime(ts: string) {
+function formatAxisTime(ts: string, spanMs: number) {
   const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return ts;
+  if (spanMs >= 48 * 3600 * 1000) {
+    return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+  }
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
@@ -181,27 +190,55 @@ function UtilLineChart({
   dataKey,
   color,
   data,
+  selectFrom,
+  selectTo,
+  onSelectStart,
+  onSelectMove,
+  extra,
 }: {
   title: string;
   dataKey: "cpu_pct" | "memory_pct" | "disk_pct";
   color: string;
   data: MetricsResponse["series"];
+  selectFrom: string;
+  selectTo: string;
+  onSelectStart: (ts: string) => void;
+  onSelectMove: (ts: string) => void;
+  extra?: React.ReactNode;
 }) {
   const chartData = data.map((row) => ({
     ts: row.ts,
     value: row[dataKey],
   }));
+  const spanMs =
+    chartData.length >= 2
+      ? Math.max(1, new Date(chartData[chartData.length - 1].ts).getTime() - new Date(chartData[0].ts).getTime())
+      : 0;
+  const left = selectFrom && selectTo ? (selectFrom < selectTo ? selectFrom : selectTo) : "";
+  const right = selectFrom && selectTo ? (selectFrom < selectTo ? selectTo : selectFrom) : "";
 
   return (
     <section className="panel monitor-chart">
       <header>
-        <h2>{title}</h2>
-        <p>Utilization over time</p>
+        <div>
+          <h2>{title}</h2>
+          <p>Drag a range to zoom it to the full chart width</p>
+        </div>
+        {extra}
       </header>
-      <div className="chart-wrap">
+      <div className="chart-wrap zoomable">
         {chartData.length ? (
           <ResponsiveContainer width="100%" height={220}>
-            <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+            <AreaChart
+              data={chartData}
+              margin={{ top: 8, right: 12, left: -8, bottom: 0 }}
+              onMouseDown={(state) => {
+                if (state?.activeLabel) onSelectStart(String(state.activeLabel));
+              }}
+              onMouseMove={(state) => {
+                if (selectFrom && state?.activeLabel) onSelectMove(String(state.activeLabel));
+              }}
+            >
               <defs>
                 <linearGradient id={`grad-${dataKey}`} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor={color} stopOpacity={0.45} />
@@ -211,7 +248,7 @@ function UtilLineChart({
               <CartesianGrid stroke="rgba(154, 165, 140, 0.15)" vertical={false} />
               <XAxis
                 dataKey="ts"
-                tickFormatter={formatAxisTime}
+                tickFormatter={(value) => formatAxisTime(String(value), spanMs)}
                 stroke="var(--muted)"
                 fontSize={11}
                 minTickGap={28}
@@ -228,6 +265,9 @@ function UtilLineChart({
                 dot={false}
                 activeDot={{ r: 4 }}
               />
+              {left && right && left !== right ? (
+                <ReferenceArea x1={left} x2={right} strokeOpacity={0.25} fill={color} fillOpacity={0.18} />
+              ) : null}
             </AreaChart>
           </ResponsiveContainer>
         ) : (
@@ -297,14 +337,34 @@ function OwnerPieChart({
   );
 }
 
-export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, onOwnerFilter, onOpenMachines, hosts = [], vms = [] }: Props) {
-  const [hours, setHours] = useState(24);
+export const MonitoringView = React.memo(function MonitoringView({
+  ownerFilter,
+  onOwnerFilter,
+  onOpenMachines,
+  hosts = [],
+  vms = [],
+  catalog = null,
+}: Props) {
+  const [hours, setHours] = useState(336);
+  const [hostFilter, setHostFilter] = useState("");
+  const [datastoreFilter, setDatastoreFilter] = useState("");
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [error, setError] = useState("");
   const [topLimit, setTopLimit] = useState(10);
   const [idleThreshold, setIdleThreshold] = useState(120);
   const [sortKey, setSortKey] = useState<MonitorOwnerSortKey>("cpu_share_pct");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [zoom, setZoom] = useState<ZoomRange | null>(null);
+  const [zoomStack, setZoomStack] = useState<ZoomRange[]>([]);
+  const [selectFrom, setSelectFrom] = useState("");
+  const [selectTo, setSelectTo] = useState("");
+  const dragRef = useRef({
+    from: "",
+    to: "",
+    series: [] as MetricsResponse["series"],
+    zoom: null as ZoomRange | null,
+    visible: [] as MetricsResponse["series"],
+  });
 
   function pickSort(key: MonitorOwnerSortKey) {
     setSortDir((dir) => toggleSortDir(sortKey, key, dir));
@@ -313,7 +373,14 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
 
   async function load() {
     try {
-      const payload = await fetchMetrics({ hours, owner: ownerFilter || undefined });
+      const payload = await fetchMetrics({
+        hours,
+        owner: ownerFilter || undefined,
+        host: hostFilter || undefined,
+        datastore: datastoreFilter || undefined,
+        since: zoom?.from,
+        until: zoom?.to,
+      });
       setMetrics((prev) => (JSON.stringify(prev) === JSON.stringify(payload) ? prev : payload));
       setError("");
     } catch (err) {
@@ -325,9 +392,88 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
     void load();
     const timer = window.setInterval(() => void load(), 8000);
     return () => window.clearInterval(timer);
-  }, [hours, ownerFilter]);
+  }, [hours, ownerFilter, hostFilter, datastoreFilter, zoom?.from, zoom?.to]);
 
   const series = metrics?.series ?? [];
+  const visibleSeries = useMemo(() => {
+    if (!zoom) return series;
+    const sliced = series.filter((point) => point.ts >= zoom.from && point.ts <= zoom.to);
+    return sliced.length >= 2 ? sliced : series;
+  }, [series, zoom]);
+
+  dragRef.current = { from: selectFrom, to: selectTo, series, zoom, visible: visibleSeries };
+
+  useEffect(() => {
+    function onUp() {
+      const drag = dragRef.current;
+      if (!drag.from || !drag.to || drag.from === drag.to) {
+        if (drag.from) {
+          setSelectFrom("");
+          setSelectTo("");
+        }
+        return;
+      }
+      const from = drag.from < drag.to ? drag.from : drag.to;
+      const to = drag.from < drag.to ? drag.to : drag.from;
+      const source = drag.zoom ? drag.visible : drag.series;
+      const inRange = source.filter((point) => point.ts >= from && point.ts <= to);
+      setSelectFrom("");
+      setSelectTo("");
+      if (inRange.length < 2) return;
+      setZoomStack((stack) => (drag.zoom ? [...stack, drag.zoom] : stack));
+      setZoom({ from, to });
+    }
+    window.addEventListener("mouseup", onUp);
+    return () => window.removeEventListener("mouseup", onUp);
+  }, []);
+
+  function startSelect(ts: string) {
+    setSelectFrom(ts);
+    setSelectTo(ts);
+  }
+
+  function moveSelect(ts: string) {
+    setSelectTo(ts);
+  }
+
+  function zoomOut() {
+    const previous = zoomStack[zoomStack.length - 1] ?? null;
+    setZoomStack((stack) => stack.slice(0, -1));
+    setZoom(previous);
+  }
+
+  function resetZoom() {
+    setZoom(null);
+    setZoomStack([]);
+    setSelectFrom("");
+    setSelectTo("");
+  }
+
+  function changeHours(value: number) {
+    setHours(value);
+    resetZoom();
+  }
+
+  const storageSources = useMemo(() => {
+    const rows = catalog?.datastores ?? [];
+    if (!hostFilter) return rows;
+    return rows.filter((item) => !item.host_ids.length || item.host_ids.includes(hostFilter));
+  }, [catalog, hostFilter]);
+
+  function changeHost(value: string) {
+    setHostFilter(value);
+    if (value && datastoreFilter) {
+      const stillVisible = (catalog?.datastores ?? []).some(
+        (item) => item.id === datastoreFilter && (!item.host_ids.length || item.host_ids.includes(value)),
+      );
+      if (!stillVisible) setDatastoreFilter("");
+    }
+  }
+
+  const scopedVms = useMemo(
+    () => (hostFilter ? vms.filter((vm) => vm.host_id === hostFilter) : vms),
+    [vms, hostFilter],
+  );
   const owners = metrics?.owners ?? [];
   const sortedOwners = useMemo(() => sortMonitorOwners(owners, sortKey, sortDir), [owners, sortKey, sortDir]);
   const listedOwners = useMemo(() => sortedOwners.slice(0, topLimit), [sortedOwners, topLimit]);
@@ -347,9 +493,9 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
     [owners, topLimit],
   );
 
-  const currentCpu = latestPct(series, "cpu_pct");
-  const currentMem = latestPct(series, "memory_pct");
-  const currentDisk = latestPct(series, "disk_pct");
+  const currentCpu = latestPct(visibleSeries.length ? visibleSeries : series, "cpu_pct");
+  const currentMem = latestPct(visibleSeries.length ? visibleSeries : series, "memory_pct");
+  const currentDisk = latestPct(visibleSeries.length ? visibleSeries : series, "disk_pct");
 
   // Storage reclaim: thick provisioned vs datastore-committed bytes.
   // NOTE: storage_used_bytes = bytes committed on the datastore (VMDK file size),
@@ -366,7 +512,7 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
     let thinProvisioned = 0;
     let thinCommitted = 0;
     let unknownCommitted = 0;
-    for (const vm of vms) {
+    for (const vm of scopedVms) {
       const provisioned = vm.storage_provisioned_bytes ?? 0;
       const committed = vm.storage_used_bytes ?? 0;
       if (vm.disk_provisioning === "thick") {
@@ -398,12 +544,12 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
       // keep reclaimable as the estimated figure for display
       reclaimable: reclaimableEst,
     };
-  }, [vms]);
+  }, [scopedVms]);
 
   // Idle VM reclaim: VMs with days_idle >= idleThreshold (candidate for deletion)
   const IDLE_VM_DAYS = idleThreshold;
   const idleVmReclaim = useMemo(() => {
-    const idleVms = vms.filter((vm) => vm.days_idle !== null && vm.days_idle >= idleThreshold);
+    const idleVms = scopedVms.filter((vm) => vm.days_idle !== null && vm.days_idle >= idleThreshold);
     let thickProvisioned = 0;
     let thickCommitted = 0;
     let thinProvisioned = 0;
@@ -443,7 +589,7 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
       memAllocatedMib,
       memUsedMib,
     };
-  }, [vms, idleThreshold]);
+  }, [scopedVms, idleThreshold]);
 
   const idleVmStoragePieData = useMemo(() => {
     const { thickProvisioned, thinCommitted } = idleVmReclaim;
@@ -504,7 +650,8 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
   // Idle hosts: hosts where all VMs have been idle ≥ 30 days (or host has no VMs and low usage)
   const idleHosts = useMemo(() => {
     const IDLE_DAYS = 30;
-    return hosts.filter((host) => {
+    const pool = hostFilter ? hosts.filter((host) => host.id === hostFilter) : hosts;
+    return pool.filter((host) => {
       const hostVms = vms.filter((vm) => vm.host_id === host.id);
       if (hostVms.length === 0) {
         // No VMs — consider idle if CPU usage is very low
@@ -512,7 +659,7 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
       }
       return hostVms.every((vm) => vm.days_idle !== null && vm.days_idle >= IDLE_DAYS);
     });
-  }, [hosts, vms]);
+  }, [hosts, vms, hostFilter]);
 
   const idleTotals = useMemo(() => {
     const totalCpuMhz = idleHosts.reduce((sum, h) => sum + h.cpu_cores * h.cpu_mhz, 0);
@@ -555,10 +702,33 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
         <div className="monitor-controls">
           <label>
             Time range
-            <select value={hours} onChange={(event) => setHours(Number(event.target.value))}>
+            <select value={hours} onChange={(event) => changeHours(Number(event.target.value))}>
               {HOUR_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Host
+            <select value={hostFilter} onChange={(event) => changeHost(event.target.value)}>
+              <option value="">All hosts (cluster view)</option>
+              {hosts.map((host) => (
+                <option key={host.id} value={host.id}>
+                  {host.name}
+                  {host.cluster_name ? ` · ${host.cluster_name}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Storage source
+            <select value={datastoreFilter} onChange={(event) => setDatastoreFilter(event.target.value)}>
+              <option value="">{hostFilter ? "Average of this host's datastores" : "Average of all datastores"}</option>
+              {storageSources.map((store) => (
+                <option key={store.id} value={store.id}>
+                  {store.name} ({store.usage_pct.toFixed(0)}%)
                 </option>
               ))}
             </select>
@@ -591,18 +761,60 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
             </select>
           </label>
         </div>
-        {ownerFilter ? (
+        {ownerFilter || hostFilter || datastoreFilter || zoom ? (
           <div className="monitor-focus">
-            Focused on <strong>{ownerFilter}</strong>
-            <button className="text" onClick={() => onOpenMachines(ownerFilter)}>
-              View machines
-            </button>
-            <button className="text" onClick={() => onOwnerFilter("")}>
-              Clear
-            </button>
+            {hostFilter ? (
+              <>
+                Host <strong>{hosts.find((host) => host.id === hostFilter)?.name || hostFilter}</strong>
+              </>
+            ) : null}
+            {datastoreFilter ? (
+              <>
+                {hostFilter ? " · " : ""}
+                Storage <strong>{storageSources.find((store) => store.id === datastoreFilter)?.name || datastoreFilter}</strong>
+              </>
+            ) : null}
+            {ownerFilter ? (
+              <>
+                {hostFilter || datastoreFilter ? " · " : ""}
+                Focused on <strong>{ownerFilter}</strong>
+                <button className="text" onClick={() => onOpenMachines(ownerFilter)}>
+                  View machines
+                </button>
+                <button className="text" onClick={() => onOwnerFilter("")}>
+                  Clear owner
+                </button>
+              </>
+            ) : null}
+            {zoom ? (
+              <>
+                <span>
+                  Zoomed {formatTooltipTime(zoom.from)} – {formatTooltipTime(zoom.to)}
+                </span>
+                <button className="text" onClick={zoomOut}>
+                  Zoom out
+                </button>
+                <button className="text" onClick={resetZoom}>
+                  Reset zoom
+                </button>
+              </>
+            ) : null}
+            {hostFilter || datastoreFilter ? (
+              <button
+                className="text"
+                onClick={() => {
+                  setHostFilter("");
+                  setDatastoreFilter("");
+                }}
+              >
+                Clear host/storage
+              </button>
+            ) : null}
           </div>
         ) : (
-          <p className="monitor-hint">Charts reflect overall cluster utilization. Filter by owner to drill into a single user.</p>
+          <p className="monitor-hint">
+            Charts show cluster utilization over the selected window (up to 14 days). Drag across a graph to zoom that range to full width. Filter by host or a specific datastore to isolate utilization.
+          </p>
         )}
       </div>
 
@@ -610,17 +822,29 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
         <article>
           <span>CPU</span>
           <strong>{currentCpu.toFixed(0)}%</strong>
-          <small>{ownerFilter ? "Owner share of cluster" : "Cluster utilization"}</small>
+          <small>
+            {hostFilter ? "Host utilization" : ownerFilter ? "Owner share of cluster" : "Cluster utilization"}
+          </small>
         </article>
         <article>
           <span>Memory</span>
           <strong>{currentMem.toFixed(0)}%</strong>
-          <small>{ownerFilter ? "Owner share of cluster" : "Cluster utilization"}</small>
+          <small>
+            {hostFilter ? "Host utilization" : ownerFilter ? "Owner share of cluster" : "Cluster utilization"}
+          </small>
         </article>
         <article>
           <span>Storage</span>
           <strong>{currentDisk.toFixed(0)}%</strong>
-          <small>{ownerFilter ? "Estimated owner share" : "Datastore utilization"}</small>
+          <small>
+            {datastoreFilter
+              ? "Selected datastore"
+              : hostFilter
+                ? "Host datastores (avg)"
+                : ownerFilter
+                  ? "Estimated owner share"
+                  : "Datastore utilization"}
+          </small>
         </article>
         <article>
           <span>Samples</span>
@@ -630,9 +854,49 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
       </div>
 
       <div className="monitor-grid charts-3">
-        <UtilLineChart title="CPU" dataKey="cpu_pct" color="#d6f261" data={series} />
-        <UtilLineChart title="Memory" dataKey="memory_pct" color="#86c9a3" data={series} />
-        <UtilLineChart title="Storage" dataKey="disk_pct" color="#7eb8da" data={series} />
+        <UtilLineChart
+          title="CPU"
+          dataKey="cpu_pct"
+          color="#d6f261"
+          data={visibleSeries}
+          selectFrom={selectFrom}
+          selectTo={selectTo}
+          onSelectStart={startSelect}
+          onSelectMove={moveSelect}
+        />
+        <UtilLineChart
+          title="Memory"
+          dataKey="memory_pct"
+          color="#86c9a3"
+          data={visibleSeries}
+          selectFrom={selectFrom}
+          selectTo={selectTo}
+          onSelectStart={startSelect}
+          onSelectMove={moveSelect}
+        />
+        <UtilLineChart
+          title="Storage"
+          dataKey="disk_pct"
+          color="#7eb8da"
+          data={visibleSeries}
+          selectFrom={selectFrom}
+          selectTo={selectTo}
+          onSelectStart={startSelect}
+          onSelectMove={moveSelect}
+          extra={
+            <label className="chart-inline-filter">
+              Source
+              <select value={datastoreFilter} onChange={(event) => setDatastoreFilter(event.target.value)}>
+                <option value="">{hostFilter ? "Host average" : "All datastores (average)"}</option>
+                {storageSources.map((store) => (
+                  <option key={store.id} value={store.id}>
+                    {store.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          }
+        />
       </div>
 
       {/* Storage Reclaim Section */}
@@ -820,7 +1084,7 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
                           <tr style={{ borderBottom: "1px solid var(--border)" }}>
                             <td style={{ padding: "6px 8px" }}><span style={{ color: "#86c9a3" }}>●</span> Thick</td>
                             <td style={{ textAlign: "right", padding: "6px 8px" }}>
-                              {vms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning === "thick").length}
+                              {scopedVms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning === "thick").length}
                             </td>
                             <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thickProvisioned)}</td>
                             <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thickCommitted)}</td>
@@ -835,7 +1099,7 @@ export const MonitoringView = React.memo(function MonitoringView({ ownerFilter, 
                         <tr style={{ borderBottom: "1px solid var(--border)" }}>
                           <td style={{ padding: "6px 8px" }}><span style={{ color: "#7eb8da" }}>●</span> Thin / mixed</td>
                           <td style={{ textAlign: "right", padding: "6px 8px" }}>
-                            {vms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning !== "thick").length}
+                            {scopedVms.filter((v) => v.days_idle !== null && v.days_idle >= IDLE_VM_DAYS && v.disk_provisioning !== "thick").length}
                           </td>
                           <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thinProvisioned)}</td>
                           <td style={{ textAlign: "right", padding: "6px 8px" }}>{bytes(idleVmReclaim.thinCommitted)}</td>

@@ -108,10 +108,16 @@ export async function fetchCatalog(): Promise<Catalog> {
   return request<Catalog>("/api/catalog");
 }
 
-export async function fetchMetrics(params: { hours?: number; owner?: string } = {}): Promise<MetricsResponse> {
+export async function fetchMetrics(
+  params: { hours?: number; owner?: string; host?: string; datastore?: string; since?: string; until?: string } = {},
+): Promise<MetricsResponse> {
   const query = new URLSearchParams();
   if (params.hours !== undefined) query.set("hours", String(params.hours));
   if (params.owner) query.set("owner", params.owner);
+  if (params.host) query.set("host", params.host);
+  if (params.datastore) query.set("datastore", params.datastore);
+  if (params.since) query.set("since", params.since);
+  if (params.until) query.set("until", params.until);
   const suffix = query.toString() ? `?${query}` : "";
   return request<MetricsResponse>(`/api/metrics${suffix}`);
 }

@@ -45,6 +45,9 @@ def test_metrics_endpoint():
         assert "owners" in payload
         assert payload["hours"] == 24
         assert isinstance(payload["owners"], list)
+        wide = client.get("/api/metrics?hours=336")
+        assert wide.status_code == 200
+        assert wide.json()["hours"] == 336
 
 
 def test_destroy_from_disk_in_demo():
