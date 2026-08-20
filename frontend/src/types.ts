@@ -132,6 +132,7 @@ export type DatastoreSummary = {
   host_count: number;
   host_ids: string[];
   usage_pct: number;
+  readonly?: boolean;
 };
 
 export type NetworkSummary = {

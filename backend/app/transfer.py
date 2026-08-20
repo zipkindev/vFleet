@@ -10,6 +10,8 @@ from .config import Settings
 from .errors import PermanentError, TransientError, is_transient
 
 ProgressFn = Callable[[int, Dict[str, Any]], None]
+_REDIRECTS = {301, 302, 303, 307, 308}
+_DROP_ON_HOST_CHANGE = {"cookie", "vmware-api-session-id", "authorization", "host"}
 
 
 class OffsetReader:
@@ -88,6 +90,16 @@ class VCenterRest:
         self.close()
 
 
+def _join_url(current: str, location: str) -> str:
+    return str(httpx.URL(current).join(location))
+
+
+def _headers_for_target(headers: Dict[str, str], original: str, target: str) -> Dict[str, str]:
+    if httpx.URL(original).netloc == httpx.URL(target).netloc:
+        return dict(headers)
+    return {key: value for key, value in headers.items() if key.lower() not in _DROP_ON_HOST_CHANGE}
+
+
 def put_file(
     url: str,
     local_path: Path,
@@ -104,6 +116,7 @@ def put_file(
     hdrs = dict(headers)
     hdrs["Content-Length"] = str(remaining)
     hdrs.setdefault("Content-Type", "application/octet-stream")
+    hdrs.setdefault("Overwrite", "t")
     if start > 0:
         hdrs["Content-Range"] = f"bytes {start}-{total - 1}/{total}"
 
@@ -117,20 +130,36 @@ def put_file(
             on_progress(value, state)
 
     try:
-        with OffsetReader(local_path, start, mark) as body:
-            timeout = httpx.Timeout(30.0, read=300.0, write=300.0, connect=30.0)
-            with httpx.Client(verify=verify, timeout=timeout, follow_redirects=True) as client:
-                response = client.put(url, headers=hdrs, content=body)
-        if response.status_code in {200, 201, 204}:
-            mark(total)
-            return total
-        if response.status_code in {400, 411, 501} and start > 0:
-            raise TransientError(f"Remote did not accept resume at byte {start}; will retry from 0")
-        if response.status_code in {401, 403}:
-            raise TransientError(f"Upload auth failed ({response.status_code})")
-        if response.status_code >= 500:
-            raise TransientError(f"Upload server error {response.status_code}")
-        raise PermanentError(f"Upload rejected ({response.status_code}): {response.text[:300]}")
+        timeout = httpx.Timeout(30.0, read=300.0, write=300.0, connect=30.0)
+        # vCenter /folder/ PUTs 303 to the ESXi host. httpx would turn that
+        # into GET, which 404s after the first send buffer (often 256 KiB).
+        with httpx.Client(verify=verify, timeout=timeout, follow_redirects=False) as client:
+            target = url
+            for _ in range(8):
+                with OffsetReader(local_path, start, mark) as body:
+                    response = client.put(target, headers=_headers_for_target(hdrs, url, target), content=body)
+                if response.status_code in _REDIRECTS:
+                    location = response.headers.get("Location")
+                    hops = state.setdefault("upload_hops", [])
+                    hops.append({"host": httpx.URL(target).host, "path": httpx.URL(target).path, "status": response.status_code})
+                    if not location:
+                        raise PermanentError(f"Upload redirected ({response.status_code}) without Location")
+                    target = _join_url(str(response.url or target), location)
+                    continue
+                hops = state.setdefault("upload_hops", [])
+                hops.append({"host": httpx.URL(target).host, "path": httpx.URL(target).path, "status": response.status_code})
+                if response.status_code in {200, 201, 204}:
+                    mark(total)
+                    return total
+                if response.status_code in {400, 411, 501} and start > 0:
+                    raise TransientError(f"Remote did not accept resume at byte {start}; will retry from 0")
+                if response.status_code in {401, 403}:
+                    raise TransientError(f"Upload auth failed ({response.status_code})")
+                if response.status_code >= 500:
+                    raise TransientError(f"Upload server error {response.status_code}")
+                parsed = httpx.URL(target)
+                raise PermanentError(f"Upload rejected ({response.status_code}) at {parsed.host}{parsed.path}")
+        raise PermanentError("Upload redirected too many times")
     except (httpx.TransportError, httpx.TimeoutException) as exc:
         raise TransientError(str(exc)) from exc
 

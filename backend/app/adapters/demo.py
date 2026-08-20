@@ -365,6 +365,8 @@ class DemoAdapter(InventoryAdapter):
 
         if datastore_id not in self._datastores:
             raise KeyError("Unknown datastore")
+        if self._datastores[datastore_id].readonly:
+            raise PermanentError(f"Datastore {self._datastores[datastore_id].name} is mounted read-only")
         size = Path(local_path).stat().st_size if Path(local_path).exists() else 0
         if on_progress:
             on_progress(size, extra or {})

@@ -163,7 +163,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(

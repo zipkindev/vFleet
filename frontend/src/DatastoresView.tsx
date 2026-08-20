@@ -118,7 +118,10 @@ export const DatastoresView = React.memo(function DatastoresView({ catalog, clus
                   {item.name}
                   <small className="sub">{item.datacenter || item.host_count + " hosts"}</small>
                 </td>
-                <td>{item.type || "—"}</td>
+                <td>
+                  {item.type || "—"}
+                  {item.readonly ? <small className="sub">read-only</small> : null}
+                </td>
                 <td>{bytes(item.capacity_bytes)}</td>
                 <td>{bytes(item.free_bytes)}</td>
                 <td>
@@ -136,6 +139,7 @@ export const DatastoresView = React.memo(function DatastoresView({ catalog, clus
             <div>
               <h2>{selected.name}</h2>
               <p>
+                {selected.readonly ? "Mounted read-only on ESXi — uploads are rejected. " : ""}
                 <button className="text" onClick={() => void loadFiles(selected.id, "")}>
                   root
                 </button>
@@ -159,11 +163,11 @@ export const DatastoresView = React.memo(function DatastoresView({ catalog, clus
                 Prefer content library (resumable)
               </label>
               <label className="accent file-btn">
-                {busy === "staging" ? "Staging locally…" : "Upload file"}
+                {busy === "staging" ? "Staging locally…" : selected.readonly ? "Read-only datastore" : "Upload file"}
                 <input
                   type="file"
                   hidden
-                  disabled={Boolean(busy)}
+                  disabled={Boolean(busy) || Boolean(selected.readonly)}
                   onChange={(event) => {
                     const file = event.target.files?.[0];
                     event.target.value = "";

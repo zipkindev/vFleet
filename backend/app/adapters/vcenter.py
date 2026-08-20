@@ -66,6 +66,43 @@ def _as_host_ids(value: Any) -> List[str]:
     return ids
 
 
+def datastore_is_readonly(hosts: Any) -> bool:
+    modes: List[str] = []
+    for mount in hosts or []:
+        info = getattr(mount, "mountInfo", None)
+        mode = getattr(info, "accessMode", None) if info is not None else None
+        if mode:
+            modes.append(str(mode).lower())
+    return bool(modes) and all(mode == "readonly" for mode in modes)
+
+
+def first_writable_host_name(datastore: Any) -> str:
+    for mount in getattr(datastore, "host", None) or []:
+        info = getattr(mount, "mountInfo", None)
+        mode = str(getattr(info, "accessMode", "") or "").lower()
+        if mode == "readonly":
+            continue
+        host = getattr(mount, "key", None)
+        if host is None:
+            continue
+        runtime = getattr(host, "runtime", None)
+        state = str(getattr(runtime, "connectionState", "") or "")
+        if state and state != "connected":
+            continue
+        if bool(getattr(runtime, "inMaintenanceMode", False)):
+            continue
+        name = str(getattr(host, "name", "") or "")
+        if name:
+            return name
+    return ""
+
+
+def folder_file_url(host: str, port: int, remote: str, dc_path: str, ds_name: str) -> str:
+    encoded = "/".join(quote(part, safe="") for part in remote.split("/") if part)
+    authority = host if port in {0, 443} else f"{host}:{port}"
+    return f"https://{authority}/folder/{encoded}?dcPath={quote(dc_path)}&dsName={quote(ds_name)}"
+
+
 def _prop_map(retrieved: Any) -> Dict[str, Any]:
     data: Dict[str, Any] = {"obj": retrieved.obj, "id": _moid(retrieved.obj)}
     missing = {name for name in getattr(retrieved, "missingSet", []) or []}
@@ -803,6 +840,7 @@ class VCenterAdapter(InventoryAdapter):
             datacenter, dc_path = self._datacenter_for(parent)
             hosts = row.get("host") or []
             host_ids = _as_host_ids(hosts)
+            readonly = datastore_is_readonly(hosts)
             item = DatastoreSummary(
                 id=row["id"],
                 name=str(row.get("name") or row["id"]),
@@ -815,9 +853,10 @@ class VCenterAdapter(InventoryAdapter):
                 host_count=len(host_ids) or len(list(hosts)),
                 host_ids=host_ids,
                 usage_pct=used_pct,
+                readonly=readonly,
             )
             result.append(item)
-            meta[item.id] = {"name": item.name, "datacenter": datacenter, "datacenter_path": dc_path}
+            meta[item.id] = {"name": item.name, "datacenter": datacenter, "datacenter_path": dc_path, "readonly": "1" if readonly else "0"}
         result.sort(key=lambda item: item.name.lower())
         self._ds_meta = meta
         return result
@@ -1290,6 +1329,15 @@ class VCenterAdapter(InventoryAdapter):
         path = Path(local_path)
         size = path.stat().st_size
         state["bytes_total"] = size
+        from pyVmomi import vim
+
+        datastore = self._obj(vim.Datastore, datastore_id)
+        if datastore_is_readonly(getattr(datastore, "host", None)):
+            raise PermanentError(
+                f"Datastore {datastore.name} is mounted read-only on every host. "
+                "vCenter cannot write files here. Use a writable datastore, or follow "
+                "'How to Upload your own Images.txt' on this datastore."
+            )
         if use_library:
             try:
                 return library_upload(self._rest, datastore_id, Path(remote_path).name or path.name, path, size, state, on_progress)
@@ -1302,23 +1350,15 @@ class VCenterAdapter(InventoryAdapter):
                 state["library_fallback"] = str(exc)
                 state["phase"] = "datastore_put"
 
-        from pyVmomi import vim
-
         meta = self._ds_meta.get(datastore_id)
         if meta is None:
             self.list_datastores()
             meta = self._ds_meta.get(datastore_id) or {}
-        ds_name = meta.get("name") or self._obj(vim.Datastore, datastore_id).name
+        ds_name = meta.get("name") or datastore.name
         dc_path = meta.get("datacenter_path") or meta.get("datacenter") or ""
         if not dc_path:
-            dc_path = self._find_datacenter(self._obj(vim.Datastore, datastore_id)).name
+            dc_path = self._find_datacenter(datastore).name
         remote = remote_path.strip("/")
-        encoded = "/".join(quote(part, safe="") for part in remote.split("/") if part)
-        url = (
-            f"https://{self.settings.vcenter_host}:{self.settings.vcenter_port}/folder/{encoded}"
-            f"?dcPath={quote(dc_path)}&dsName={quote(ds_name)}"
-        )
-        cookie = getattr(self._session()._stub, "cookie", "") or ""
         start = int(state.get("bytes_sent") or 0)
         remote_size = None
         try:
@@ -1333,35 +1373,93 @@ class VCenterAdapter(InventoryAdapter):
         if remote_size is not None and remote_size > 0:
             start = remote_size
             state["bytes_sent"] = start
-        headers = {"Cookie": cookie, "Content-Type": "application/octet-stream"}
         try:
-            sent = put_file(
-                url,
-                path,
-                start,
-                size,
-                headers,
-                verify=not self.settings.vcenter_insecure,
-                on_progress=on_progress,
-                extra=state,
-            )
+            sent = self._put_datastore_file(datastore, ds_name, dc_path, remote, path, start, size, state, on_progress)
             state["bytes_sent"] = sent
             return state
         except TransientError as exc:
             if start > 0 and "resume" in str(exc).lower():
                 state["bytes_sent"] = 0
-                sent = put_file(
-                    url,
-                    path,
-                    0,
-                    size,
-                    headers,
-                    verify=not self.settings.vcenter_insecure,
-                    on_progress=on_progress,
-                    extra=state,
-                )
+                sent = self._put_datastore_file(datastore, ds_name, dc_path, remote, path, 0, size, state, on_progress)
                 state["bytes_sent"] = sent
                 return state
+            raise
+
+    def _http_put_ticket(self, url: str) -> str:
+        from pyVmomi import vim
+
+        spec = vim.SessionManager.HttpServiceRequestSpec(url=url, method="httpPut")
+        ticket = self._session().content.sessionManager.AcquireGenericServiceTicket(spec)
+        return str(getattr(ticket, "id", "") or "")
+
+    def _put_datastore_file(
+        self,
+        datastore: Any,
+        ds_name: str,
+        dc_path: str,
+        remote: str,
+        path: Path,
+        start: int,
+        size: int,
+        state: Dict[str, Any],
+        on_progress: Optional[Callable[[int, Dict[str, Any]], None]],
+    ) -> int:
+        verify = not self.settings.vcenter_insecure
+        host_name = first_writable_host_name(datastore)
+        last_error: Optional[BaseException] = None
+        if host_name:
+            dc_candidates: List[str] = []
+            for item in ("ha-datacenter", dc_path):
+                if item and item not in dc_candidates:
+                    dc_candidates.append(item)
+            for dc in dc_candidates:
+                url = folder_file_url(host_name, 443, remote, dc, ds_name)
+                try:
+                    ticket = self._http_put_ticket(url)
+                except Exception as exc:
+                    last_error = TransientError(f"Could not get ESXi upload ticket for {host_name}: {exc}")
+                    break
+                if not ticket:
+                    continue
+                state["phase"] = "esxi_put"
+                state["upload_host"] = host_name
+                try:
+                    return put_file(
+                        url,
+                        path,
+                        start,
+                        size,
+                        {"Cookie": f"vmware_cgi_ticket={ticket}", "Content-Type": "application/octet-stream"},
+                        verify,
+                        on_progress,
+                        state,
+                    )
+                except PermanentError as exc:
+                    last_error = exc
+                    if "404" not in str(exc):
+                        raise
+                except TransientError as exc:
+                    last_error = TransientError(
+                        f"Cannot reach ESXi {host_name} for datastore upload (vCenter does not proxy PUTs): {exc}"
+                    )
+                    break
+        url = folder_file_url(self.settings.vcenter_host, self.settings.vcenter_port, remote, dc_path, ds_name)
+        cookie = getattr(self._session()._stub, "cookie", "") or ""
+        state["phase"] = "vcenter_put"
+        try:
+            return put_file(
+                url,
+                path,
+                start,
+                size,
+                {"Cookie": cookie, "Content-Type": "application/octet-stream"},
+                verify,
+                on_progress,
+                state,
+            )
+        except PermanentError as exc:
+            if last_error is not None:
+                raise PermanentError(f"{exc}; earlier: {last_error}") from exc
             raise
 
     def _datacenter_for(self, parent: Any) -> Tuple[str, str]:

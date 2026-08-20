@@ -162,6 +162,7 @@ class DatastoreSummary(BaseModel):
     host_count: int = 0
     host_ids: List[str] = Field(default_factory=list)
     usage_pct: float = 0.0
+    readonly: bool = False
 
 
 class NetworkSummary(BaseModel):

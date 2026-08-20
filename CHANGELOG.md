@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.9] — 2026-08-19
+
+fix: stream ISO uploads and keep saved vCenter passwords
+
+- 7 files changed, 286 insertions(+), 49 deletions(-) · backend/app/adapters/demo.py, backend/app/adapters/vcenter.py, backend/app/models.py, backend/app/transfer.py, backend/tests/test_transfer.py, frontend/src/DatastoresView.tsx, …
+
 ## [1.0.8] — 2026-08-19
 
 fix: migrate host/datastore metric columns before creating their index
