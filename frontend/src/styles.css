@@ -2271,8 +2271,7 @@ tr.clickable:hover td {
   margin-top: 1rem;
 }
 
-.disk-convert-settings label,
-.disk-convert-confirm {
+.disk-convert-settings label {
   display: grid;
   min-width: 0;
   gap: 0.4rem;
@@ -2320,7 +2319,6 @@ tr.clickable:hover td {
   border-color: var(--accent);
 }
 
-.disk-convert-confirm { margin-top: 1rem; }
 .disk-batch-list {
   display: grid;
   gap: 0.75rem;
@@ -2369,6 +2367,75 @@ tr.clickable:hover td {
   cursor: not-allowed;
   opacity: 1;
 }
+
+.disk-confirm-back {
+  z-index: 80;
+  background: rgba(4, 7, 4, 0.84);
+}
+
+.disk-confirm-modal {
+  width: min(590px, 100%);
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.disk-confirm-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 1rem 0;
+}
+
+.disk-confirm-grid > div {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-2) 74%, var(--panel));
+}
+
+.disk-confirm-grid span,
+.disk-confirm-vms > span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.disk-confirm-grid strong {
+  overflow-wrap: anywhere;
+}
+
+.disk-confirm-vms {
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.disk-confirm-vms ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  max-height: 116px;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.disk-confirm-vms li {
+  max-width: 100%;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.disk-confirm-warning {
+  margin-top: 0.75rem;
+}
 .plan-summary, .host-facts, .button-grid, .inline-actions {
   display: flex;
   flex-wrap: wrap;
@@ -2389,6 +2456,7 @@ tr.clickable:hover td {
 @media (max-width: 620px) {
   .disk-convert-modal { width: min(100%, calc(100vw - 1rem)); padding: 16px; }
   .disk-convert-settings { grid-template-columns: minmax(0, 1fr); }
+  .disk-confirm-grid { grid-template-columns: minmax(0, 1fr); }
   .disk-plan-list > div { align-items: flex-start; flex-direction: column; gap: 0.35rem; }
   .disk-batch-card > header { align-items: flex-start; }
 }

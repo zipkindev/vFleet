@@ -28,11 +28,11 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   const [rows, setRows] = useState<PlanRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [confirmation, setConfirmation] = useState("");
+  const [showConfirmation, setShowConfirmation] = useState(false);
 
   useEffect(() => {
     setRows(null);
-    setConfirmation("");
+    setShowConfirmation(false);
   }, [target, method]);
 
   const executable = useMemo(
@@ -42,14 +42,21 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   const scratchBytes = executable.reduce((sum, row) => sum + row.plan.estimated_scratch_bytes, 0);
   const largestScratchBytes = executable.reduce((largest, row) => Math.max(largest, row.plan.estimated_scratch_bytes), 0);
   const preservesSources = executable.some((row) => row.plan.method === "ssh");
-  const expectedConfirmation = vms.length === 1
-    ? vms[0]?.name ?? ""
-    : `CONVERT ${executable.length} ${executable.length === 1 ? "VM" : "VMS"}`;
+  const methodNames = new Set(executable.map((row) => row.plan.method));
+  const methodLabel = methodNames.size > 1
+    ? "Mixed"
+    : methodNames.has("ssh") ? "Verified SSH" : "vSphere API";
+  const targetLabel = target === "thin"
+    ? "Thin"
+    : target === "eager_zeroed_thick" ? "Eager-zeroed thick" : "Lazy-zeroed thick";
+  const capacityLabel = preservesSources
+    ? `${bytes(scratchBytes)} additional`
+    : `${bytes(largestScratchBytes)} temporary per job`;
 
   async function review() {
     setBusy(true);
     setError("");
-    setConfirmation("");
+    setShowConfirmation(false);
     setRows([]);
     const next: PlanRow[] = [];
     for (const vm of vms) {
@@ -65,7 +72,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   }
 
   async function execute() {
-    if (executable.length === 0 || confirmation !== expectedConfirmation) return;
+    if (executable.length === 0 || !showConfirmation) return;
     setBusy(true);
     setError("");
     const jobs: Job[] = [];
@@ -80,6 +87,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
       }
     }
     setBusy(false);
+    setShowConfirmation(false);
     if (jobs.length === 0) {
       setError(failures.join("; ") || "No conversions were queued");
       return;
@@ -91,8 +99,9 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   const planned = rows !== null && rows.length === vms.length;
 
   return (
-    <div className="modal-back" onClick={() => !busy && onClose()}>
-      <div className="modal disk-convert-modal" onClick={(event) => event.stopPropagation()}>
+    <>
+      <div className="modal-back" onClick={() => !busy && onClose()}>
+        <div className="modal disk-convert-modal" onClick={(event) => event.stopPropagation()}>
         <h2>{batch ? `Convert disks · ${vms.length} selected VMs` : `Convert disks · ${vms[0]?.name ?? "VM"}`}</h2>
         <p>
           Each VM is safety-checked and queued as an independent persistent job. The vSphere API uses storage relocation;
@@ -172,27 +181,65 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
               ))}
             </div>
 
-            {planned && executable.length > 0 ? (
-              <label className="disk-convert-confirm">
-                <span>
-                  Type <strong>{expectedConfirmation}</strong> to queue {executable.length} conversion{executable.length === 1 ? "" : "s"}
-                </span>
-                <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" />
-              </label>
-            ) : null}
             <div className="modal-actions">
               <button className="ghost" disabled={busy} onClick={() => setRows(null)}>Back</button>
               <button
                 className="accent"
-                disabled={busy || !planned || executable.length === 0 || confirmation !== expectedConfirmation}
-                onClick={() => void execute()}
+                disabled={busy || !planned || executable.length === 0}
+                onClick={() => setShowConfirmation(true)}
               >
-                {busy ? "Queueing…" : `Queue ${executable.length} conversion${executable.length === 1 ? "" : "s"}`}
+                {`Queue ${executable.length} conversion${executable.length === 1 ? "" : "s"}`}
               </button>
             </div>
           </>
         )}
+        </div>
       </div>
-    </div>
+
+      {showConfirmation ? (
+        <div className="modal-back disk-confirm-back" onClick={() => !busy && setShowConfirmation(false)}>
+          <div
+            className="modal disk-confirm-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="disk-confirm-title"
+            aria-describedby="disk-confirm-description"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="disk-confirm-title">Confirm disk conversions</h2>
+            <p id="disk-confirm-description">
+              Queue {executable.length} independent conversion {executable.length === 1 ? "job" : "jobs"}? Jobs run one at a time and each VM plan is revalidated before execution.
+            </p>
+
+            <div className="disk-confirm-grid" aria-label="Conversion summary">
+              <div><span>Virtual machines</span><strong>{executable.length}</strong></div>
+              <div><span>Target</span><strong>{targetLabel}</strong></div>
+              <div><span>Method</span><strong>{methodLabel}</strong></div>
+              <div><span>Capacity impact</span><strong>{capacityLabel}</strong></div>
+            </div>
+
+            <div className="disk-confirm-vms">
+              <span>Ready to queue</span>
+              <ul>
+                {executable.map((row) => <li key={row.vm.id}>{row.vm.name}</li>)}
+              </ul>
+            </div>
+
+            <div className="banner warm disk-confirm-warning">
+              This changes disk provisioning on the selected VMs. Closing or canceling this popup queues nothing.
+            </div>
+
+            <div className="modal-actions">
+              <button className="ghost" disabled={busy} onClick={() => setShowConfirmation(false)}>Cancel</button>
+              <button className="accent" disabled={busy} onClick={() => void execute()} autoFocus>
+                {busy
+                  ? "Queueing…"
+                  : `Confirm & queue ${executable.length} conversion${executable.length === 1 ? "" : "s"}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }

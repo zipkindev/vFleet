@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.15] — 2026-08-31
+
+feat: add multi-endpoint connection profiles
+
+- 2 files changed, 139 insertions(+), 24 deletions(-) · frontend/src/DiskConversionModal.tsx, frontend/src/styles.css
+
 ## [1.0.14] — 2026-08-31
 
 feat: add bulk disk conversion workflow
