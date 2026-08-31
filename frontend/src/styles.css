@@ -2115,7 +2115,50 @@ tr.clickable:hover td {
 .advanced-box summary { cursor: pointer; font-weight: 700; }
 .advanced-box p { margin: 0.65rem 0; }
 
-.disk-convert-modal { width: min(760px, calc(100vw - 2rem)); }
+.disk-convert-modal {
+  width: min(760px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.disk-convert-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+  margin-top: 1rem;
+}
+
+.disk-convert-settings label,
+.disk-convert-confirm {
+  display: grid;
+  min-width: 0;
+  gap: 0.4rem;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.disk-convert-modal select,
+.disk-convert-modal input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--ink);
+  color-scheme: dark;
+}
+
+.disk-convert-modal select:focus-visible,
+.disk-convert-modal input:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+.disk-convert-confirm { margin-top: 1rem; }
 .plan-summary, .host-facts, .button-grid, .inline-actions {
   display: flex;
   flex-wrap: wrap;
@@ -2131,6 +2174,11 @@ tr.clickable:hover td {
   padding: 0.7rem;
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+@media (max-width: 620px) {
+  .disk-convert-settings { grid-template-columns: minmax(0, 1fr); }
+  .disk-plan-list > div { align-items: flex-start; flex-direction: column; gap: 0.35rem; }
 }
 .host-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
 .host-facts > div { display: grid; gap: 0.25rem; padding: 0.75rem; border: 1px solid var(--line); border-radius: 8px; }

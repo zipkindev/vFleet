@@ -54,7 +54,7 @@ export function DiskConversionModal({ vm, connection, onClose, onQueued }: Props
           SSH clones to new VMDKs and preserves the original source files.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
-        <div className="login-grid">
+        <div className="disk-convert-settings">
           <label>
             Target provisioning
             <select value={target} onChange={(event) => setTarget(event.target.value)}>
@@ -96,8 +96,8 @@ export function DiskConversionModal({ vm, connection, onClose, onQueued }: Props
             {plan.warnings.map((item) => <div className="banner" key={item}>{item}</div>)}
             {plan.noop ? <div className="banner">No conversion is needed; every disk already matches.</div> : null}
             {plan.can_execute ? (
-              <label>
-                Type <strong>{vm.name}</strong> to confirm
+              <label className="disk-convert-confirm">
+                <span>Type <strong>{vm.name}</strong> to confirm</span>
                 <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" />
               </label>
             ) : null}

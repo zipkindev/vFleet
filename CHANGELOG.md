@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.12] — 2026-08-31
+
+fix: improve ESXi host control contrast
+
+- 3 files changed, 83 insertions(+), 8 deletions(-) · frontend/src/DiskConversionModal.tsx, frontend/src/JobsView.tsx, frontend/src/styles.css
+
 ## [1.0.11] — 2026-08-30
 
 feat: add direct ESXi management and automation

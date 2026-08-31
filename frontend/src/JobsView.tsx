@@ -26,8 +26,31 @@ function progressLabel(job: Job): string {
     const index = Number(job.progress.index ?? 0);
     if (total > 0) return `${Math.min(index + (job.status === "succeeded" ? 0 : 1), total)} / ${total}`;
   }
-  if (job.progress.task_id) return "vCenter task running";
+  if (job.kind === "disk_convert") {
+    if (job.status !== "running" && job.status !== "queued" && job.status !== "retrying") return job.status;
+    const phase = String(job.progress.phase || "");
+    const disk = String(job.progress.disk || "disk");
+    const index = Number(job.progress.index ?? 0);
+    const total = Number(job.progress.total ?? 0);
+    if (phase === "clone") return `Cloning ${disk}${total > 0 ? ` (${Math.min(index + 1, total)}/${total})` : ""}`;
+    if (phase === "reconfigure") return "Attaching converted disk";
+    if (phase === "relocate" || job.progress.task_id) return "vSphere task running";
+  }
+  if (job.progress.task_id) {
+    return job.status === "running" ? "vSphere task running" : job.status;
+  }
   return job.status;
+}
+
+function diskFallbackHint(job: Job): string {
+  const plan = job.payload.plan;
+  const fallback = plan && typeof plan === "object" && "fallback_method" in plan
+    ? String((plan as Record<string, unknown>).fallback_method || "")
+    : "";
+  if (job.kind === "disk_convert" && fallback === "ssh" && /not supported/i.test(job.error)) {
+    return "This host rejected API relocation. Re-plan from Machines and choose Verified SSH fallback.";
+  }
+  return "";
 }
 
 export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh: () => void }) {
@@ -64,7 +87,9 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
               </tr>
             </thead>
             <tbody>
-              {jobs.map((job) => (
+              {jobs.map((job) => {
+                const fallbackHint = diskFallbackHint(job);
+                return (
                 <tr key={job.id}>
                   <td>
                     {job.title}
@@ -73,6 +98,7 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                   <td>
                     <span className={`chip job ${job.status}`}>{job.status}</span>
                     {job.error ? <small className="sub">{job.error}</small> : null}
+                    {fallbackHint ? <small className="sub">{fallbackHint}</small> : null}
                     {job.status === "retrying" && job.next_run_at ? (
                       <small className="sub">retry {relTime(job.next_run_at)}</small>
                     ) : null}
@@ -97,7 +123,7 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                         Grant & retry
                       </button>
                     ) : null}
-                    {job.status === "failed" || job.status === "cancelled" ? (
+                    {(job.status === "failed" || job.status === "cancelled") && !fallbackHint ? (
                       <button
                         className="text"
                         onClick={() => {
@@ -119,7 +145,8 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                     ) : null}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </TableFit>
