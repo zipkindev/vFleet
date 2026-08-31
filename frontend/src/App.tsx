@@ -1,13 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchCatalog, fetchConnection, fetchInventory, fetchJobs, logout, runActions, setUiToken } from "./api";
+import { applyDrsOverride, fetchCatalog, fetchConnection, fetchConsoleTicket, fetchInventory, fetchJobs, launchExternalUri, logout, renameVm, runActions, setUiToken, vcenterVmConsoleUrl, VMRC_INSTALL_URL } from "./api";
 import { BatchCount } from "./BatchCount";
 import { ChangelogModal } from "./ChangelogModal";
 import { BatchLimitDialog } from "./BatchLimitDialog";
 import { BATCH_LIMIT } from "./batch";
-import { CloneVmModal } from "./CloneVmModal";
+import { NewVmModal } from "./NewVmModal";
 import { DatastoresView } from "./DatastoresView";
+import { DiskConversionModal } from "./DiskConversionModal";
 import { downloadText, gib, bytes, powerLabel, powerClass, relTime, csvEscape, diskLabel } from "./format";
 import { JobsView } from "./JobsView";
+import { HostManagementView } from "./HostManagementView";
 import { LoginPanel } from "./LoginPanel";
 import { MigrateVmModal } from "./MigrateVmModal";
 import { MonitoringView } from "./MonitoringView";
@@ -29,6 +31,8 @@ import type { ActionName, Catalog, ConnectionInfo, InventorySnapshot, JobList, O
 import { APP_VERSION } from "./version";
 import { ThemePanel } from "./ThemePanel";
 import { ThemeProvider } from "./ThemeContext";
+import { TableFit } from "./TableFit";
+import { VmActionsMenu } from "./VmActionsMenu";
 
 type View = "overview" | "monitoring" | "hosts" | "machines" | "datastores" | "jobs" | "owners" | "reclaim";
 
@@ -99,15 +103,20 @@ export function App() {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [pending, setPending] = useState<ActionName | null>(null);
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<React.ReactNode>("");
   const [expandedOwner, setExpandedOwner] = useState("");
   const [showLogin, setShowLogin] = useState(false);
   const [connection, setConnection] = useState<ConnectionInfo | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [jobs, setJobs] = useState<JobList | null>(null);
-  const [showClone, setShowClone] = useState(false);
+  const [showNewVm, setShowNewVm] = useState(false);
+  const [newVmTemplateId, setNewVmTemplateId] = useState("");
+  const [drsOverrideTargets, setDrsOverrideTargets] = useState<VirtualMachine[] | null>(null);
+  const [renameTarget, setRenameTarget] = useState<VirtualMachine | null>(null);
+  const [renameName, setRenameName] = useState("");
   const [showMigrate, setShowMigrate] = useState(false);
   const [migrateTargets, setMigrateTargets] = useState<VirtualMachine[] | null>(null);
+  const [diskTarget, setDiskTarget] = useState<VirtualMachine | null>(null);
   const [actionTargets, setActionTargets] = useState<VirtualMachine[] | null>(null);
   const [batchIntent, setBatchIntent] = useState<"migrate" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
@@ -139,7 +148,7 @@ export function App() {
       setConnectionIfChanged(snapshot.connection);
       setError("");
       const neverSynced = !snapshot.connection.last_sync && snapshot.vms.length === 0;
-      if (snapshot.connection.mode === "vcenter" && !snapshot.connection.connected && neverSynced) {
+      if (snapshot.connection.mode !== "demo" && !snapshot.connection.connected && neverSynced) {
         setShowLogin(true);
       }
     } catch (err) {
@@ -147,7 +156,7 @@ export function App() {
       try {
         const info = await fetchConnection();
         setConnectionIfChanged(info);
-        if (info.mode === "vcenter" && !info.connected && !info.last_sync) setShowLogin(true);
+        if (info.mode !== "demo" && !info.connected && !info.last_sync) setShowLogin(true);
       } catch {
         setShowLogin(true);
       }
@@ -237,6 +246,122 @@ export function App() {
     setPending(action);
   }
 
+  function requestVmAction(vm: VirtualMachine, action: ActionName) {
+    setActionTargets([vm]);
+    setPending(action);
+  }
+
+  function openVmMigrate(vm: VirtualMachine) {
+    setMigrateTargets([vm]);
+    setShowMigrate(true);
+  }
+
+  function requestDrsOverride(rows?: VirtualMachine[]) {
+    const targets = rows ?? selectedFromData();
+    const eligible = targets.filter((vm) => !vm.drs_override && vm.cluster_id);
+    if (eligible.length === 0) {
+      setNotice(
+        targets.length === 0
+          ? "Select one or more VMs first"
+          : "Selected VMs already have a DRS override or are not in a cluster",
+      );
+      return;
+    }
+    if (eligible.length > BATCH_LIMIT) {
+      setNotice(`Select at most ${BATCH_LIMIT} VMs for one DRS override job`);
+      return;
+    }
+    setDrsOverrideTargets(eligible);
+  }
+
+  function openVmDrsOverride(vm: VirtualMachine) {
+    requestDrsOverride([vm]);
+  }
+
+  function openVmRename(vm: VirtualMachine) {
+    setRenameTarget(vm);
+    setRenameName(vm.name);
+  }
+
+  async function confirmRename() {
+    const target = renameTarget;
+    const name = renameName.trim();
+    if (!target) return;
+    if (!name || name.includes("/")) {
+      setNotice("VM name is required and cannot contain '/'");
+      return;
+    }
+    if (name === target.name) {
+      setNotice("New name is the same as the current name");
+      return;
+    }
+    setBusy(true);
+    try {
+      const job = await renameVm(target.id, name);
+      setRenameTarget(null);
+      setNotice(`${job.title} queued locally. Watch Jobs for progress; inventory updates after sync.`);
+      setView("jobs");
+      await load();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "Rename failed to queue");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmDrsOverride() {
+    const targets = drsOverrideTargets ?? [];
+    if (targets.length === 0) return;
+    setBusy(true);
+    try {
+      const job = await applyDrsOverride(targets.map((vm) => vm.id));
+      setDrsOverrideTargets(null);
+      setNotice(`${job.title} queued locally. Watch Jobs for progress; inventory updates after sync.`);
+      setView("jobs");
+      await load();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "DRS override failed to queue");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openVmConsole(vm: VirtualMachine) {
+    try {
+      const ticket = await fetchConsoleTicket(vm.id, "vmrc");
+      const target = ticket.uri || ticket.vcenter_url;
+      if (!target) {
+        setNotice("vCenter did not return a console launch URI. Try Open in vCenter.");
+        return;
+      }
+      launchExternalUri(target);
+      if (target.startsWith("vmrc://")) {
+        setNotice(
+          <>
+            Launching VMware Remote Console… If nothing opens,{" "}
+            <a href={VMRC_INSTALL_URL} target="_blank" rel="noopener noreferrer">
+              install VMRC
+            </a>{" "}
+            or use Actions → Open in vCenter.
+          </>,
+        );
+      }
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "Console launch failed");
+    }
+  }
+
+  function openVmInVcenter(vm: VirtualMachine) {
+    const host = connection?.host || connection?.saved_host;
+    if (!host) {
+      setNotice("vCenter host is not configured");
+      return;
+    }
+    const port = connection?.saved_port || 443;
+    const url = vcenterVmConsoleUrl(host, vm.id, port);
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
   function acceptBatch(included: VirtualMachine[]) {
     const intent = batchIntent;
     setBatchIntent(null);
@@ -290,7 +415,7 @@ export function App() {
       setNotice(
         failed.length
           ? `${results.length - failed.length} succeeded, ${failed.length} failed: ${failed.map((row) => `${row.name || row.vm_id}: ${row.message}`).join("; ")}`
-          : `${results.length} ${pending} request(s) queued locally. The relay will run them even if vCenter drops.`,
+          : `${results.length} ${pending} request(s) queued locally. The relay will run them even if the vSphere endpoint drops.`,
       );
       dropCompleted(targets.map((vm) => vm.id));
       setPending(null);
@@ -361,7 +486,7 @@ export function App() {
     toggleMany(group, true);
     setView("machines");
   }, [toggleMany]);
-  const onExportOwners = useCallback(() => exportOwners(owners), [owners]);
+  const onExportOwners = useCallback((rows: OwnerReport[]) => exportOwners(rows), []);
   const onDatastoreQueued = useCallback((_job: unknown, message: string) => {
     setNotice(message);
     setView("jobs");
@@ -383,7 +508,7 @@ export function App() {
           <span className="mark" />
           <div>
             <strong>vFleet</strong>
-            <em>vCenter control</em>
+            <em>vSphere control</em>
           </div>
           <button
             className="version-badge"
@@ -417,11 +542,11 @@ export function App() {
         </nav>
         <div className="rail-foot">
           <StatusPill connection={connection} loading={!data && !error} />
-          {connection?.mode === "vcenter" ? (
+          {connection && connection.mode !== "demo" ? (
             <>
               {!connection.connected ? (
                 <button className="accent wide" onClick={() => setShowLogin(true)}>
-                  Reconnect to vCenter
+                  Reconnect to vSphere
                 </button>
               ) : null}
               {connection.can_disconnect ? (
@@ -432,7 +557,7 @@ export function App() {
             </>
           ) : (
             <button className="accent wide" onClick={() => setShowLogin(true)}>
-              Connect to vCenter
+              Connect to vSphere
             </button>
           )}
         </div>
@@ -478,7 +603,7 @@ export function App() {
               <div className="settings-divider" />
 
               {/* Credentials */}
-              {connection?.mode === "vcenter" && connection.can_disconnect && connection.env_ready && (
+              {connection && connection.mode !== "demo" && connection.can_disconnect && connection.env_ready && (
                 <div className="settings-section">
                   <button
                     className="settings-row-btn danger-row"
@@ -511,12 +636,12 @@ export function App() {
             <input
               value={qInput}
               onChange={(event) => setQInput(event.target.value)}
-              placeholder="Search name or owner…"
+              placeholder="Search name, owner, or deployer…"
             />
             <input
               value={ownerInput}
               onChange={(event) => setOwnerInput(event.target.value)}
-              placeholder="Owner / prefix"
+              placeholder="Owner / prefix / deployer"
             />
             <select value={cluster} onChange={(event) => setCluster(event.target.value)}>
               <option value="">All clusters</option>
@@ -534,12 +659,18 @@ export function App() {
             </select>
           </div>
           {selectedIds.length > 0 ? <BatchCount count={selectedIds.length} /> : null}
-          <button className="accent" onClick={() => setShowClone(true)}>
+          {connection?.capabilities?.clone ? <button
+            className="accent"
+            onClick={() => {
+              setNewVmTemplateId("");
+              setShowNewVm(true);
+            }}
+          >
             New VM
-          </button>
-          {view === "machines" ? (
+          </button> : null}
+          {view === "machines" && connection?.capabilities?.migrate ? (
             <button className="ghost" disabled={selectedIds.length === 0} onClick={() => openMigrate()}>
-              Host migrate
+              Migrate / Clone
             </button>
           ) : null}
           <button className="ghost" onClick={() => void load()}>
@@ -549,7 +680,7 @@ export function App() {
 
         {connection?.stale ? (
           <div className="banner">
-            vCenter is unreachable over the VPN. Showing the last local snapshot
+            The vSphere endpoint is unreachable. Showing the last local snapshot
             {connection.last_sync ? ` from ${relTime(connection.last_sync)}` : ""}. Clones, uploads, migrates, and power
             actions stay in the Jobs queue and resume automatically.
             <button onClick={() => setShowLogin(true)}>Reconnect</button>
@@ -573,7 +704,7 @@ export function App() {
               </button>
             </span>
             <div className="action-buttons">
-              <button onClick={() => openMigrate()}>Host migrate</button>
+              {connection?.capabilities?.migrate ? <button onClick={() => openMigrate()}>Migrate / Clone</button> : null}
               {ACTIONS.map((action) => (
                 <button
                   key={action.id}
@@ -608,14 +739,31 @@ export function App() {
             catalog={catalog}
           />
         ) : null}
-        {view === "hosts" ? <HostTable hosts={hosts} /> : null}
+        {view === "hosts" ? (
+          connection?.endpoint_kind === "esxi" && connection.capabilities?.host_admin ? (
+            <HostManagementView onQueued={(job) => {
+              setNotice(`${job.title} queued. Review progress in Jobs.`);
+              setView("jobs");
+              void load();
+            }} />
+          ) : <HostTable hosts={hosts} />
+        ) : null}
         {view === "machines" ? (
           <VmTable
             vms={vms}
             selected={selected}
+            connection={connection}
             onToggle={toggle}
             onSelectVisible={onVmSelectVisible}
             onMigrate={openMigrate}
+            onVmConsole={openVmConsole}
+            onOpenVcenter={openVmInVcenter}
+            onVmAction={requestVmAction}
+            onVmMigrate={openVmMigrate}
+            onVmRename={openVmRename}
+            onVmDrsOverride={openVmDrsOverride}
+            onVmDiskConvert={setDiskTarget}
+            onDrsOverride={() => requestDrsOverride()}
           />
         ) : null}
         {view === "datastores" ? (
@@ -624,6 +772,10 @@ export function App() {
             clusters={clusters}
             onQueued={onDatastoreQueued}
             onNotice={onDatastoreNotice}
+            onNewVmFromTemplate={(templateId) => {
+              setNewVmTemplateId(templateId);
+              setShowNewVm(true);
+            }}
           />
         ) : null}
         {view === "jobs" ? <JobsView data={jobs} onRefresh={onJobsRefresh} /> : null}
@@ -662,13 +814,20 @@ export function App() {
         />
       ) : null}
 
-      {showClone ? (
-        <CloneVmModal
+      {showNewVm ? (
+        <NewVmModal
+          key={newVmTemplateId || "new-vm-default"}
           catalog={catalog}
           clusters={clusters}
-          onClose={() => setShowClone(false)}
+          hosts={hosts}
+          initialTemplateId={newVmTemplateId || undefined}
+          onClose={() => {
+            setShowNewVm(false);
+            setNewVmTemplateId("");
+          }}
           onQueued={(job) => {
-            setShowClone(false);
+            setShowNewVm(false);
+            setNewVmTemplateId("");
             setNotice(`${job.title} queued locally. Watch Jobs for progress; it will resume if the VPN drops.`);
             setView("jobs");
             void load();
@@ -702,13 +861,92 @@ export function App() {
         />
       ) : null}
 
+      {diskTarget && connection ? (
+        <DiskConversionModal
+          vm={diskTarget}
+          connection={connection}
+          onClose={() => setDiskTarget(null)}
+          onQueued={(job) => {
+            setDiskTarget(null);
+            setNotice(`${job.title} queued. Watch Jobs for progress.`);
+            setView("jobs");
+            void load();
+          }}
+        />
+      ) : null}
+
       {batchIntent ? (
         <BatchLimitDialog
           vms={selectedFromData()}
-          actionLabel={batchIntent === "migrate" ? "Host migrate" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
+          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
           onCancel={() => setBatchIntent(null)}
           onAccept={acceptBatch}
         />
+      ) : null}
+
+      {renameTarget ? (
+        <div className="modal-back" onClick={() => !busy && setRenameTarget(null)}>
+          <form
+            className="modal login-modal"
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void confirmRename();
+            }}
+          >
+            <h2>Rename {renameTarget.name}</h2>
+            <p>Changes the VM display name in vSphere. Queued locally; the relay retries if the endpoint drops.</p>
+            <label>
+              New name
+              <input
+                value={renameName}
+                onChange={(event) => setRenameName(event.target.value)}
+                autoFocus
+                required
+              />
+            </label>
+            <div className="modal-actions">
+              <button className="ghost" type="button" disabled={busy} onClick={() => setRenameTarget(null)}>
+                Cancel
+              </button>
+              <button className="accent" type="submit" disabled={busy || !renameName.trim() || renameName.trim() === renameTarget.name}>
+                {busy ? "Queueing…" : "Rename"}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {drsOverrideTargets && drsOverrideTargets.length > 0 ? (
+        <div className="modal-back" onClick={() => !busy && setDrsOverrideTargets(null)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <h2>Pin on current host (DRS override)</h2>
+            <p>
+              Adds a per-VM DRS override so vCenter will not auto-migrate these VMs from their current host. This does
+              not move a VM to another host. Requires cluster reconfigure permission.
+            </p>
+            <p className="migrate-summary">
+              <BatchCount count={drsOverrideTargets.length} /> in this job
+            </p>
+            <ul>
+              {drsOverrideTargets.slice(0, 12).map((vm) => (
+                <li key={vm.id}>
+                  {vm.name}
+                  <small className="sub"> {vm.host_name || "unknown host"}</small>
+                </li>
+              ))}
+              {drsOverrideTargets.length > 12 ? <li>and {drsOverrideTargets.length - 12} more</li> : null}
+            </ul>
+            <div className="modal-actions">
+              <button className="ghost" disabled={busy} onClick={() => setDrsOverrideTargets(null)}>
+                Cancel
+              </button>
+              <button className="accent" disabled={busy} onClick={() => void confirmDrsOverride()}>
+                {busy ? "Queueing…" : "Apply DRS override"}
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {pending ? (
@@ -782,14 +1020,16 @@ function StatusPill({ connection, loading }: { connection: ConnectionInfo | null
             : connection.syncing
               ? "vCenter · syncing"
               : "vCenter"
-          : "Demo"}
+          : connection.mode === "esxi"
+            ? connection.syncing ? "ESXi · syncing" : "Direct ESXi"
+            : "Demo"}
       </span>
       <small>{connection.host || "local demo"}</small>
       <small>
         {connection.stale
           ? connection.last_sync
             ? `last sync ${relTime(connection.last_sync)}`
-            : "waiting for vCenter"
+            : "waiting for vSphere"
           : connection.user || connection.message}
       </small>
       {(connection.queued_jobs || 0) + (connection.active_jobs || 0) > 0 ? (
@@ -830,13 +1070,13 @@ const Overview = React.memo(function Overview({
 }) {
   return (
     <section className="stack">
-      {connection?.mode !== "vcenter" ? (
+      {connection?.mode === "demo" ? (
         <div className="panel connect-card">
           <header>
             <div>
-              <h2>Sign in to vCenter</h2>
+              <h2>Sign in to vSphere</h2>
               <p>
-                Add the server hostname and account here. You can keep using demo data until you connect. Saving credentials
+                Add a vCenter or standalone ESXi hostname and account here. You can keep using demo data until you connect. Saving credentials
                 writes them into local <code>.env</code> so the next launch can reconnect.
               </p>
             </div>
@@ -974,39 +1214,41 @@ const HostTable = React.memo(function HostTable({ hosts }: { hosts: InventorySna
       <header>
         <h2>ESXi hosts</h2>
       </header>
-      <table>
-        <thead>
-          <tr>
-            <th>Host</th>
-            <th>Cluster</th>
-            <th>State</th>
-            <th>VMs</th>
-            <th>CPU</th>
-            <th>Memory</th>
-          </tr>
-        </thead>
-        <tbody>
-          {hosts.map((host) => (
-            <tr key={host.id}>
-              <td>
-                {host.name}
-                <small className="sub">{host.cpu_cores} cores</small>
-              </td>
-              <td>{host.cluster_name}</td>
-              <td>
-                <span className="chip">{host.connection_state}</span>
-              </td>
-              <td>{host.vm_count}</td>
-              <td>
-                <Meter value={host.cpu_usage_pct} />
-              </td>
-              <td>
-                <Meter value={host.memory_usage_pct} />
-              </td>
+      <TableFit>
+        <table>
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>Cluster</th>
+              <th>State</th>
+              <th>VMs</th>
+              <th>CPU</th>
+              <th>Memory</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {hosts.map((host) => (
+              <tr key={host.id}>
+                <td>
+                  {host.name}
+                  <small className="sub">{host.cpu_cores} cores</small>
+                </td>
+                <td>{host.cluster_name}</td>
+                <td>
+                  <span className="chip">{host.connection_state}</span>
+                </td>
+                <td>{host.vm_count}</td>
+                <td>
+                  <Meter value={host.cpu_usage_pct} />
+                </td>
+                <td>
+                  <Meter value={host.memory_usage_pct} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </TableFit>
     </div>
   );
 });
@@ -1014,15 +1256,33 @@ const HostTable = React.memo(function HostTable({ hosts }: { hosts: InventorySna
 const VmTable = React.memo(function VmTable({
   vms,
   selected,
+  connection,
   onToggle,
   onSelectVisible,
   onMigrate,
+  onDrsOverride,
+  onVmConsole,
+  onOpenVcenter,
+  onVmAction,
+  onVmMigrate,
+  onVmRename,
+  onVmDrsOverride,
+  onVmDiskConvert,
 }: {
   vms: VirtualMachine[];
   selected: Record<string, boolean>;
+  connection: ConnectionInfo | null;
   onToggle: (id: string) => void;
   onSelectVisible: (vms: VirtualMachine[]) => void;
   onMigrate: () => void;
+  onDrsOverride: () => void;
+  onVmConsole: (vm: VirtualMachine) => void;
+  onOpenVcenter: (vm: VirtualMachine) => void;
+  onVmAction: (vm: VirtualMachine, action: ActionName) => void;
+  onVmMigrate: (vm: VirtualMachine) => void;
+  onVmRename: (vm: VirtualMachine) => void;
+  onVmDrsOverride: (vm: VirtualMachine) => void;
+  onVmDiskConvert: (vm: VirtualMachine) => void;
 }) {
   const [sortKey, setSortKey] = useState<MachineSortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -1049,8 +1309,8 @@ const VmTable = React.memo(function VmTable({
         <div>
           <h2>Virtual machines</h2>
           <p>
-            Select one or more VMs, then use <strong>Host migrate</strong> to move hosts, convert Thick to Thin, or change
-            datastore/network. Thick→Thin uses Storage vMotion and can stay on the current datastore.
+            Use <strong>Actions</strong> for power, console, rename, and guided disk provisioning changes.
+            {connection?.capabilities?.migrate ? " Select VMs to migrate, clone, or apply DRS controls." : " Direct ESXi mode keeps vCenter-only migration and DRS controls out of the workflow."}
           </p>
         </div>
         <div className="header-meta">
@@ -1073,153 +1333,193 @@ const VmTable = React.memo(function VmTable({
             <button className="text" onClick={() => onSelectVisible(sorted)} disabled={sorted.length === 0}>
               Select page
             </button>
-            <button className="accent compact" disabled={selectedCount === 0} onClick={onMigrate}>
-              Host migrate
-            </button>
+            {connection?.capabilities?.migrate ? <button className="accent compact" disabled={selectedCount === 0} onClick={onMigrate}>
+              Migrate / Clone
+            </button> : null}
+            {connection?.capabilities?.drs ? <button className="ghost compact" disabled={selectedCount === 0} onClick={onDrsOverride}>
+              Pin host (DRS)
+            </button> : null}
           </div>
         </div>
       </header>
-      <table>
-        <thead>
-          <tr>
-            <th />
-            <SortHeader
-              label="Name"
-              active={sortKey === "name"}
-              dir={sortDir}
-              onClick={() => pickSort("name")}
-              filter={filters.name}
-              onFilter={(value) => setFilter("name", value)}
-              filterPlaceholder="Name…"
-            />
-            <SortHeader
-              label="Owner"
-              active={sortKey === "owner_key"}
-              dir={sortDir}
-              onClick={() => pickSort("owner_key")}
-              filter={filters.owner_key}
-              onFilter={(value) => setFilter("owner_key", value)}
-              filterPlaceholder="Owner…"
-            />
-            <SortHeader
-              label="Power"
-              active={sortKey === "power_state"}
-              dir={sortDir}
-              onClick={() => pickSort("power_state")}
-              filter={filters.power_state}
-              onFilter={(value) => setFilter("power_state", value)}
-              filterPlaceholder="On / Off"
-            />
-            <SortHeader
-              label="Cluster / host"
-              active={sortKey === "cluster_name"}
-              dir={sortDir}
-              onClick={() => pickSort("cluster_name")}
-              filter={filters.cluster_name}
-              onFilter={(value) => setFilter("cluster_name", value)}
-              filterPlaceholder="Cluster…"
-            />
-            <SortHeader
-              label="vCPU"
-              active={sortKey === "cpu_count"}
-              dir={sortDir}
-              onClick={() => pickSort("cpu_count")}
-              filter={filters.cpu_count}
-              onFilter={(value) => setFilter("cpu_count", value)}
-              filterPlaceholder="e.g. >=4"
-            />
-            <SortHeader
-              label="Memory"
-              active={sortKey === "memory_mib"}
-              dir={sortDir}
-              onClick={() => pickSort("memory_mib")}
-              filter={filters.memory_mib}
-              onFilter={(value) => setFilter("memory_mib", value)}
-              filterPlaceholder="GiB"
-            />
-            <SortHeader
-              label="Storage"
-              active={sortKey === "storage_provisioned_bytes"}
-              dir={sortDir}
-              onClick={() => pickSort("storage_provisioned_bytes")}
-              filter={filters.storage_provisioned_bytes}
-              onFilter={(value) => setFilter("storage_provisioned_bytes", value)}
-              filterPlaceholder="e.g. >80"
-            />
-            <SortHeader
-              label="Disk"
-              active={sortKey === "disk_provisioning"}
-              dir={sortDir}
-              onClick={() => pickSort("disk_provisioning")}
-              filter={filters.disk_provisioning}
-              onFilter={(value) => setFilter("disk_provisioning", value)}
-              filterPlaceholder="Thin / Thick"
-            />
-            <SortHeader
-              label="Activity"
-              active={sortKey === "last_activity"}
-              dir={sortDir}
-              onClick={() => pickSort("last_activity")}
-              filter={filters.last_activity}
-              onFilter={(value) => setFilter("last_activity", value)}
-              filterPlaceholder="Activity…"
-            />
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.length === 0 ? (
+      <TableFit>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={10} className="empty">
-                {vms.length === 0 ? "No virtual machines in this view." : "No rows match these column filters."}
-              </td>
+              <th />
+              <SortHeader
+                label="Name"
+                active={sortKey === "name"}
+                dir={sortDir}
+                onClick={() => pickSort("name")}
+                filter={filters.name}
+                onFilter={(value) => setFilter("name", value)}
+                filterPlaceholder="Name…"
+              />
+              <th aria-label="Actions" />
+              <SortHeader
+                label="Owner"
+                active={sortKey === "owner_key"}
+                dir={sortDir}
+                onClick={() => pickSort("owner_key")}
+                filter={filters.owner_key}
+                onFilter={(value) => setFilter("owner_key", value)}
+                filterPlaceholder="Owner…"
+              />
+              <SortHeader
+                label="Power"
+                active={sortKey === "power_state"}
+                dir={sortDir}
+                onClick={() => pickSort("power_state")}
+                filter={filters.power_state}
+                onFilter={(value) => setFilter("power_state", value)}
+                filterPlaceholder="On / Off"
+              />
+              <SortHeader
+                label="Cluster / host"
+                active={sortKey === "cluster_name"}
+                dir={sortDir}
+                onClick={() => pickSort("cluster_name")}
+                filter={filters.cluster_name}
+                onFilter={(value) => setFilter("cluster_name", value)}
+                filterPlaceholder="Cluster…"
+              />
+              <SortHeader
+                label="vCPU"
+                active={sortKey === "cpu_count"}
+                dir={sortDir}
+                onClick={() => pickSort("cpu_count")}
+                filter={filters.cpu_count}
+                onFilter={(value) => setFilter("cpu_count", value)}
+                filterPlaceholder="e.g. >=4"
+              />
+              <SortHeader
+                label="Memory"
+                active={sortKey === "memory_mib"}
+                dir={sortDir}
+                onClick={() => pickSort("memory_mib")}
+                filter={filters.memory_mib}
+                onFilter={(value) => setFilter("memory_mib", value)}
+                filterPlaceholder="GiB"
+              />
+              <SortHeader
+                label="Storage"
+                active={sortKey === "storage_provisioned_bytes"}
+                dir={sortDir}
+                onClick={() => pickSort("storage_provisioned_bytes")}
+                filter={filters.storage_provisioned_bytes}
+                onFilter={(value) => setFilter("storage_provisioned_bytes", value)}
+                filterPlaceholder="e.g. >80"
+              />
+              <SortHeader
+                label="Disk"
+                active={sortKey === "disk_provisioning"}
+                dir={sortDir}
+                onClick={() => pickSort("disk_provisioning")}
+                filter={filters.disk_provisioning}
+                onFilter={(value) => setFilter("disk_provisioning", value)}
+                filterPlaceholder="Thin / Thick"
+              />
+              <SortHeader
+                label="DRS"
+                active={sortKey === "drs_override"}
+                dir={sortDir}
+                onClick={() => pickSort("drs_override")}
+                filter={filters.drs_override}
+                onFilter={(value) => setFilter("drs_override", value)}
+                filterPlaceholder="yes / no"
+              />
+              <SortHeader
+                label="Activity"
+                active={sortKey === "last_activity"}
+                dir={sortDir}
+                onClick={() => pickSort("last_activity")}
+                filter={filters.last_activity}
+                onFilter={(value) => setFilter("last_activity", value)}
+                filterPlaceholder="Activity…"
+              />
             </tr>
-          ) : (
-            sorted.map((vm) => (
-              <tr key={vm.id} className={vm.idle_score >= 40 ? "idle" : ""}>
-                <td>
-                  <input type="checkbox" checked={Boolean(selected[vm.id])} onChange={() => onToggle(vm.id)} />
-                </td>
-                <td>
-                  {vm.name}
-                  <small className="sub">{vm.ip_address || vm.guest_os || "—"}</small>
-                </td>
-                <td>
-                  {vm.owner_key}
-                  <small className="sub">{vm.owner_source}</small>
-                </td>
-                <td>
-                  <span className={`chip power ${powerClass(vm.power_state)}`}>{powerLabel(vm.power_state)}</span>
-                </td>
-                <td>
-                  {vm.cluster_name}
-                  <small className="sub">{vm.host_name}</small>
-                </td>
-                <td>
-                  {vm.cpu_count}
-                  <small className="sub">
-                    {vm.cpu_usage_pct.toFixed(0)}% · {vm.cpu_usage_mhz} MHz
-                  </small>
-                </td>
-                <td>
-                  {gib(vm.memory_mib)}
-                  <small className="sub">{vm.memory_usage_pct.toFixed(0)}% used</small>
-                </td>
-                <td>
-                  {bytes(vm.storage_provisioned_bytes)}
-                  <small className="sub">{bytes(vm.storage_used_bytes)} used</small>
-                </td>
-                <td>
-                  <DiskChip kind={vm.disk_provisioning} />
-                </td>
-                <td>
-                  {relTime(vm.last_activity)}
-                  <small className="sub">{vm.last_activity_source.replace("_", " ")}</small>
+          </thead>
+          <tbody>
+            {sorted.length === 0 ? (
+              <tr>
+                <td colSpan={12} className="empty">
+                  {vms.length === 0 ? "No virtual machines in this view." : "No rows match these column filters."}
                 </td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              sorted.map((vm) => (
+                <tr key={vm.id} className={vm.idle_score >= 40 ? "idle" : ""}>
+                  <td>
+                    <input type="checkbox" checked={Boolean(selected[vm.id])} onChange={() => onToggle(vm.id)} />
+                  </td>
+                  <td>
+                    {vm.name}
+                    <small className="sub">{vm.ip_address || vm.guest_os || "—"}</small>
+                  </td>
+                  <td className="row-actions-cell">
+                    <VmActionsMenu
+                      vm={vm}
+                      connection={connection}
+                      onConsole={onVmConsole}
+                      onOpenVcenter={onOpenVcenter}
+                      onAction={onVmAction}
+                      onMigrate={onVmMigrate}
+                      onRename={onVmRename}
+                      onDrsOverride={onVmDrsOverride}
+                      onDiskConvert={onVmDiskConvert}
+                    />
+                  </td>
+                  <td>
+                    {vm.owner_key}
+                    <small className="sub">
+                      {vm.owner_source}
+                      {vm.deployed_by && vm.deployed_by !== vm.owner_key ? ` · deployed by ${vm.deployed_by}` : ""}
+                    </small>
+                  </td>
+                  <td>
+                    <span className={`chip power ${powerClass(vm.power_state)}`}>{powerLabel(vm.power_state)}</span>
+                  </td>
+                  <td>
+                    {vm.cluster_name}
+                    <small className="sub">{vm.host_name}</small>
+                  </td>
+                  <td>
+                    {vm.cpu_count}
+                    <small className="sub">
+                      {vm.cpu_usage_pct.toFixed(0)}% · {vm.cpu_usage_mhz} MHz
+                    </small>
+                  </td>
+                  <td>
+                    {gib(vm.memory_mib)}
+                    <small className="sub">{vm.memory_usage_pct.toFixed(0)}% used</small>
+                  </td>
+                  <td>
+                    {bytes(vm.storage_provisioned_bytes)}
+                    <small className="sub">{bytes(vm.storage_used_bytes)} used</small>
+                  </td>
+                  <td>
+                    <DiskChip kind={vm.disk_provisioning} />
+                  </td>
+                  <td>
+                    {vm.drs_override ? (
+                      <span className="chip drs" title="Per-VM DRS override — will not auto-migrate">
+                        Pinned
+                      </span>
+                    ) : (
+                      <span className="sub">—</span>
+                    )}
+                  </td>
+                  <td>
+                    {relTime(vm.last_activity)}
+                    <small className="sub">{vm.last_activity_source.replace("_", " ")}</small>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </TableFit>
     </div>
   );
 });
@@ -1270,6 +1570,51 @@ function SortHeader({
   );
 }
 
+function buildLocalOwnerReports(vms: VirtualMachine[], groupBy: "owner_key" | "deployed_by"): OwnerReport[] {
+  const grouped = new Map<string, VirtualMachine[]>();
+  for (const vm of vms) {
+    const key =
+      groupBy === "deployed_by" ? ((vm.deployed_by || "").trim() || "unknown") : vm.owner_key || "unknown";
+    const list = grouped.get(key) ?? [];
+    list.push(vm);
+    grouped.set(key, list);
+  }
+  const reports: OwnerReport[] = [];
+  for (const [owner, members] of grouped) {
+    const poweredOn = members.filter((vm) => vm.power_state === "POWERED_ON").length;
+    const poweredOff = members.filter((vm) => vm.power_state === "POWERED_OFF").length;
+    const suspended = members.filter((vm) => vm.power_state === "SUSPENDED").length;
+    const idle = members.filter((vm) => vm.idle_score >= 40 && vm.power_state === "POWERED_ON");
+    reports.push({
+      owner_key: owner,
+      owner_source:
+        groupBy === "deployed_by" ? (owner === "unknown" ? "unknown" : "deployed_by") : members[0]?.owner_source ?? "name_prefix",
+      vm_count: members.length,
+      powered_on: poweredOn,
+      powered_off: poweredOff,
+      suspended,
+      cpu_count: members.reduce((sum, vm) => sum + vm.cpu_count, 0),
+      memory_mib: members.reduce((sum, vm) => sum + vm.memory_mib, 0),
+      cpu_usage_mhz: members.reduce((sum, vm) => sum + vm.cpu_usage_mhz, 0),
+      memory_usage_mib: members.reduce((sum, vm) => sum + vm.memory_usage_mib, 0),
+      idle_candidates: idle.length,
+      reclaimable_memory_mib: idle.reduce((sum, vm) => sum + vm.memory_mib, 0),
+      vms: members.map((vm) => vm.name).sort(),
+    });
+  }
+  return reports;
+}
+
+function ownerGroupMembers(vms: VirtualMachine[], row: OwnerReport, groupBy: "owner_key" | "deployed_by"): VirtualMachine[] {
+  if (groupBy === "deployed_by") {
+    return vms.filter((vm) => {
+      const key = (vm.deployed_by || "").trim() || "unknown";
+      return key === row.owner_key;
+    });
+  }
+  return vms.filter((vm) => vm.owner_key === row.owner_key);
+}
+
 const OwnerTable = React.memo(function OwnerTable({
   owners,
   vms,
@@ -1283,82 +1628,133 @@ const OwnerTable = React.memo(function OwnerTable({
   expanded: string;
   onExpand: (owner: string) => void;
   onSelectGroup: (group: VirtualMachine[]) => void;
-  onExport: () => void;
+  onExport: (rows: OwnerReport[]) => void;
 }) {
   const [sortKey, setSortKey] = useState<OwnerSortKey>("memory_mib");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [groupBy, setGroupBy] = useState<"owner_key" | "deployed_by">("owner_key");
 
   function pickSort(key: OwnerSortKey) {
     setSortDir((dir) => toggleSortDir(sortKey, key, dir));
     setSortKey(key);
   }
 
-  const sorted = useMemo(() => sortOwners(owners, sortKey, sortDir), [owners, sortKey, sortDir]);
+  const reports = useMemo(
+    () => (groupBy === "deployed_by" ? buildLocalOwnerReports(vms, "deployed_by") : owners),
+    [groupBy, owners, vms],
+  );
+  const sorted = useMemo(() => sortOwners(reports, sortKey, sortDir), [reports, sortKey, sortDir]);
 
   return (
     <div className="panel">
       <header>
-        <h2>Owner / naming groups</h2>
-        <button className="text" onClick={onExport}>
-          Export CSV
-        </button>
+        <div>
+          <h2>{groupBy === "deployed_by" ? "Owners by deployer" : "Owner / naming groups"}</h2>
+          <p>
+            {groupBy === "deployed_by"
+              ? "Grouped by the person who created or cloned the VM (custom Owner field or vCenter event)."
+              : "Grouped by VM name prefix, or a vCenter Owner/User/CreatedBy custom field when set."}
+          </p>
+        </div>
+        <div className="header-meta">
+          <div className="owner-group-toggle" role="group" aria-label="Owner grouping">
+            <button
+              type="button"
+              className={groupBy === "owner_key" ? "active" : ""}
+              onClick={() => {
+                setGroupBy("owner_key");
+                onExpand("");
+              }}
+            >
+              Name prefix
+            </button>
+            <button
+              type="button"
+              className={groupBy === "deployed_by" ? "active" : ""}
+              onClick={() => {
+                setGroupBy("deployed_by");
+                onExpand("");
+              }}
+            >
+              Deployed by
+            </button>
+          </div>
+          <button className="text" onClick={() => onExport(sorted)}>
+            Export CSV
+          </button>
+        </div>
       </header>
-      <table>
-        <thead>
-          <tr>
-            <SortHeader label="Owner" active={sortKey === "owner_key"} dir={sortDir} onClick={() => pickSort("owner_key")} />
-            <SortHeader label="VMs" active={sortKey === "vm_count"} dir={sortDir} onClick={() => pickSort("vm_count")} />
-            <SortHeader label="On / Off / Susp" active={sortKey === "powered_on"} dir={sortDir} onClick={() => pickSort("powered_on")} />
-            <SortHeader label="vCPU" active={sortKey === "cpu_count"} dir={sortDir} onClick={() => pickSort("cpu_count")} />
-            <SortHeader label="Memory" active={sortKey === "memory_mib"} dir={sortDir} onClick={() => pickSort("memory_mib")} />
-            <SortHeader label="Idle" active={sortKey === "idle_candidates"} dir={sortDir} onClick={() => pickSort("idle_candidates")} />
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((row) => {
-            const members = vms.filter((vm) => vm.owner_key === row.owner_key);
-            const open = expanded === row.owner_key;
-            return (
-              <React.Fragment key={row.owner_key}>
-                <tr>
-                  <td>
-                    <button className="text" onClick={() => onExpand(open ? "" : row.owner_key)}>
-                      {row.owner_key}
-                    </button>
-                    <small className="sub">{row.owner_source}</small>
-                  </td>
-                  <td>{row.vm_count}</td>
-                  <td>
-                    {row.powered_on} / {row.powered_off} / {row.suspended}
-                  </td>
-                  <td>{row.cpu_count}</td>
-                  <td>{gib(row.memory_mib)}</td>
-                  <td>{row.idle_candidates}</td>
-                  <td>
-                    <button className="text" onClick={() => onSelectGroup(members)}>
-                      Select
-                    </button>
-                  </td>
-                </tr>
-                {open
-                  ? members.map((vm) => (
-                      <tr key={vm.id} className="nested">
-                        <td colSpan={2}>{vm.name}</td>
-                        <td>
-                          <span className={`chip power ${powerClass(vm.power_state)}`}>{powerLabel(vm.power_state)}</span>
-                        </td>
-                        <td>{vm.cpu_count}</td>
-                        <td>{gib(vm.memory_mib)}</td>
-                        <td colSpan={2}>{relTime(vm.last_activity)}</td>
-                      </tr>
-                    ))
-                  : null}
-              </React.Fragment>
-            );
-          })}
-        </tbody>
-      </table>
+      <TableFit>
+        <table>
+          <thead>
+            <tr>
+              <SortHeader
+                label={groupBy === "deployed_by" ? "Deployer" : "Owner"}
+                active={sortKey === "owner_key"}
+                dir={sortDir}
+                onClick={() => pickSort("owner_key")}
+              />
+              <SortHeader label="VMs" active={sortKey === "vm_count"} dir={sortDir} onClick={() => pickSort("vm_count")} />
+              <SortHeader label="On / Off / Susp" active={sortKey === "powered_on"} dir={sortDir} onClick={() => pickSort("powered_on")} />
+              <SortHeader label="vCPU" active={sortKey === "cpu_count"} dir={sortDir} onClick={() => pickSort("cpu_count")} />
+              <SortHeader label="Memory" active={sortKey === "memory_mib"} dir={sortDir} onClick={() => pickSort("memory_mib")} />
+              <SortHeader label="Idle" active={sortKey === "idle_candidates"} dir={sortDir} onClick={() => pickSort("idle_candidates")} />
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((row) => {
+              const members = ownerGroupMembers(vms, row, groupBy);
+              const open = expanded === row.owner_key;
+              return (
+                <React.Fragment key={`${groupBy}:${row.owner_key}`}>
+                  <tr>
+                    <td>
+                      <button className="text" onClick={() => onExpand(open ? "" : row.owner_key)}>
+                        {row.owner_key}
+                      </button>
+                      <small className="sub">{row.owner_source}</small>
+                    </td>
+                    <td>{row.vm_count}</td>
+                    <td>
+                      {row.powered_on} / {row.powered_off} / {row.suspended}
+                    </td>
+                    <td>{row.cpu_count}</td>
+                    <td>{gib(row.memory_mib)}</td>
+                    <td>{row.idle_candidates}</td>
+                    <td>
+                      <button className="text" onClick={() => onSelectGroup(members)}>
+                        Select
+                      </button>
+                    </td>
+                  </tr>
+                  {open
+                    ? members.map((vm) => (
+                        <tr key={vm.id} className="nested">
+                          <td colSpan={2}>
+                            {vm.name}
+                            {groupBy === "owner_key" && vm.deployed_by && vm.deployed_by !== vm.owner_key ? (
+                              <small className="sub">deployed by {vm.deployed_by}</small>
+                            ) : null}
+                            {groupBy === "deployed_by" && vm.owner_key !== row.owner_key ? (
+                              <small className="sub">prefix {vm.owner_key}</small>
+                            ) : null}
+                          </td>
+                          <td>
+                            <span className={`chip power ${powerClass(vm.power_state)}`}>{powerLabel(vm.power_state)}</span>
+                          </td>
+                          <td>{vm.cpu_count}</td>
+                          <td>{gib(vm.memory_mib)}</td>
+                          <td colSpan={2}>{relTime(vm.last_activity)}</td>
+                        </tr>
+                      ))
+                    : null}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </TableFit>
     </div>
   );
 });
@@ -1446,125 +1842,127 @@ const ReclaimTable = React.memo(function ReclaimTable({
           </div>
         </div>
       </header>
-      <table>
-        <thead>
-          <tr>
-            <th />
-            <SortHeader
-              label="VM"
-              active={sortKey === "name"}
-              dir={sortDir}
-              onClick={() => pickSort("name")}
-              filter={filters.name}
-              onFilter={(value) => setFilter("name", value)}
-              filterPlaceholder="Name…"
-            />
-            <SortHeader
-              label="Owner"
-              active={sortKey === "owner_key"}
-              dir={sortDir}
-              onClick={() => pickSort("owner_key")}
-              filter={filters.owner_key}
-              onFilter={(value) => setFilter("owner_key", value)}
-              filterPlaceholder="Owner…"
-            />
-            <SortHeader
-              label="Score"
-              active={sortKey === "idle_score"}
-              dir={sortDir}
-              onClick={() => pickSort("idle_score")}
-              filter={filters.idle_score}
-              onFilter={(value) => setFilter("idle_score", value)}
-              filterPlaceholder="e.g. >40"
-            />
-            <SortHeader
-              label="CPU / Mem"
-              active={sortKey === "memory_mib"}
-              dir={sortDir}
-              onClick={() => pickSort("memory_mib")}
-              filter={filters.memory_mib}
-              onFilter={(value) => setFilter("memory_mib", value)}
-              filterPlaceholder="CPU or RAM"
-            />
-            <SortHeader
-              label="Storage"
-              active={sortKey === "storage_provisioned_bytes"}
-              dir={sortDir}
-              onClick={() => pickSort("storage_provisioned_bytes")}
-              filter={filters.storage_provisioned_bytes}
-              onFilter={(value) => setFilter("storage_provisioned_bytes", value)}
-              filterPlaceholder="e.g. >80"
-            />
-            <SortHeader
-              label="Disk"
-              active={sortKey === "disk_provisioning"}
-              dir={sortDir}
-              onClick={() => pickSort("disk_provisioning")}
-              filter={filters.disk_provisioning}
-              onFilter={(value) => setFilter("disk_provisioning", value)}
-              filterPlaceholder="Thin / Thick"
-            />
-            <SortHeader
-              label="Idle"
-              active={sortKey === "days_idle"}
-              dir={sortDir}
-              onClick={() => pickSort("days_idle")}
-              filter={filters.days_idle}
-              onFilter={(value) => setFilter("days_idle", value)}
-              filterPlaceholder="e.g. >14"
-            />
-            <SortHeader
-              label="Why"
-              active={sortKey === "reclaim_reason"}
-              dir={sortDir}
-              onClick={() => pickSort("reclaim_reason")}
-              filter={filters.reclaim_reason}
-              onFilter={(value) => setFilter("reclaim_reason", value)}
-              filterPlaceholder="Reason…"
-            />
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.length === 0 ? (
+      <TableFit>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={9} className="empty">
-                {vms.length === 0 ? "No reclaim candidates right now." : "No rows match these column filters."}
-              </td>
+              <th />
+              <SortHeader
+                label="VM"
+                active={sortKey === "name"}
+                dir={sortDir}
+                onClick={() => pickSort("name")}
+                filter={filters.name}
+                onFilter={(value) => setFilter("name", value)}
+                filterPlaceholder="Name…"
+              />
+              <SortHeader
+                label="Owner"
+                active={sortKey === "owner_key"}
+                dir={sortDir}
+                onClick={() => pickSort("owner_key")}
+                filter={filters.owner_key}
+                onFilter={(value) => setFilter("owner_key", value)}
+                filterPlaceholder="Owner…"
+              />
+              <SortHeader
+                label="Score"
+                active={sortKey === "idle_score"}
+                dir={sortDir}
+                onClick={() => pickSort("idle_score")}
+                filter={filters.idle_score}
+                onFilter={(value) => setFilter("idle_score", value)}
+                filterPlaceholder="e.g. >40"
+              />
+              <SortHeader
+                label="CPU / Mem"
+                active={sortKey === "memory_mib"}
+                dir={sortDir}
+                onClick={() => pickSort("memory_mib")}
+                filter={filters.memory_mib}
+                onFilter={(value) => setFilter("memory_mib", value)}
+                filterPlaceholder="CPU or RAM"
+              />
+              <SortHeader
+                label="Storage"
+                active={sortKey === "storage_provisioned_bytes"}
+                dir={sortDir}
+                onClick={() => pickSort("storage_provisioned_bytes")}
+                filter={filters.storage_provisioned_bytes}
+                onFilter={(value) => setFilter("storage_provisioned_bytes", value)}
+                filterPlaceholder="e.g. >80"
+              />
+              <SortHeader
+                label="Disk"
+                active={sortKey === "disk_provisioning"}
+                dir={sortDir}
+                onClick={() => pickSort("disk_provisioning")}
+                filter={filters.disk_provisioning}
+                onFilter={(value) => setFilter("disk_provisioning", value)}
+                filterPlaceholder="Thin / Thick"
+              />
+              <SortHeader
+                label="Idle"
+                active={sortKey === "days_idle"}
+                dir={sortDir}
+                onClick={() => pickSort("days_idle")}
+                filter={filters.days_idle}
+                onFilter={(value) => setFilter("days_idle", value)}
+                filterPlaceholder="e.g. >14"
+              />
+              <SortHeader
+                label="Why"
+                active={sortKey === "reclaim_reason"}
+                dir={sortDir}
+                onClick={() => pickSort("reclaim_reason")}
+                filter={filters.reclaim_reason}
+                onFilter={(value) => setFilter("reclaim_reason", value)}
+                filterPlaceholder="Reason…"
+              />
             </tr>
-          ) : (
-            sorted.map((vm) => (
-              <tr key={vm.id}>
-                <td>
-                  <input type="checkbox" checked={Boolean(selected[vm.id])} onChange={() => onToggle(vm.id)} />
+          </thead>
+          <tbody>
+            {sorted.length === 0 ? (
+              <tr>
+                <td colSpan={9} className="empty">
+                  {vms.length === 0 ? "No reclaim candidates right now." : "No rows match these column filters."}
                 </td>
-                <td>
-                  {vm.name}
-                  <small className="sub">{vm.cluster_name}</small>
-                </td>
-                <td>{vm.owner_key}</td>
-                <td>
-                  <b className="score">{vm.idle_score}</b>
-                </td>
-                <td>
-                  {vm.cpu_count} vCPU {vm.cpu_usage_pct.toFixed(0)}%
-                  <small className="sub">
-                    {gib(vm.memory_mib)} · {vm.memory_usage_pct.toFixed(0)}%
-                  </small>
-                </td>
-                <td>
-                  {bytes(vm.storage_provisioned_bytes)}
-                  <small className="sub">{bytes(vm.storage_used_bytes)} used</small>
-                </td>
-                <td>
-                  <DiskChip kind={vm.disk_provisioning} />
-                </td>
-                <td>{vm.days_idle != null ? `${vm.days_idle.toFixed(0)}d` : "unknown"}</td>
-                <td className="reason">{vm.reclaim_reason}</td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              sorted.map((vm) => (
+                <tr key={vm.id}>
+                  <td>
+                    <input type="checkbox" checked={Boolean(selected[vm.id])} onChange={() => onToggle(vm.id)} />
+                  </td>
+                  <td>
+                    {vm.name}
+                    <small className="sub">{vm.cluster_name}</small>
+                  </td>
+                  <td>{vm.owner_key}</td>
+                  <td>
+                    <b className="score">{vm.idle_score}</b>
+                  </td>
+                  <td>
+                    {vm.cpu_count} vCPU {vm.cpu_usage_pct.toFixed(0)}%
+                    <small className="sub">
+                      {gib(vm.memory_mib)} · {vm.memory_usage_pct.toFixed(0)}%
+                    </small>
+                  </td>
+                  <td>
+                    {bytes(vm.storage_provisioned_bytes)}
+                    <small className="sub">{bytes(vm.storage_used_bytes)} used</small>
+                  </td>
+                  <td>
+                    <DiskChip kind={vm.disk_provisioning} />
+                  </td>
+                  <td>{vm.days_idle != null ? `${vm.days_idle.toFixed(0)}d` : "unknown"}</td>
+                  <td className="reason">{vm.reclaim_reason}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </TableFit>
     </div>
   );
 });

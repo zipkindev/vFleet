@@ -1,6 +1,6 @@
 # vFleet
 
-A local web console for **your** vCenter: inventory clusters/hosts/VMs, group labs by naming convention, report resource use by owner, and shut down idle machines that are sitting on CPU and memory.
+A local web console for **your** vCenter or standalone ESXi host: inventory clusters/hosts/VMs, group labs by naming convention, report resource use by owner, and run guarded operator workflows.
 
 This talks to vCenter with credentials **you** put in `.env`. It is an operator tool, not a scanner for systems you do not administer.
 
@@ -8,7 +8,7 @@ This talks to vCenter with credentials **you** put in `.env`. It is an operator 
 
 | Need | How | Notes |
 | --- | --- | --- |
-| Authenticate | vCenter session via [pyvmomi](https://github.com/vmware/pyvmomi) (SOAP) | Same account you would use in the vSphere Client. A role with inventory + VM power + events is enough; full Administrator is not required. |
+| Authenticate | vSphere session via [pyvmomi](https://github.com/vmware/pyvmomi) (SOAP) | Auto-detects vCenter (`VirtualCenter`) or direct ESXi (`HostAgent`). |
 | Clusters, hosts, VMs | PropertyCollector inventory | Names, power state, guest OS, Tools, IP, configured vCPU/RAM, current host/cluster. Cached locally so the UI keeps working if the VPN drops. |
 | CPU / memory utilization | `summary.quickStats` | Live usage (MHz / guest memory). This is the same family of numbers the vSphere UI uses, not guest-inside telemetry. |
 | Power on / off / reset / suspend | Local job queue → VIM power methods | **Guest shutdown/reboot** needs VMware Tools. Hard power-off does not. Queued on disk; retried after disconnects. |
@@ -22,6 +22,18 @@ This talks to vCenter with credentials **you** put in `.env`. It is an operator 
 | Reclaim oversized idle labs | Score + confirm UI | Flags powered-on VMs with low utilization, high reservation, and stale activity. You can guest-shutdown, hard power-off, or **delete the VM from disk** (powers off first). Destroy datastore is not exposed. |
 
 The vSphere **REST** Automation API can list VMs and do power operations, but live performance and event history are still best through the SOAP APIs. That is why the backend uses pyvmomi rather than REST-only.
+
+## Standalone ESXi mode
+
+Connect to an ESXi management address exactly as you would connect to vCenter. vFleet detects the endpoint and keeps the existing vCenter adapter/relay architecture intact; vCenter-only controls are hidden rather than emulated.
+
+- Inventory, VM console/power/rename/delete, datastore access, and disk relocation use the vSphere SOAP API directly on the host.
+- The **Hosts** view becomes a direct-host console for maintenance mode, guarded reboot/shutdown, ESXi Shell/SSH/NTP service state, NTP configuration, storage rescan, and support-bundle generation.
+- VM **Actions → Convert disk provisioning** first builds a disk-by-disk plan. RDM, encrypted, shared, snapshot-dependent SSH, stale-plan, and endpoint-switch hazards are blocked before a job is queued.
+- vCenter-only DRS, roles, templates, Content Library, and cross-host migration remain available only when a vCenter endpoint reports those capabilities.
+- Some free ESXi licenses expose write APIs as read-only. Use the API method first. The optional SSH fallback is explicitly selected, host-key verified, and limited to `vmkfstools` cloning; it never accepts arbitrary shell commands and preserves source VMDKs.
+
+Every job records the endpoint fingerprint it was created for. A queued task will fail closed rather than run after the operator switches to a different vCenter or ESXi host.
 
 ## Honest limits
 
@@ -52,10 +64,10 @@ Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a 
 
 ## Connect from the UI
 
-The left rail has **Connect to vCenter**. Enter host (or `https://vcenter.example.com:443`), username, and password.
+The left rail has **Connect to vSphere**. Enter either a vCenter address or a standalone ESXi host, username, and password.
 
-- **Test** talks to vCenter and reports whether the account works, without leaving demo.
-- **Save** tests first, then writes host and credentials to local `.env` and switches to live inventory.
+- **Test** detects and reports the endpoint without saving credentials or switching away from the current session.
+- **Connect & save** tests first, then writes host and credentials to the gitignored local `.env` and switches to live inventory.
 - **Stay in demo** closes the dialog. **Disconnect** / **Forget saved credentials** are in the rail after you connect.
 
 `.env` still works if you prefer to pre-fill values before start.
@@ -74,6 +86,24 @@ VCENTER_INSECURE=true
 ```
 
 3. Restart `./scripts/dev.sh`. `APP_MODE=auto` uses vCenter whenever host/user/password are set, otherwise demo.
+
+For a standalone host, use the same variables with its management address and an ESXi account. Optional SSH fallback settings are documented in `.env.example`; leave `ESXI_SSH_ENABLED=false` unless you specifically need it.
+
+## CLI automation
+
+The CLI calls the local FastAPI/relay boundary, so it gets the same confirmations, endpoint binding, retry state, and audit trail as the UI:
+
+```bash
+scripts/vfleet connection
+scripts/vfleet inventory --kind vms
+scripts/vfleet host
+scripts/vfleet disk-plan VM_ID --target thin
+scripts/vfleet disk-convert VM_ID --target thin --yes
+scripts/vfleet jobs
+scripts/vfleet job JOB_ID --wait
+```
+
+Host lifecycle, service, NTP, storage-rescan, and support-bundle commands are listed by `scripts/vfleet --help`. Mutating commands require an interactive `yes` or `--yes`. Override the local endpoint with `VFLEET_API_URL`; use `VFLEET_UI_TOKEN` when the API is protected.
 
 Keep `.env` off git. Use a dedicated service account with least privilege:
 
@@ -125,6 +155,7 @@ Tune those in `.env`. Prefer **Guest shutdown** when Tools is running. **Delete 
 ```
 backend/app          FastAPI + demo/vCenter adapters + local relay
 frontend/src         React UI
+scripts/vfleet       Local API/relay CLI
 scripts/dev.sh       API :8081 + Vite :5173
 data/                SQLite job queue, last inventory, staging uploads (gitignored)
 .env.example         Credential stub

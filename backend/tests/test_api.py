@@ -30,6 +30,18 @@ def test_inventory_groups_and_reclaim():
         assert {vm["disk_provisioning"] for vm in payload["vms"]} >= {"thin", "thick"}
 
 
+def test_inventory_owner_filter_matches_deployed_by():
+    with TestClient(app) as client:
+        response = client.get("/api/inventory", params={"owner": "pbogar"})
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["vms"]
+        assert all(
+            vm["deployed_by"] == "pbogar" or vm["owner_key"] == "pbogar" for vm in payload["vms"]
+        )
+        assert any(vm["owner_key"] == "windows" for vm in payload["vms"])
+
+
 def test_actions_require_confirm():
     with TestClient(app) as client:
         response = client.post("/api/actions", json={"vm_ids": ["vm-104"], "action": "shutdown", "confirm": False})

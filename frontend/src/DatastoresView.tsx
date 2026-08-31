@@ -2,19 +2,27 @@ import React, { useEffect, useState } from "react";
 import { createStaging, deleteDatastoreFile, enqueueUpload, fetchDatastoreFiles, mkdir, putStagingChunk } from "./api";
 import { bytes } from "./format";
 import { MigrationAccessPanel } from "./MigrationAccessPanel";
-import type { Catalog, ClusterSummary, DatastoreFile, DatastoreListing, Job } from "./types";
+import type { Catalog, ClusterSummary, DatastoreFile, DatastoreListing, Job, VmTemplate } from "./types";
 
 type Props = {
   catalog: Catalog | null;
   clusters: ClusterSummary[];
   onQueued: (job: Job, message: string) => void;
   onNotice?: (message: string) => void;
+  onNewVmFromTemplate?: (templateId: string) => void;
 };
 
 const CHUNK = 4 * 1024 * 1024;
 
-export const DatastoresView = React.memo(function DatastoresView({ catalog, clusters, onQueued, onNotice }: Props) {
+export const DatastoresView = React.memo(function DatastoresView({
+  catalog,
+  clusters,
+  onQueued,
+  onNotice,
+  onNewVmFromTemplate,
+}: Props) {
   const datastores = catalog?.datastores ?? [];
+  const templates = catalog?.templates ?? [];
   const [selectedId, setSelectedId] = useState(datastores[0]?.id ?? "");
   const [listing, setListing] = useState<DatastoreListing | null>(null);
   const [path, setPath] = useState("");
@@ -88,10 +96,52 @@ export const DatastoresView = React.memo(function DatastoresView({ catalog, clus
   return (
     <section className="stack">
       {catalog?.stale ? (
-        <div className="banner">Showing last cached datastores. Browse/upload will queue or retry when vCenter is reachable.</div>
+        <div className="banner">Showing last cached datastores. Browse/upload will queue or retry when the vSphere endpoint is reachable.</div>
       ) : null}
       {error ? <div className="banner bad">{error}</div> : null}
       <MigrationAccessPanel clusters={clusters} onDone={(message) => onNotice?.(message)} />
+      {templates.length > 0 ? (
+        <div className="panel">
+          <header>
+            <div>
+              <h2>Templates</h2>
+              <p>Deploy a VM from a vCenter template. Pick a host to pin placement, or optionally add a DRS override.</p>
+            </div>
+          </header>
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Cluster</th>
+                <th>Datastore</th>
+                <th>Size</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {templates.map((item: VmTemplate) => (
+                <tr key={item.id}>
+                  <td>
+                    {item.name}
+                    {item.guest_os ? <small className="sub">{item.guest_os}</small> : null}
+                  </td>
+                  <td>{item.cluster_name || "—"}</td>
+                  <td>{item.datastore_name || "—"}</td>
+                  <td>
+                    {item.cpu_count ? `${item.cpu_count} vCPU` : "—"}
+                    {item.memory_mib ? ` · ${Math.round(item.memory_mib / 1024)} GiB` : ""}
+                  </td>
+                  <td>
+                    <button className="text" onClick={() => onNewVmFromTemplate?.(item.id)}>
+                      New VM…
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
       <div className="panel">
         <header>
           <h2>Datastores</h2>

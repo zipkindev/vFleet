@@ -29,6 +29,7 @@ export type MachineSortKey =
   | "memory_mib"
   | "storage_provisioned_bytes"
   | "disk_provisioning"
+  | "drs_override"
   | "last_activity";
 
 export type MachineFilters = Partial<Record<MachineSortKey, string>>;
@@ -102,6 +103,8 @@ export function sortMachines(vms: VirtualMachine[], key: MachineSortKey, dir: So
         return compareNumbers(a.storage_provisioned_bytes, b.storage_provisioned_bytes, sign);
       case "disk_provisioning":
         return compareStrings(diskLabel(a.disk_provisioning), diskLabel(b.disk_provisioning), sign);
+      case "drs_override":
+        return compareNumbers(Number(a.drs_override), Number(b.drs_override), sign);
       case "last_activity": {
         const missing = dir === "desc" ? -Infinity : Infinity;
         const aTs = a.last_activity ? Date.parse(a.last_activity) : missing;
@@ -143,7 +146,7 @@ function machineCellText(vm: VirtualMachine, key: MachineSortKey): string {
     case "name":
       return `${vm.name} ${vm.ip_address ?? ""} ${vm.guest_os}`;
     case "owner_key":
-      return `${vm.owner_key} ${vm.owner_source}`;
+      return `${vm.owner_key} ${vm.owner_source} ${vm.deployed_by ?? ""}`;
     case "power_state":
       return powerLabel(vm.power_state);
     case "cluster_name":
@@ -156,6 +159,8 @@ function machineCellText(vm: VirtualMachine, key: MachineSortKey): string {
       return storageGib(vm.storage_provisioned_bytes).toFixed(1);
     case "disk_provisioning":
       return diskLabel(vm.disk_provisioning);
+    case "drs_override":
+      return vm.drs_override ? "yes pinned drs override" : "no";
     case "last_activity":
       return `${vm.last_activity ?? ""} ${vm.last_activity_source}`;
   }
@@ -169,6 +174,8 @@ function machineNumericValues(vm: VirtualMachine, key: MachineSortKey): number[]
       return [vm.memory_mib / 1024];
     case "storage_provisioned_bytes":
       return [storageGib(vm.storage_provisioned_bytes)];
+    case "drs_override":
+      return [Number(vm.drs_override)];
     case "last_activity":
       // ISO timestamp text contains many incidental numbers; block numeric operators entirely.
       return [];

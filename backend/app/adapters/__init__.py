@@ -7,7 +7,7 @@ from .demo import DemoAdapter
 
 def build_adapter(settings: Settings) -> InventoryAdapter:
     mode = settings.resolved_mode
-    if mode == "vcenter":
+    if mode in {"vcenter", "esxi"}:
         from .vcenter import VCenterAdapter
 
         return VCenterAdapter(settings)

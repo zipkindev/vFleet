@@ -27,6 +27,16 @@ class ConnectionInfo(BaseModel):
     queued_jobs: int = 0
     active_jobs: int = 0
     cache_age_seconds: Optional[float] = None
+    endpoint_kind: str = "demo"
+    api_type: str = ""
+    api_version: str = ""
+    product_name: str = ""
+    product_version: str = ""
+    product_build: str = ""
+    instance_uuid: str = ""
+    endpoint_fingerprint: str = ""
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+    ssh_configured: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -37,6 +47,12 @@ class LoginRequest(BaseModel):
     insecure: bool = True
     remember: bool = False
     connect: bool = True
+    endpoint_kind: str = "auto"
+    ssh_enabled: bool = False
+    ssh_user: str = ""
+    ssh_password: str = ""
+    ssh_port: int = 22
+    ssh_host_key_sha256: str = ""
 
 
 class LogoutRequest(BaseModel):
@@ -58,6 +74,10 @@ class HostSummary(BaseModel):
     memory_usage_mib: int
     memory_usage_pct: float
     vm_count: int = 0
+    maintenance_mode: bool = False
+    uptime_seconds: int = 0
+    vendor: str = ""
+    model: str = ""
 
 
 class ClusterSummary(BaseModel):
@@ -97,6 +117,7 @@ class VirtualMachine(BaseModel):
     days_idle: Optional[float] = None
     owner_key: str
     owner_source: str
+    deployed_by: str = ""
     custom_fields: Dict[str, str] = Field(default_factory=dict)
     idle_score: int = 0
     reclaim_reason: Optional[str] = None
@@ -104,6 +125,35 @@ class VirtualMachine(BaseModel):
     storage_used_bytes: int = 0
     storage_provisioned_bytes: int = 0
     disk_provisioning: str = "unknown"
+    drs_override: bool = False
+    folder_id: str = ""
+    folder_path: str = ""
+    disks: List["VirtualDiskSummary"] = Field(default_factory=list)
+
+
+class VirtualDiskSummary(BaseModel):
+    key: int
+    label: str = ""
+    capacity_bytes: int = 0
+    file_name: str = ""
+    datastore_id: str = ""
+    datastore_name: str = ""
+    provisioning: str = "unknown"
+    disk_mode: str = ""
+    backing_type: str = ""
+    parent_depth: int = 0
+    rdm: bool = False
+    encrypted: bool = False
+    sharing: str = ""
+
+
+class VmFolder(BaseModel):
+    id: str
+    name: str
+    path: str
+    parent_id: str = ""
+    datacenter_id: str = ""
+    datacenter_name: str = ""
 
 
 class OwnerReport(BaseModel):
@@ -148,6 +198,24 @@ class ActionResponse(BaseModel):
     results: List[ActionResult]
     job_id: Optional[str] = None
     queued: bool = False
+
+
+class ConsoleTicketRequest(BaseModel):
+    type: str = "vmrc"
+
+
+class ConsoleTicket(BaseModel):
+    vm_id: str
+    name: str
+    type: str
+    uri: str = ""
+    host: str = ""
+    port: int = 0
+    ticket: str = ""
+    ssl_thumbprint: str = ""
+    vcenter_url: str = ""
+    expires_in_seconds: int = 1800
+    message: str = ""
 
 
 class DatastoreSummary(BaseModel):
@@ -216,9 +284,15 @@ class CloneVmRequest(BaseModel):
     name: str
     datastore_id: str
     cluster_id: str = ""
+    host_id: str = ""
+    folder_id: str = ""
+    disable_drs: bool = False
     cpu_count: Optional[int] = None
     memory_mib: Optional[int] = None
     power_on: bool = False
+
+
+DeployVmRequest = CloneVmRequest
 
 
 class MigrateVmRequest(BaseModel):
@@ -227,6 +301,128 @@ class MigrateVmRequest(BaseModel):
     datastore_id: str = ""
     network_id: str = ""
     disk_provisioning: str = ""
+    folder_id: str = ""
+    confirm: bool = False
+
+
+class DiskConversionPlanRequest(BaseModel):
+    vm_id: str
+    target: str = "thin"
+    method: str = "auto"
+
+
+class DiskConversionRequest(DiskConversionPlanRequest):
+    plan_token: str
+    confirm: bool = False
+
+
+class DiskConversionPlan(BaseModel):
+    vm_id: str
+    vm_name: str
+    target: str
+    method: str
+    fallback_method: str = ""
+    plan_token: str
+    power_state: str
+    disks: List[VirtualDiskSummary] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    estimated_scratch_bytes: int = 0
+    noop: bool = False
+    can_execute: bool = False
+
+
+class HostServiceSummary(BaseModel):
+    key: str
+    label: str = ""
+    running: bool = False
+    policy: str = ""
+    required: bool = False
+    controllable: bool = False
+
+
+class HostStorageAdapterSummary(BaseModel):
+    key: str
+    model: str = ""
+    driver: str = ""
+    status: str = ""
+    device: str = ""
+
+
+class HostHealthSensor(BaseModel):
+    name: str
+    status: str = "unknown"
+    reading: str = ""
+
+
+class HostManagementInfo(BaseModel):
+    host_id: str
+    name: str
+    endpoint_kind: str = ""
+    product_name: str = ""
+    version: str = ""
+    build: str = ""
+    api_version: str = ""
+    vendor: str = ""
+    model: str = ""
+    uuid: str = ""
+    connection_state: str = "unknown"
+    maintenance_mode: bool = False
+    uptime_seconds: int = 0
+    boot_time: Optional[datetime] = None
+    current_time: Optional[datetime] = None
+    ntp_servers: List[str] = Field(default_factory=list)
+    dns_servers: List[str] = Field(default_factory=list)
+    search_domains: List[str] = Field(default_factory=list)
+    hostname: str = ""
+    domain_name: str = ""
+    license_name: str = ""
+    license_key: str = ""
+    services: List[HostServiceSummary] = Field(default_factory=list)
+    storage_adapters: List[HostStorageAdapterSummary] = Field(default_factory=list)
+    health: List[HostHealthSensor] = Field(default_factory=list)
+    ssh_configured: bool = False
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+
+
+class HostActionRequest(BaseModel):
+    action: str
+    confirm: bool = False
+    timeout_seconds: int = Field(default=900, ge=30, le=7200)
+
+
+class HostServiceActionRequest(BaseModel):
+    service_key: str
+    action: str
+    policy: str = ""
+    confirm: bool = False
+
+
+class HostTimeRequest(BaseModel):
+    ntp_servers: List[str] = Field(default_factory=list)
+    sync_now: bool = False
+    confirm: bool = False
+
+
+class CloneMigrateRequest(BaseModel):
+    vm_id: str
+    host_id: str
+    name: str = ""
+    destroy_source: bool = False
+    disable_drs: bool = False
+    datastore_id: str = ""
+    folder_id: str = ""
+    power_on: bool = False
+    confirm: bool = False
+
+
+class DrsOverrideRequest(BaseModel):
+    vm_ids: List[str]
+    confirm: bool = False
+
+
+class RenameVmRequest(BaseModel):
+    name: str
     confirm: bool = False
 
 

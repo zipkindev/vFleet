@@ -89,6 +89,19 @@ class VCenterRest:
     def reset(self) -> None:
         self.close()
 
+    def console_ticket(self, vm_id: str, ticket_type: str = "VMRC") -> Any:
+        client = self.client()
+        body = {"type": ticket_type.upper()}
+        response = client.post(f"/api/vcenter/vm/{vm_id}/console/tickets", json=body)
+        if response.status_code >= 400:
+            response = client.post(
+                f"/rest/vcenter/vm/{vm_id}/console/tickets",
+                json={"spec": body},
+            )
+        if response.status_code >= 400:
+            raise PermanentError(response.text[:240] or f"Console ticket request failed ({response.status_code})")
+        return _unwrap(_json(response))
+
 
 def _join_url(current: str, location: str) -> str:
     return str(httpx.URL(current).join(location))

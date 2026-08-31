@@ -21,6 +21,16 @@ export type ConnectionInfo = {
   queued_jobs: number;
   active_jobs: number;
   cache_age_seconds: number | null;
+  endpoint_kind: "demo" | "vcenter" | "esxi" | string;
+  api_type: string;
+  api_version: string;
+  product_name: string;
+  product_version: string;
+  product_build: string;
+  instance_uuid: string;
+  endpoint_fingerprint: string;
+  capabilities: Record<string, boolean>;
+  ssh_configured: boolean;
 };
 
 export type HostSummary = {
@@ -38,6 +48,10 @@ export type HostSummary = {
   memory_usage_mib: number;
   memory_usage_pct: number;
   vm_count: number;
+  maintenance_mode: boolean;
+  uptime_seconds: number;
+  vendor: string;
+  model: string;
 };
 
 export type ClusterSummary = {
@@ -77,6 +91,7 @@ export type VirtualMachine = {
   days_idle: number | null;
   owner_key: string;
   owner_source: string;
+  deployed_by: string;
   custom_fields: Record<string, string>;
   idle_score: number;
   reclaim_reason: string | null;
@@ -84,6 +99,90 @@ export type VirtualMachine = {
   storage_used_bytes: number;
   storage_provisioned_bytes: number;
   disk_provisioning: "thin" | "thick" | "mixed" | "unknown" | string;
+  drs_override: boolean;
+  folder_id?: string;
+  folder_path?: string;
+  disks: VirtualDiskSummary[];
+};
+
+export type VirtualDiskSummary = {
+  key: number;
+  label: string;
+  capacity_bytes: number;
+  file_name: string;
+  datastore_id: string;
+  datastore_name: string;
+  provisioning: string;
+  disk_mode: string;
+  backing_type: string;
+  parent_depth: number;
+  rdm: boolean;
+  encrypted: boolean;
+  sharing: string;
+};
+
+export type DiskConversionPlan = {
+  vm_id: string;
+  vm_name: string;
+  target: string;
+  method: "soap" | "ssh" | string;
+  fallback_method: string;
+  plan_token: string;
+  power_state: string;
+  disks: VirtualDiskSummary[];
+  blockers: string[];
+  warnings: string[];
+  estimated_scratch_bytes: number;
+  noop: boolean;
+  can_execute: boolean;
+};
+
+export type HostServiceSummary = {
+  key: string;
+  label: string;
+  running: boolean;
+  policy: string;
+  required: boolean;
+  controllable: boolean;
+};
+
+export type HostManagementInfo = {
+  host_id: string;
+  name: string;
+  endpoint_kind: string;
+  product_name: string;
+  version: string;
+  build: string;
+  api_version: string;
+  vendor: string;
+  model: string;
+  uuid: string;
+  connection_state: string;
+  maintenance_mode: boolean;
+  uptime_seconds: number;
+  boot_time: string | null;
+  current_time: string | null;
+  ntp_servers: string[];
+  dns_servers: string[];
+  search_domains: string[];
+  hostname: string;
+  domain_name: string;
+  license_name: string;
+  license_key: string;
+  services: HostServiceSummary[];
+  storage_adapters: Array<{ key: string; model: string; driver: string; status: string; device: string }>;
+  health: Array<{ name: string; status: string; reading: string }>;
+  ssh_configured: boolean;
+  capabilities: Record<string, boolean>;
+};
+
+export type VmFolder = {
+  id: string;
+  name: string;
+  path: string;
+  parent_id: string;
+  datacenter_id: string;
+  datacenter_name: string;
 };
 
 export type OwnerReport = {
@@ -117,6 +216,20 @@ export type ActionResult = {
   name: string;
   action: string;
   ok: boolean;
+  message: string;
+};
+
+export type ConsoleTicket = {
+  vm_id: string;
+  name: string;
+  type: string;
+  uri: string;
+  host: string;
+  port: number;
+  ticket: string;
+  ssl_thumbprint: string;
+  vcenter_url: string;
+  expires_in_seconds: number;
   message: string;
 };
 

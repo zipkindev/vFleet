@@ -4,7 +4,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +23,16 @@ from .models import (
     Catalog,
     CloneVmRequest,
     ConnectionInfo,
+    ConsoleTicket,
+    ConsoleTicketRequest,
     DatastoreListing,
     DeleteFileRequest,
+    DiskConversionPlan,
+    DiskConversionPlanRequest,
+    DiskConversionRequest,
+    DeployVmRequest,
+    DrsOverrideRequest,
+    CloneMigrateRequest,
     InventorySnapshot,
     Job,
     JobList,
@@ -33,19 +41,27 @@ from .models import (
     MetricsResponse,
     MigrateVmRequest,
     GrantMigrationRequest,
+    HostActionRequest,
+    HostManagementInfo,
+    HostServiceActionRequest,
+    HostTimeRequest,
     MigrationAccessStatus,
     MkdirRequest,
+    RenameVmRequest,
     StagingCreateRequest,
     StagingSession,
     UploadRequest,
+    VmFolder,
 )
 from .reclaim import build_owner_reports
+from .grouping import vm_matches_owner_query, vm_matches_search
 from .metrics import build_owner_utilization
 from .power import normalize_power_state
 from .relay import RelayWorker
 from .session import apply_runtime, forget_vcenter, parse_endpoint, persist_vcenter, resolve_login_password
 from .store import LocalStore
 from .vm_storage import normalize_disk_transform
+from .errors import PermanentError
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "destroy"}
@@ -93,7 +109,7 @@ def decorate_connection(conn: ConnectionInfo, request: Request) -> ConnectionInf
             "saved_user": settings.vcenter_user,
             "saved_port": settings.vcenter_port,
             "insecure": settings.vcenter_insecure,
-            "can_disconnect": conn.mode == "vcenter",
+            "can_disconnect": conn.mode in {"vcenter", "esxi"},
         }
     )
 
@@ -102,11 +118,19 @@ def _filter_snapshot(snapshot: InventorySnapshot, q, owner, cluster, power, pref
     vms = snapshot.vms
     if q:
         needle = q.lower()
-        vms = [vm for vm in vms if needle in vm.name.lower() or needle in vm.owner_key.lower()]
+        vms = [
+            vm
+            for vm in vms
+            if vm_matches_search(vm.name, vm.owner_key, vm.deployed_by, vm.custom_fields, needle)
+        ]
     if prefix:
         vms = [vm for vm in vms if vm.name.lower().startswith(prefix.lower())]
     if owner:
-        vms = [vm for vm in vms if vm.owner_key.lower() == owner.lower()]
+        vms = [
+            vm
+            for vm in vms
+            if vm_matches_owner_query(vm.owner_key, vm.deployed_by, vm.custom_fields, owner)
+        ]
     if cluster:
         vms = [vm for vm in vms if cluster.lower() in (vm.cluster_id.lower(), vm.cluster_name.lower())]
     if power:
@@ -139,7 +163,22 @@ def _filter_snapshot(snapshot: InventorySnapshot, q, owner, cluster, power, pref
 def _enqueue(request: Request, kind: str, title: str, payload: dict, idempotency_key: str = "") -> Job:
     store: LocalStore = request.app.state.store
     worker: RelayWorker = request.app.state.worker
-    job = store.enqueue(kind, title, payload, idempotency_key=idempotency_key)
+    bound = dict(payload)
+    adapter: InventoryAdapter = request.app.state.adapter
+    connection = adapter.connection()
+    fingerprint = connection.endpoint_fingerprint
+    endpoint_kind = connection.endpoint_kind
+    if not fingerprint:
+        cached = store.load_inventory()
+        if cached is not None:
+            fingerprint = cached.connection.endpoint_fingerprint
+            endpoint_kind = cached.connection.endpoint_kind
+    if connection.mode != "demo" and not fingerprint:
+        raise HTTPException(status_code=503, detail="Cannot bind the job to the current endpoint")
+    bound["_endpoint_fingerprint"] = fingerprint
+    bound["_endpoint_kind"] = endpoint_kind
+    scoped_key = f"{fingerprint}:{idempotency_key}" if fingerprint and idempotency_key else idempotency_key
+    job = store.enqueue(kind, title, bound, idempotency_key=scoped_key)
     worker.wake()
     return job
 
@@ -150,7 +189,7 @@ async def lifespan(app: FastAPI):
     adapter = build_adapter(settings)
     app.state.store = store
     app.state.adapter = adapter
-    app.state.session_source = settings.resolved_mode if settings.resolved_mode == "vcenter" else "demo"
+    app.state.session_source = "env" if settings.resolved_mode in {"vcenter", "esxi"} else "demo"
     app.state.swap_lock = threading.Lock()
     worker = RelayWorker(settings, store, lambda: app.state.adapter)
     app.state.worker = worker
@@ -163,7 +202,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -192,7 +231,7 @@ def health(request: Request) -> dict:
     elif isinstance(adapter, DemoAdapter):
         mode = "demo"
     else:
-        mode = "vcenter"
+        mode = adapter.connection().mode
     counts = request.app.state.store.counts() if hasattr(request.app.state, "store") else {}
     return {"ok": True, "mode": mode, "env_ready": settings.has_vcenter_creds, **counts}
 
@@ -220,12 +259,12 @@ def connection(request: Request, adapter: InventoryAdapter = Depends(get_adapter
     if isinstance(adapter, DemoAdapter):
         info = adapter.connection()
     else:
-        info = ConnectionInfo(
-            mode="vcenter",
-            connected=worker.reachable is not False and not worker.last_error,
-            host=settings.vcenter_host,
-            user=settings.vcenter_user,
-            message=worker.last_error or "Local relay",
+        live = adapter.connection()
+        info = live.model_copy(
+            update={
+                "connected": worker.reachable is not False and not worker.last_error,
+                "message": worker.last_error or live.message or "Local relay",
+            }
         )
     return decorate_connection(info, request)
 
@@ -244,24 +283,92 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     if not password:
         raise HTTPException(status_code=400, detail="Host, username, and password are required")
 
-    live = apply_runtime(settings, endpoint, user, password, port, body.insecure)
+    live = apply_runtime(
+        settings,
+        endpoint,
+        user,
+        password,
+        port,
+        body.insecure,
+        ssh_enabled=body.ssh_enabled,
+        ssh_user=body.ssh_user,
+        ssh_password=body.ssh_password,
+        ssh_port=body.ssh_port,
+        ssh_host_key_sha256=body.ssh_host_key_sha256,
+    )
     candidate = VCenterAdapter(live)
     info = candidate.connection()
     if not info.connected:
         _close(candidate)
-        detail = info.message or "Could not sign in to vCenter"
+        detail = info.message or "Could not sign in to the vSphere endpoint"
         lowered = detail.lower()
         status = 401 if ("password" in lowered or "cannot complete login" in lowered or "incorrect user" in lowered) else 503
         raise HTTPException(status_code=status, detail=detail)
+
+    if not body.connect:
+        _close(candidate)
+        info.message = f"Connection test passed. Detected {info.endpoint_kind.upper()}."
+        counts = request.app.state.store.counts()
+        return info.model_copy(
+            update={
+                "source": "test",
+                "env_ready": settings.has_vcenter_creds,
+                "has_saved_password": bool(settings.vcenter_password),
+                "saved_host": settings.vcenter_host,
+                "saved_user": settings.vcenter_user,
+                "saved_port": settings.vcenter_port,
+                "insecure": settings.vcenter_insecure,
+                "queued_jobs": counts["queued"],
+                "active_jobs": counts["active"],
+            }
+        )
+
+    current = request.app.state.adapter.connection()
+    if current.endpoint_fingerprint and current.endpoint_fingerprint != info.endpoint_fingerprint:
+        open_jobs = request.app.state.store.open_jobs()
+        if open_jobs:
+            _close(candidate)
+            raise HTTPException(
+                status_code=409,
+                detail=f"Wait for or cancel {len(open_jobs)} queued/running job(s) before switching endpoints",
+            )
 
     with request.app.state.swap_lock:
         previous = request.app.state.adapter
         request.app.state.adapter = candidate
         request.app.state.session_source = "ui"
         _close(previous)
+        request.app.state.store.clear_runtime_cache()
 
-    persist_vcenter(settings, endpoint, user, password, port, body.insecure)
-    info.message = f"{info.message}. Saved on this machine for the next start."
+    settings.app_mode = info.endpoint_kind
+    settings.vcenter_host = endpoint
+    settings.vcenter_user = user
+    settings.vcenter_password = password
+    settings.vcenter_port = port
+    settings.vcenter_insecure = body.insecure
+    settings.esxi_ssh_enabled = body.ssh_enabled
+    settings.esxi_ssh_user = body.ssh_user
+    settings.esxi_ssh_password = body.ssh_password
+    settings.esxi_ssh_port = body.ssh_port
+    settings.esxi_ssh_host_key_sha256 = body.ssh_host_key_sha256
+    if body.remember:
+        persist_vcenter(
+            settings,
+            endpoint,
+            user,
+            password,
+            port,
+            body.insecure,
+            endpoint_kind=info.endpoint_kind,
+            ssh_enabled=body.ssh_enabled,
+            ssh_user=body.ssh_user,
+            ssh_password=body.ssh_password,
+            ssh_port=body.ssh_port,
+            ssh_host_key_sha256=body.ssh_host_key_sha256,
+        )
+        info.message = f"{info.message}. Saved on this machine for the next start."
+    else:
+        info.message = f"{info.message}. Connected for this server session only."
     request.app.state.worker.wake()
     return decorate_connection(info, request)
 
@@ -274,6 +381,7 @@ def logout(request: Request, body: Optional[LogoutRequest] = None) -> Connection
         request.app.state.adapter = DemoAdapter(settings)
         request.app.state.session_source = "demo"
         _close(previous)
+        request.app.state.store.clear_runtime_cache()
     if payload.forget:
         forget_vcenter(settings)
     request.app.state.worker.wake()
@@ -374,6 +482,17 @@ def catalog(request: Request, adapter: InventoryAdapter = Depends(get_adapter)) 
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.get("/api/folders", response_model=List[VmFolder], dependencies=[Depends(require_token)])
+def list_folders(
+    adapter: InventoryAdapter = Depends(get_adapter),
+    datacenter: str = Query(default=""),
+) -> List[VmFolder]:
+    try:
+        return adapter.list_vm_folders(datacenter=datacenter.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.get("/api/datastores/{datastore_id}/files", response_model=DatastoreListing, dependencies=[Depends(require_token)])
 def datastore_files(
     datastore_id: str,
@@ -427,6 +546,21 @@ def actions(body: ActionRequest, request: Request) -> ActionResponse:
 
 @app.post("/api/vms", response_model=Job, dependencies=[Depends(require_token)])
 def clone_vm(body: CloneVmRequest, request: Request) -> Job:
+    return _enqueue_template_deploy(request, body, kind="clone", title_prefix="Clone")
+
+
+@app.post("/api/vms/deploy", response_model=Job, dependencies=[Depends(require_token)])
+def deploy_vm(body: DeployVmRequest, request: Request) -> Job:
+    return _enqueue_template_deploy(request, body, kind="deploy", title_prefix="Deploy")
+
+
+def _enqueue_template_deploy(
+    request: Request,
+    body: CloneVmRequest,
+    *,
+    kind: str,
+    title_prefix: str,
+) -> Job:
     name = body.name.strip()
     if not name or "/" in name:
         raise HTTPException(status_code=400, detail="VM name is required and cannot contain '/'")
@@ -436,13 +570,253 @@ def clone_vm(body: CloneVmRequest, request: Request) -> Job:
         raise HTTPException(status_code=400, detail="cpu_count must be between 1 and 128")
     if body.memory_mib is not None and not 128 <= body.memory_mib <= 1_048_576:
         raise HTTPException(status_code=400, detail="memory_mib is out of range")
+    if body.disable_drs and not (body.host_id or "").strip():
+        raise HTTPException(status_code=400, detail="disable_drs requires a destination host")
     return _enqueue(
         request,
-        "clone",
-        f"Clone {name}",
+        kind,
+        f"{title_prefix} {name}",
         body.model_dump(),
-        idempotency_key=f"clone:{name}",
+        idempotency_key=f"{kind}:{name}",
     )
+
+
+@app.post("/api/vms/{vm_id}/console", response_model=ConsoleTicket, dependencies=[Depends(require_token)])
+def vm_console(
+    vm_id: str,
+    request: Request,
+    adapter: InventoryAdapter = Depends(get_adapter),
+    body: Optional[ConsoleTicketRequest] = None,
+) -> ConsoleTicket:
+    ticket_type = (body.type if body else "vmrc").strip().lower()
+    if ticket_type not in {"vmrc", "webmks"}:
+        raise HTTPException(status_code=400, detail="type must be vmrc or webmks")
+    try:
+        return adapter.console_ticket(vm_id.strip(), ticket_type)
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/vms/{vm_id}/rename", response_model=Job, dependencies=[Depends(require_token)])
+def rename_vm(vm_id: str, body: RenameVmRequest, request: Request) -> Job:
+    target_id = vm_id.strip()
+    name = body.name.strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="vm_id is required")
+    if not name or "/" in name:
+        raise HTTPException(status_code=400, detail="VM name is required and cannot contain '/'")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to rename")
+    snapshot = request.app.state.worker.cached_snapshot()
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="Inventory is not ready yet")
+    source = next((vm for vm in snapshot.vms if vm.id == target_id), None)
+    if source is None:
+        raise HTTPException(status_code=400, detail="Unknown VM")
+    if name == source.name:
+        raise HTTPException(status_code=400, detail="New name is the same as the current name")
+    if any(vm.name == name and vm.id != target_id for vm in snapshot.vms):
+        raise HTTPException(status_code=400, detail=f"VM name already exists: {name}")
+    return _enqueue(
+        request,
+        "rename",
+        f"Rename {source.name} → {name}",
+        {"vm_id": target_id, "name": name, "confirm": True},
+        idempotency_key=f"rename:{target_id}:{name}",
+    )
+
+
+@app.post("/api/vms/drs-override", response_model=Job, dependencies=[Depends(require_token)])
+def apply_drs_override(body: DrsOverrideRequest, request: Request) -> Job:
+    vm_ids = [item.strip() for item in body.vm_ids if item and item.strip()]
+    if not vm_ids:
+        raise HTTPException(status_code=400, detail="No virtual machines selected")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to apply a DRS override")
+    if len(vm_ids) > 50:
+        raise HTTPException(
+            status_code=400,
+            detail="Refusing more than 50 VMs in one request (local relay batch limit; split into a second job)",
+        )
+    snapshot = request.app.state.worker.cached_snapshot()
+    names: List[str] = []
+    if snapshot is not None:
+        by_id = {vm.id: vm.name for vm in snapshot.vms}
+        names = [by_id.get(vm_id, vm_id) for vm_id in vm_ids]
+    title = f"DRS override {names[0]}" if len(names) == 1 else f"DRS override {len(vm_ids)} VM(s)"
+    return _enqueue(
+        request,
+        "drs_override",
+        title,
+        body.model_dump(),
+        idempotency_key="drs_override:" + ",".join(sorted(vm_ids)),
+    )
+
+
+@app.post("/api/vms/clone-migrate", response_model=Job, dependencies=[Depends(require_token)])
+def clone_migrate_vm(body: CloneMigrateRequest, request: Request) -> Job:
+    vm_id = (body.vm_id or "").strip()
+    host_id = (body.host_id or "").strip()
+    if not vm_id:
+        raise HTTPException(status_code=400, detail="vm_id is required")
+    if not host_id:
+        raise HTTPException(status_code=400, detail="Destination host is required")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to clone-migrate")
+    snapshot = request.app.state.worker.cached_snapshot()
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="Inventory is not ready yet")
+    source = next((vm for vm in snapshot.vms if vm.id == vm_id), None)
+    if source is None:
+        raise HTTPException(status_code=400, detail="Unknown VM")
+    host = next((item for item in snapshot.hosts if item.id == host_id), None)
+    if host is None:
+        raise HTTPException(status_code=400, detail="Unknown host")
+    if source.cluster_id and host.cluster_id and source.cluster_id != host.cluster_id:
+        raise HTTPException(status_code=400, detail=f"{source.name} is not in the same cluster as {host.name}")
+
+    destroy = bool(body.destroy_source)
+    original_name = source.name
+    if destroy:
+        short = vm_id.replace("vm-", "")[-6:] or "tmp"
+        clone_name = f"{original_name}-migrate-{short}"
+        if any(vm.name == clone_name for vm in snapshot.vms):
+            clone_name = f"{original_name}-migrate-{short}-2"
+        title = f"Replace {original_name} → {host.name}"
+    else:
+        clone_name = (body.name or "").strip() or f"{original_name}-clone"
+        if not clone_name or "/" in clone_name:
+            raise HTTPException(status_code=400, detail="Clone name is required and cannot contain '/'")
+        if any(vm.name == clone_name for vm in snapshot.vms):
+            raise HTTPException(status_code=400, detail=f"VM name already exists: {clone_name}")
+        title = f"Clone {original_name} → {host.name}"
+
+    payload = body.model_copy(
+        update={
+            "vm_id": vm_id,
+            "host_id": host_id,
+            "name": clone_name,
+            "datastore_id": (body.datastore_id or "").strip(),
+            "destroy_source": destroy,
+        }
+    ).model_dump()
+    payload["original_name"] = original_name
+    return _enqueue(
+        request,
+        "clone_migrate",
+        title,
+        payload,
+        idempotency_key=f"clone_migrate:{vm_id}:{host_id}:{clone_name}:{int(destroy)}",
+    )
+
+
+@app.post("/api/vms/disk-conversion/plan", response_model=DiskConversionPlan, dependencies=[Depends(require_token)])
+def plan_disk_conversion(
+    body: DiskConversionPlanRequest,
+    adapter: InventoryAdapter = Depends(get_adapter),
+) -> DiskConversionPlan:
+    try:
+        return adapter.disk_conversion_plan(body)
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/vms/disk-conversion", response_model=Job, dependencies=[Depends(require_token)])
+def convert_vm_disks(body: DiskConversionRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Review the plan and set confirm=true to convert disks")
+    adapter: InventoryAdapter = request.app.state.adapter
+    try:
+        plan = adapter.disk_conversion_plan(
+            DiskConversionPlanRequest(vm_id=body.vm_id, target=body.target, method=body.method)
+        )
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if plan.plan_token != body.plan_token:
+        raise HTTPException(status_code=409, detail="The VM changed after the plan was created; review a fresh plan")
+    if plan.noop:
+        raise HTTPException(status_code=400, detail="All supported disks already use that provisioning type")
+    if not plan.can_execute:
+        raise HTTPException(status_code=400, detail="; ".join(plan.blockers) or "Conversion cannot be executed")
+    return _enqueue(
+        request,
+        "disk_convert",
+        f"Convert {plan.vm_name} disks to {plan.target.replace('_', ' ')}",
+        {"plan": plan.model_dump(mode="json")},
+        idempotency_key=f"disk_convert:{plan.plan_token}",
+    )
+
+
+@app.get("/api/host", response_model=HostManagementInfo, dependencies=[Depends(require_token)])
+def host_management(adapter: InventoryAdapter = Depends(get_adapter)) -> HostManagementInfo:
+    try:
+        return adapter.host_management()
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/host/actions", response_model=Job, dependencies=[Depends(require_token)])
+def host_action(body: HostActionRequest, request: Request) -> Job:
+    action = body.action.strip().lower()
+    if action not in {"maintenance_enter", "maintenance_exit", "reboot", "shutdown"}:
+        raise HTTPException(status_code=400, detail="Unknown host action")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Review host state and set confirm=true")
+    return _enqueue(
+        request,
+        "host_action",
+        f"Host {action.replace('_', ' ')}",
+        body.model_dump(),
+        idempotency_key=f"host_action:{action}",
+    )
+
+
+@app.post("/api/host/services", response_model=Job, dependencies=[Depends(require_token)])
+def host_service(body: HostServiceActionRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to change a host service")
+    return _enqueue(
+        request,
+        "host_service",
+        f"{body.action.title()} host service {body.service_key}",
+        body.model_dump(),
+        idempotency_key=f"host_service:{body.service_key}:{body.action}:{body.policy}",
+    )
+
+
+@app.post("/api/host/time", response_model=Job, dependencies=[Depends(require_token)])
+def host_time(body: HostTimeRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to update host time settings")
+    return _enqueue(
+        request,
+        "host_time",
+        "Update host NTP settings",
+        body.model_dump(),
+        idempotency_key="host_time:" + ",".join(sorted(body.ntp_servers)),
+    )
+
+
+@app.post("/api/host/storage/rescan", response_model=Job, dependencies=[Depends(require_token)])
+def host_storage_rescan(body: HostActionRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to rescan host storage")
+    return _enqueue(request, "host_storage_rescan", "Rescan host storage", {}, idempotency_key="host_storage_rescan")
+
+
+@app.post("/api/host/support-bundle", response_model=Job, dependencies=[Depends(require_token)])
+def host_support_bundle(body: HostActionRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to generate a support bundle")
+    return _enqueue(request, "host_support_bundle", "Generate ESXi support bundle", {}, idempotency_key="host_support_bundle")
 
 
 @app.post("/api/vms/migrate", response_model=Job, dependencies=[Depends(require_token)])
@@ -464,10 +838,11 @@ def migrate_vms(body: MigrateVmRequest, request: Request) -> Job:
     host_id = (body.host_id or "").strip()
     datastore_id = (body.datastore_id or "").strip()
     network_id = (body.network_id or "").strip()
-    if not host_id and not datastore_id and not network_id and not disk:
+    folder_id = (body.folder_id or "").strip()
+    if not host_id and not datastore_id and not network_id and not disk and not folder_id:
         raise HTTPException(
             status_code=400,
-            detail="Pick a destination host, datastore, network, or disk type",
+            detail="Pick a destination host, datastore, network, disk type, or folder",
         )
     snapshot = request.app.state.worker.cached_snapshot()
     host_name = host_id
@@ -486,6 +861,8 @@ def migrate_vms(body: MigrateVmRequest, request: Request) -> Job:
     parts = [f"{len(vm_ids)} VM(s)"]
     if host_id:
         parts.append(f"→ {host_name}")
+    if folder_id:
+        parts.append("folder")
     if disk:
         parts.append(f"{disk} disks")
     payload = body.model_dump()
@@ -496,6 +873,7 @@ def migrate_vms(body: MigrateVmRequest, request: Request) -> Job:
             "datastore_id": datastore_id,
             "network_id": network_id,
             "disk_provisioning": disk,
+            "folder_id": folder_id,
         }
     )
     return _enqueue(
@@ -503,7 +881,9 @@ def migrate_vms(body: MigrateVmRequest, request: Request) -> Job:
         "migrate",
         "Migrate " + " ".join(parts),
         payload,
-        idempotency_key="migrate:" + ",".join(sorted(vm_ids)) + f":{host_id}:{datastore_id}:{network_id}:{disk}",
+        idempotency_key="migrate:"
+        + ",".join(sorted(vm_ids))
+        + f":{host_id}:{datastore_id}:{network_id}:{disk}:{folder_id}",
     )
 
 

@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     vcenter_port: int = 443
     vcenter_insecure: bool = True
 
+    # Optional, tightly scoped SSH fallback for standalone ESXi disk conversion.
+    esxi_ssh_enabled: bool = False
+    esxi_ssh_user: str = ""
+    esxi_ssh_password: str = ""
+    esxi_ssh_port: int = Field(default=22, ge=1, le=65535)
+    esxi_ssh_key_path: Path = Path("")
+    esxi_ssh_host_key_sha256: str = ""
+    esxi_ssh_timeout_seconds: int = Field(default=30, ge=5, le=300)
+    esxi_ssh_use_login_password: bool = False
+
     name_group_pattern: str = r"^([A-Za-z][A-Za-z0-9]+)"
     owner_field_names: str = "Owner,owner,User,user,CreatedBy,createdBy"
 
@@ -45,7 +55,7 @@ class Settings(BaseSettings):
     @field_validator("app_mode")
     @classmethod
     def _mode(cls, value: str) -> str:
-        allowed = {"auto", "demo", "vcenter"}
+        allowed = {"auto", "demo", "vcenter", "esxi"}
         lowered = value.lower().strip()
         if lowered not in allowed:
             raise ValueError(f"APP_MODE must be one of {sorted(allowed)}")

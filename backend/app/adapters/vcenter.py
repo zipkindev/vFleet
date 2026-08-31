@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import socket
 import ssl
 import threading
@@ -11,27 +13,36 @@ from urllib.parse import quote
 
 from ..config import Settings
 from ..errors import PermanentError, TransientError, humanize_vcenter_error, is_not_authenticated, is_transient
-from ..grouping import resolve_owner
+from ..grouping import resolve_deployed_by, resolve_owner
 from ..models import (
     ActionResult,
     Catalog,
+    CloneMigrateRequest,
     CloneVmRequest,
     ClusterSummary,
     ConnectionInfo,
+    ConsoleTicket,
     DatastoreFile,
     DatastoreListing,
     DatastoreSummary,
+    DiskConversionPlan,
+    DiskConversionPlanRequest,
+    HostHealthSensor,
+    HostManagementInfo,
+    HostServiceSummary,
+    HostStorageAdapterSummary,
     HostSummary,
     InventorySnapshot,
     MigrateVmRequest,
     NetworkSummary,
     VirtualMachine,
+    VmFolder,
     VmTemplate,
 )
 from ..reclaim import annotate_idle, build_owner_reports
 from ..power import normalize_power_state
 from ..transfer import VCenterRest, library_upload, put_file
-from ..vm_storage import summarize_disks, normalize_disk_transform
+from ..vm_storage import disk_summaries, normalize_disk_transform, summarize_disks
 from .base import InventoryAdapter
 
 ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "destroy"}
@@ -129,22 +140,70 @@ class VCenterAdapter(InventoryAdapter):
         self._rest = VCenterRest(settings)
         self._ds_meta: Dict[str, Dict[str, str]] = {}
 
+    def _endpoint_metadata(self) -> Dict[str, Any]:
+        about = self._session().content.about
+        api_type = str(getattr(about, "apiType", "") or "")
+        endpoint_kind = "esxi" if api_type.lower() == "hostagent" else "vcenter"
+        instance_uuid = str(getattr(about, "instanceUuid", "") or "")
+        raw = f"{self.settings.vcenter_host.lower()}:{self.settings.vcenter_port}:{api_type}:{instance_uuid}"
+        fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        capabilities = {
+            "inventory": True,
+            "power": True,
+            "console": True,
+            "datastores": True,
+            "host_admin": endpoint_kind == "esxi",
+            "host_services": endpoint_kind == "esxi",
+            "host_time": endpoint_kind == "esxi",
+            "storage_rescan": endpoint_kind == "esxi",
+            "support_bundle": endpoint_kind == "esxi",
+            "disk_convert": True,
+            "disk_convert_ssh": endpoint_kind == "esxi" and self.settings.esxi_ssh_enabled,
+            "clone": endpoint_kind == "vcenter",
+            "migrate": endpoint_kind == "vcenter",
+            "drs": endpoint_kind == "vcenter",
+            "permissions": endpoint_kind == "vcenter",
+            "templates": endpoint_kind == "vcenter",
+            "content_library": endpoint_kind == "vcenter",
+            "historical_metrics": endpoint_kind == "vcenter",
+        }
+        return {
+            "endpoint_kind": endpoint_kind,
+            "api_type": api_type,
+            "api_version": str(getattr(about, "apiVersion", "") or ""),
+            "product_name": str(getattr(about, "fullName", "") or getattr(about, "name", "") or ""),
+            "product_version": str(getattr(about, "version", "") or ""),
+            "product_build": str(getattr(about, "build", "") or ""),
+            "instance_uuid": instance_uuid,
+            "endpoint_fingerprint": fingerprint,
+            "capabilities": capabilities,
+        }
+
+    def endpoint_fingerprint(self) -> str:
+        return str(self._endpoint_metadata()["endpoint_fingerprint"])
+
+    def _is_esxi(self) -> bool:
+        return self._endpoint_metadata()["endpoint_kind"] == "esxi"
+
     def connection(self) -> ConnectionInfo:
         try:
             si = self._session()
             about = si.content.about
+            metadata = self._endpoint_metadata()
             return ConnectionInfo(
-                mode="vcenter",
+                mode=metadata["endpoint_kind"],
                 connected=True,
                 host=self.settings.vcenter_host,
                 user=self.settings.vcenter_user,
                 message=f"{about.fullName} ({about.apiVersion})",
                 last_sync=datetime.now(timezone.utc),
+                ssh_configured=bool(self.settings.esxi_ssh_enabled),
+                **metadata,
             )
         except Exception as exc:
             self._error = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
             return ConnectionInfo(
-                mode="vcenter",
+                mode="esxi" if self.settings.app_mode == "esxi" else "vcenter",
                 connected=False,
                 host=self.settings.vcenter_host,
                 user=self.settings.vcenter_user,
@@ -193,8 +252,9 @@ class VCenterAdapter(InventoryAdapter):
             return []
 
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=HISTORY_DAYS)
-        interval = 1800
+        direct_esxi = self._is_esxi()
+        start = end - timedelta(days=1 if direct_esxi else HISTORY_DAYS)
+        interval = 300 if direct_esxi else 1800
         naive_start = start.replace(tzinfo=None)
         naive_end = end.replace(tzinfo=None)
 
@@ -452,6 +512,118 @@ class VCenterAdapter(InventoryAdapter):
             self._cache = None
         return results
 
+    def console_ticket(self, vm_id: str, ticket_type: str = "vmrc") -> ConsoleTicket:
+        kind = (ticket_type or "vmrc").strip().lower()
+        if kind not in {"vmrc", "webmks"}:
+            raise PermanentError("Console type must be vmrc or webmks")
+
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("VM not found")
+        name = vm.name
+        vcenter_url = self._vcenter_console_url(vm_id)
+
+        rest_type = "WEBMKS" if kind == "webmks" else "VMRC"
+        try:
+            payload = self._rest.console_ticket(vm_id, rest_type)
+            ticket = self._normalize_console_ticket(payload, kind)
+            if ticket.get("uri") or ticket.get("ticket"):
+                return ConsoleTicket(
+                    vm_id=vm_id,
+                    name=name,
+                    type=kind,
+                    uri=str(ticket.get("uri") or ""),
+                    host=str(ticket.get("host") or ""),
+                    port=int(ticket.get("port") or 0),
+                    ticket=str(ticket.get("ticket") or ""),
+                    ssl_thumbprint=str(ticket.get("ssl_thumbprint") or ""),
+                    vcenter_url=vcenter_url,
+                    message="Opened via vCenter REST ticket",
+                )
+        except PermanentError:
+            raise
+        except Exception:
+            pass
+
+        return self._console_ticket_pyvmomi(vm, vm_id, name, kind, vcenter_url)
+
+    def _vcenter_console_url(self, vm_id: str) -> str:
+        host = self.settings.vcenter_host
+        port = self.settings.vcenter_port
+        authority = host if port in {0, 443} else f"{host}:{port}"
+        return f"https://{authority}/ui/app/vm;nav=s/urn:vmomi:VirtualMachine:{vm_id}/console"
+
+    def _normalize_console_ticket(self, payload: Any, kind: str) -> Dict[str, Any]:
+        if isinstance(payload, str):
+            return {"uri": payload, "ticket": payload}
+        if not isinstance(payload, dict):
+            return {}
+        ticket = str(payload.get("ticket") or "")
+        uri = str(payload.get("uri") or "")
+        if not uri and ticket.startswith(("vmrc://", "http://", "https://", "wss://")):
+            uri = ticket
+        host = str(payload.get("host") or "")
+        port = int(payload.get("port") or 0)
+        thumb = str(payload.get("ssl_thumbprint") or payload.get("sslThumbprint") or "")
+        if kind == "webmks" and host and ticket and not uri.startswith("wss://"):
+            uri = f"wss://{host}:{port or 443}/ticket/{ticket}"
+        elif kind == "vmrc" and not uri and ticket:
+            uri = ticket
+        return {
+            "uri": uri,
+            "ticket": ticket or uri,
+            "host": host,
+            "port": port,
+            "ssl_thumbprint": thumb,
+        }
+
+    def _console_ticket_pyvmomi(
+        self,
+        vm: Any,
+        vm_id: str,
+        name: str,
+        kind: str,
+        vcenter_url: str,
+    ) -> ConsoleTicket:
+        from pyVmomi import vim
+
+        try:
+            raw = vm.AcquireTicket(ticketType=kind)
+        except vim.fault.InvalidPowerState:
+            raise PermanentError(
+                "Web console requires the VM to be powered on. Use VMRC or power on first."
+            ) from None
+        except vim.fault.NoPermission as exc:
+            raise PermanentError(
+                f"Missing VirtualMachine.Interact.ConsoleInteract privilege: {getattr(exc, 'msg', exc)}"
+            ) from exc
+        except Exception as exc:
+            raise PermanentError(humanize_vcenter_error(exc, host=self.settings.vcenter_host)) from exc
+
+        ticket = self._normalize_console_ticket(
+            {
+                "ticket": getattr(raw, "ticket", ""),
+                "host": getattr(raw, "host", ""),
+                "port": getattr(raw, "port", 0),
+                "sslThumbprint": getattr(raw, "sslThumbprint", ""),
+            },
+            kind,
+        )
+        if not ticket.get("uri") and not ticket.get("ticket"):
+            raise PermanentError("vCenter did not return a console ticket")
+        return ConsoleTicket(
+            vm_id=vm_id,
+            name=name,
+            type=kind,
+            uri=str(ticket.get("uri") or ""),
+            host=str(ticket.get("host") or ""),
+            port=int(ticket.get("port") or 0),
+            ticket=str(ticket.get("ticket") or ""),
+            ssl_thumbprint=str(ticket.get("ssl_thumbprint") or ""),
+            vcenter_url=vcenter_url,
+            message="Opened via pyVmomi AcquireTicket",
+        )
+
     def close(self) -> None:
         self._rest.close()
         self._drop_session()
@@ -507,8 +679,12 @@ class VCenterAdapter(InventoryAdapter):
 
         si = self._session()
         content = si.content
-        field_names = {field.key: field.name for field in (content.customFieldsManager.field or [])}
-        activity = self._last_activity(content)
+        custom_fields_manager = getattr(content, "customFieldsManager", None)
+        field_names = {
+            field.key: field.name
+            for field in (getattr(custom_fields_manager, "field", None) or [])
+        }
+        activity, deployers = self._event_index(content)
 
         host_rows = self._collect(
             content,
@@ -524,6 +700,10 @@ class VCenterAdapter(InventoryAdapter):
                 "summary.hardware.memorySize",
                 "summary.quickStats.overallCpuUsage",
                 "summary.quickStats.overallMemoryUsage",
+                "runtime.inMaintenanceMode",
+                "summary.quickStats.uptime",
+                "summary.hardware.vendor",
+                "summary.hardware.model",
             ],
         )
         vm_rows = self._collect(
@@ -552,6 +732,21 @@ class VCenterAdapter(InventoryAdapter):
                 "summary.config.template",
             ],
         )
+        cluster_rows = self._collect(
+            content,
+            vmodl,
+            vim.ClusterComputeResource,
+            ["configuration.drsVmConfig"],
+        )
+        drs_overridden: Dict[str, bool] = {}
+        for row in cluster_rows:
+            for cfg in row.get("configuration.drsVmConfig") or []:
+                vm_ref = getattr(cfg, "key", None)
+                if vm_ref is None:
+                    continue
+                enabled = getattr(cfg, "enabled", None)
+                if enabled is False:
+                    drs_overridden[_moid(vm_ref)] = True
 
         hosts: List[HostSummary] = []
         host_by_id: Dict[str, HostSummary] = {}
@@ -583,6 +778,10 @@ class VCenterAdapter(InventoryAdapter):
                 memory_mib=mem_mib,
                 memory_usage_mib=mem_usage,
                 memory_usage_pct=_pct(mem_usage, mem_mib),
+                maintenance_mode=bool(row.get("runtime.inMaintenanceMode") or False),
+                uptime_seconds=int(row.get("summary.quickStats.uptime") or 0),
+                vendor=str(row.get("summary.hardware.vendor") or ""),
+                model=str(row.get("summary.hardware.model") or ""),
             )
             hosts.append(host)
             host_by_id[host.id] = host
@@ -600,6 +799,7 @@ class VCenterAdapter(InventoryAdapter):
                 custom[label] = str(item.value)
             name = str(row.get("name") or row["id"])
             owner, source = resolve_owner(name, custom, self.settings.owner_fields, self.settings.name_group_pattern)
+            deployed_by = resolve_deployed_by(custom, self.settings.owner_fields, deployers.get(row["id"], ""))
             cpus = int(row.get("config.hardware.numCPU") or 0)
             memory_mib = int(row.get("config.hardware.memoryMB") or 0)
             cpu_usage = int(row.get("summary.quickStats.overallCpuUsage") or 0)
@@ -639,11 +839,14 @@ class VCenterAdapter(InventoryAdapter):
                 last_activity_source=last_src,
                 owner_key=owner,
                 owner_source=source,
+                deployed_by=deployed_by,
                 custom_fields=custom,
                 annotation=str(row.get("config.annotation") or ""),
                 storage_used_bytes=storage_used,
                 storage_provisioned_bytes=storage_provisioned,
                 disk_provisioning=disk_provisioning,
+                drs_override=drs_overridden.get(row["id"], False),
+                disks=disk_summaries(row.get("config.hardware.device") or []),
             )
             vms.append(annotate_idle(vm, self.settings))
 
@@ -685,8 +888,16 @@ class VCenterAdapter(InventoryAdapter):
             owners=build_owner_reports(vms),
         )
 
-    def _collect(self, content: Any, vmodl: Any, vimtype: Any, properties: List[str]) -> List[Dict[str, Any]]:
-        view = content.viewManager.CreateContainerView(content.rootFolder, [vimtype], True)
+    def _collect(
+        self,
+        content: Any,
+        vmodl: Any,
+        vimtype: Any,
+        properties: List[str],
+        root: Any = None,
+    ) -> List[Dict[str, Any]]:
+        container = root if root is not None else content.rootFolder
+        view = content.viewManager.CreateContainerView(container, [vimtype], True)
         try:
             traversal = vmodl.query.PropertyCollector.TraversalSpec(
                 name="traverseEntities",
@@ -702,8 +913,16 @@ class VCenterAdapter(InventoryAdapter):
         finally:
             view.Destroy()
 
-    def _last_activity(self, content: Any) -> Dict[str, Tuple[datetime, str]]:
+    def _event_index(self, content: Any) -> Tuple[Dict[str, Tuple[datetime, str]], Dict[str, str]]:
+        """Scan recent events for last activity and create/clone principals."""
         latest: Dict[str, Tuple[datetime, str]] = {}
+        deployers: Dict[str, Tuple[datetime, str]] = {}
+        create_types = {
+            "VmCreatedEvent",
+            "VmClonedEvent",
+            "VmDeployedEvent",
+            "VmRegisteredEvent",
+        }
         try:
             from pyVmomi import vim
 
@@ -721,6 +940,9 @@ class VCenterAdapter(InventoryAdapter):
                     "VmMigratedEvent",
                     "VmBeingClonedEvent",
                     "VmCreatedEvent",
+                    "VmClonedEvent",
+                    "VmDeployedEvent",
+                    "VmRegisteredEvent",
                 ],
                 time=vim.event.EventFilterSpec.ByTime(beginTime=begin.replace(tzinfo=None)),
             )
@@ -739,24 +961,36 @@ class VCenterAdapter(InventoryAdapter):
                         if created is None:
                             continue
                         source = type(event).__name__
+                        key = _moid(ref)
                         if source == "VmAcquiredMksTicketEvent":
                             label = "console_event"
                         elif "Power" in source or "Guest" in source or "Reset" in source or "Suspend" in source:
                             label = "power_event"
                         else:
                             label = "vcenter_event"
-                        key = _moid(ref)
                         prev = latest.get(key)
                         if prev is None or created > prev[0]:
                             latest[key] = (created, label)
+
+                        if source in create_types:
+                            user = str(getattr(event, "userName", "") or "").strip()
+                            if user:
+                                prior = deployers.get(key)
+                                # Prefer the earliest create/clone event as the deployer.
+                                if prior is None or created < prior[0]:
+                                    deployers[key] = (created, user)
                     seen += len(page)
                     previous = collector.ReadPreviousEvents(200)
                     page = list(previous or [])
             finally:
                 collector.DestroyCollector()
         except Exception:
-            return latest
-        return latest
+            return latest, {key: user for key, (_ts, user) in deployers.items()}
+        return latest, {key: user for key, (_ts, user) in deployers.items()}
+
+    def _last_activity(self, content: Any) -> Dict[str, Tuple[datetime, str]]:
+        activity, _deployers = self._event_index(content)
+        return activity
 
     def _find_vm(self, content: Any, vm_id: str):
         from pyVmomi import vim
@@ -862,6 +1096,8 @@ class VCenterAdapter(InventoryAdapter):
         return result
 
     def list_templates(self) -> List[VmTemplate]:
+        if self._is_esxi():
+            return []
         from pyVmomi import vim, vmodl
 
         rows = self._collect(
@@ -907,6 +1143,89 @@ class VCenterAdapter(InventoryAdapter):
             )
         templates.sort(key=lambda item: item.name.lower())
         return templates
+
+    def list_vm_folders(self, datacenter: str = "") -> List[VmFolder]:
+        """List VM inventory folders via PropertyCollector (avoids per-folder childEntity walks)."""
+        from pyVmomi import vim, vmodl
+
+        wanted = (datacenter or "").strip().lower()
+        result: List[VmFolder] = []
+        content = self._session().content
+        for dc in content.rootFolder.childEntity:
+            if not isinstance(dc, vim.Datacenter):
+                continue
+            dc_id = _moid(dc)
+            dc_name = str(getattr(dc, "name", "") or dc_id)
+            if wanted and wanted not in {dc_id.lower(), dc_name.lower()}:
+                continue
+            root = getattr(dc, "vmFolder", None)
+            if root is None:
+                continue
+            root_id = _moid(root)
+            root_name = str(getattr(root, "name", "") or "vm")
+            by_id: Dict[str, Dict[str, str]] = {
+                root_id: {"name": root_name, "parent_id": ""},
+            }
+            for row in self._collect(content, vmodl, vim.Folder, ["name", "parent"], root=root):
+                folder_id = str(row.get("id") or "")
+                if not folder_id or folder_id == root_id:
+                    continue
+                parent = row.get("parent")
+                parent_id = _moid(parent) if parent is not None else ""
+                by_id[folder_id] = {
+                    "name": str(row.get("name") or folder_id),
+                    "parent_id": parent_id,
+                }
+
+            path_cache: Dict[str, str] = {}
+
+            def folder_path(folder_id: str) -> str:
+                cached = path_cache.get(folder_id)
+                if cached is not None:
+                    return cached
+                node = by_id.get(folder_id)
+                if node is None:
+                    path_cache[folder_id] = folder_id
+                    return folder_id
+                parent_id = node["parent_id"]
+                if not parent_id or parent_id not in by_id:
+                    path = f"{dc_name} / {node['name']}"
+                else:
+                    path = f"{folder_path(parent_id)} / {node['name']}"
+                path_cache[folder_id] = path
+                return path
+
+            for folder_id, node in by_id.items():
+                result.append(
+                    VmFolder(
+                        id=folder_id,
+                        name=node["name"],
+                        path=folder_path(folder_id),
+                        parent_id=node["parent_id"],
+                        datacenter_id=dc_id,
+                        datacenter_name=dc_name,
+                    )
+                )
+        result.sort(key=lambda item: item.path.lower())
+        return result
+
+    def _resolve_vm_folder(self, folder_id: str) -> Any:
+        from pyVmomi import vim
+
+        clean = (folder_id or "").strip()
+        if not clean:
+            return None
+        folder = self._obj(vim.Folder, clean)
+        try:
+            _ = folder.name
+        except Exception as exc:
+            raise PermanentError(f"Unknown VM folder: {clean}") from exc
+        parent = folder
+        while parent is not None:
+            if isinstance(parent, vim.Datacenter):
+                return folder
+            parent = getattr(parent, "parent", None)
+        raise PermanentError(f"Folder {clean} is not under a datacenter VM inventory")
 
     def list_networks(self) -> List[NetworkSummary]:
         from pyVmomi import vim, vmodl
@@ -992,8 +1311,28 @@ class VCenterAdapter(InventoryAdapter):
         datastore = self._obj(vim.Datastore, spec.datastore_id)
         relocate = vim.vm.RelocateSpec()
         relocate.datastore = datastore
+        dest_host = self._obj(vim.HostSystem, spec.host_id) if spec.host_id else None
         pool = None
-        if spec.cluster_id:
+        if dest_host is not None:
+            _ = dest_host.name
+            connection = str(getattr(dest_host.runtime, "connectionState", "") or "").lower()
+            if connection == "disconnected":
+                raise PermanentError(f"Host {dest_host.name} is disconnected")
+            dest_parent = getattr(dest_host, "parent", None)
+            if spec.cluster_id:
+                cluster_moid = spec.cluster_id
+                if _moid(dest_parent) != cluster_moid:
+                    try:
+                        compute = self._obj(vim.ComputeResource, spec.cluster_id)
+                        if _moid(dest_parent) != _moid(compute):
+                            raise PermanentError(f"Host {dest_host.name} is not in the selected cluster")
+                    except PermanentError:
+                        raise
+                    except Exception:
+                        raise PermanentError(f"Host {dest_host.name} is not in the selected cluster") from None
+            relocate.host = dest_host
+            pool = getattr(dest_parent, "resourcePool", None)
+        elif spec.cluster_id:
             cluster = self._obj(vim.ClusterComputeResource, spec.cluster_id)
             try:
                 pool = cluster.resourcePool
@@ -1012,8 +1351,116 @@ class VCenterAdapter(InventoryAdapter):
                 clone_spec.config.numCPUs = int(spec.cpu_count)
             if spec.memory_mib:
                 clone_spec.config.memoryMB = int(spec.memory_mib)
-        folder = template.parent
+        folder = self._resolve_vm_folder(spec.folder_id) or template.parent
         task = template.Clone(folder=folder, name=spec.name.strip(), spec=clone_spec)
+        return _moid(task)
+
+    def start_clone_migrate(self, spec: CloneMigrateRequest) -> str:
+        from pyVmomi import vim
+
+        source = self._find_vm(self._session().content, spec.vm_id)
+        if source is None:
+            raise PermanentError("Unknown VM")
+        if bool(getattr(getattr(source, "config", None), "template", False)):
+            raise PermanentError("Refusing to clone-migrate a template")
+        clone_name = (spec.name or "").strip()
+        if not clone_name or "/" in clone_name:
+            raise PermanentError("Clone name is required and cannot contain '/'")
+
+        dest_host = self._obj(vim.HostSystem, spec.host_id)
+        _ = dest_host.name
+        connection = str(getattr(dest_host.runtime, "connectionState", "") or "").lower()
+        if connection == "disconnected":
+            raise PermanentError(f"Host {dest_host.name} is disconnected")
+        current_host = getattr(source.runtime, "host", None)
+        if current_host is not None:
+            current_cluster = getattr(current_host, "parent", None)
+            dest_cluster = getattr(dest_host, "parent", None)
+            if (
+                current_cluster is not None
+                and dest_cluster is not None
+                and _moid(current_cluster) != _moid(dest_cluster)
+            ):
+                raise PermanentError(f"{source.name} is not in the same cluster as {dest_host.name}")
+
+        relocate = vim.vm.RelocateSpec()
+        relocate.host = dest_host
+        pool = getattr(getattr(dest_host, "parent", None), "resourcePool", None)
+        if pool is not None:
+            relocate.pool = pool
+
+        if spec.datastore_id:
+            datastore = self._obj(vim.Datastore, spec.datastore_id)
+            relocate.datastore = datastore
+        else:
+            refs = list(getattr(source, "datastore", None) or [])
+            if refs:
+                relocate.datastore = refs[0]
+
+        clone_spec = vim.vm.CloneSpec(location=relocate, powerOn=bool(spec.power_on), template=False)
+        folder = self._resolve_vm_folder(spec.folder_id) or source.parent
+        task = source.Clone(folder=folder, name=clone_name, spec=clone_spec)
+        return _moid(task)
+
+    def rename_vm(self, vm_id: str, new_name: str) -> str:
+        from pyVmomi import vim
+
+        clean = new_name.strip()
+        if not clean or "/" in clean:
+            raise PermanentError("Invalid VM name")
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        task = vm.Rename(clean)
+        return _moid(task)
+
+    def disable_vm_drs(self, vm: Any, cluster_id: str = "", vm_name: str = "", vm_id: str = "") -> str:
+        from pyVmomi import vim
+
+        target = vm
+        if target is None and (vm_id or "").strip():
+            target = self._find_vm(self._session().content, vm_id.strip())
+        if target is None and vm_name:
+            from pyVmomi import vmodl
+
+            content = self._session().content
+            for row in self._collect(content, vmodl, vim.VirtualMachine, ["name"]):
+                if str(row.get("name") or "") == vm_name:
+                    target = self._find_vm(content, row["id"])
+                    break
+        if target is None:
+            raise PermanentError("Cannot disable DRS: VM was not found")
+
+        cluster = None
+        if cluster_id:
+            try:
+                cluster = self._obj(vim.ClusterComputeResource, cluster_id)
+            except Exception:
+                cluster = self._obj(vim.ComputeResource, cluster_id)
+        if cluster is None:
+            host = getattr(getattr(target, "runtime", None), "host", None)
+            parent = getattr(host, "parent", None) if host is not None else None
+            if isinstance(parent, vim.ClusterComputeResource):
+                cluster = parent
+            elif parent is not None and hasattr(parent, "parent"):
+                grand = getattr(parent, "parent", None)
+                if isinstance(grand, vim.ClusterComputeResource):
+                    cluster = grand
+        if cluster is None:
+            raise PermanentError("Cannot disable DRS: VM is not in a DRS cluster")
+
+        drs_vm_config_info = vim.cluster.DrsVmConfigInfo()
+        drs_vm_config_info.key = target
+        drs_vm_config_info.enabled = False
+
+        drs_config_spec = vim.cluster.DrsVmConfigSpec()
+        drs_config_spec.operation = vim.option.ArrayUpdateSpec.Operation.add
+        drs_config_spec.info = drs_vm_config_info
+
+        cluster_spec_ex = vim.cluster.ConfigSpecEx()
+        cluster_spec_ex.drsVmConfigSpec = [drs_config_spec]
+
+        task = cluster.ReconfigureComputeResource_Task(cluster_spec_ex, True)
         return _moid(task)
 
     def start_migrate(self, spec: MigrateVmRequest) -> str:
@@ -1087,6 +1534,24 @@ class VCenterAdapter(InventoryAdapter):
         task = vm.Relocate(relocate)
         return _moid(task)
 
+    def start_move_into_folder(self, vm_id: str, folder_id: str) -> str:
+        from pyVmomi import vim
+
+        clean_folder = (folder_id or "").strip()
+        if not clean_folder:
+            return ""
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        folder = self._resolve_vm_folder(clean_folder)
+        if folder is None:
+            raise PermanentError("Unknown VM folder")
+        current = getattr(vm, "parent", None)
+        if current is not None and _moid(current) == _moid(folder):
+            return ""
+        task = folder.MoveIntoFolder_Task([vm])
+        return _moid(task)
+
     def _disk_locators(self, vm: Any, datastore: Any, provisioning: str) -> List[Any]:
         from pyVmomi import vim
 
@@ -1108,7 +1573,7 @@ class VCenterAdapter(InventoryAdapter):
             if provisioning:
                 info = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
                 info.thinProvisioned = provisioning == "thin"
-                info.eagerlyScrub = False
+                info.eagerlyScrub = provisioning == "eager_zeroed_thick"
                 locator.diskBackingInfo = info
             locators.append(locator)
         return locators
@@ -1161,6 +1626,324 @@ class VCenterAdapter(InventoryAdapter):
         except Exception:
             return self.settings.vcenter_user
 
+    def _host_obj(self):
+        from pyVmomi import vim, vmodl
+
+        rows = self._collect(self._session().content, vmodl, vim.HostSystem, ["name"])
+        if not rows:
+            raise PermanentError("This endpoint did not return an ESXi host")
+        if len(rows) > 1 and self._is_esxi():
+            raise PermanentError("Direct ESXi mode expected exactly one host")
+        return self._obj(vim.HostSystem, rows[0]["id"])
+
+    def host_management(self) -> HostManagementInfo:
+        if not self._is_esxi():
+            raise PermanentError("Host administration is available when connected directly to an ESXi host")
+        host = self._host_obj()
+        content = self._session().content
+        connection = self.connection()
+        runtime = getattr(host, "runtime", None)
+        summary = getattr(host, "summary", None)
+        hardware = getattr(summary, "hardware", None)
+        quick = getattr(summary, "quickStats", None)
+        config = getattr(host, "config", None)
+        managers = getattr(host, "configManager", None)
+
+        services: List[HostServiceSummary] = []
+        service_system = getattr(managers, "serviceSystem", None)
+        service_info = getattr(service_system, "serviceInfo", None)
+        for item in getattr(service_info, "service", None) or []:
+            key = str(getattr(item, "key", "") or "")
+            services.append(
+                HostServiceSummary(
+                    key=key,
+                    label=str(getattr(item, "label", "") or key),
+                    running=bool(getattr(item, "running", False)),
+                    policy=str(getattr(item, "policy", "") or ""),
+                    required=bool(getattr(item, "required", False)),
+                    controllable=key in {"TSM", "TSM-SSH", "ntpd"},
+                )
+            )
+
+        storage_adapters: List[HostStorageAdapterSummary] = []
+        storage = getattr(config, "storageDevice", None)
+        for item in getattr(storage, "hostBusAdapter", None) or []:
+            storage_adapters.append(
+                HostStorageAdapterSummary(
+                    key=str(getattr(item, "key", "") or getattr(item, "device", "") or ""),
+                    model=str(getattr(item, "model", "") or ""),
+                    driver=str(getattr(item, "driver", "") or ""),
+                    status=str(getattr(item, "status", "") or ""),
+                    device=str(getattr(item, "device", "") or ""),
+                )
+            )
+
+        health: List[HostHealthSensor] = []
+        health_system = getattr(runtime, "healthSystemRuntime", None)
+        system_health = getattr(health_system, "systemHealthInfo", None)
+        for item in getattr(system_health, "numericSensorInfo", None) or []:
+            health.append(
+                HostHealthSensor(
+                    name=str(getattr(item, "name", "") or "Sensor"),
+                    status=str(getattr(item, "healthState", "") or "unknown"),
+                    reading=str(getattr(item, "currentReading", "") or ""),
+                )
+            )
+
+        date_time = getattr(config, "dateTimeInfo", None)
+        ntp_config = getattr(date_time, "ntpConfig", None)
+        network = getattr(config, "network", None)
+        dns = getattr(network, "dnsConfig", None)
+        uptime = int(getattr(quick, "uptime", 0) or 0)
+        now = datetime.now(timezone.utc)
+        try:
+            remote_now = getattr(managers, "dateTimeSystem", None).QueryDateTime()
+            remote_now = _utc(remote_now)
+        except Exception:
+            remote_now = None
+        return HostManagementInfo(
+            host_id=_moid(host),
+            name=str(getattr(host, "name", "") or self.settings.vcenter_host),
+            endpoint_kind="esxi",
+            product_name=connection.product_name,
+            version=connection.product_version,
+            build=connection.product_build,
+            api_version=connection.api_version,
+            vendor=str(getattr(hardware, "vendor", "") or ""),
+            model=str(getattr(hardware, "model", "") or ""),
+            uuid=str(getattr(hardware, "uuid", "") or ""),
+            connection_state=str(getattr(runtime, "connectionState", "") or "unknown"),
+            maintenance_mode=bool(getattr(runtime, "inMaintenanceMode", False)),
+            uptime_seconds=uptime,
+            boot_time=now - timedelta(seconds=uptime) if uptime else None,
+            current_time=remote_now,
+            ntp_servers=[str(item) for item in getattr(ntp_config, "server", None) or []],
+            dns_servers=[str(item) for item in getattr(dns, "address", None) or []],
+            search_domains=[str(item) for item in getattr(dns, "searchDomain", None) or []],
+            hostname=str(getattr(dns, "hostName", "") or ""),
+            domain_name=str(getattr(dns, "domainName", "") or ""),
+            services=sorted(services, key=lambda item: item.label.lower()),
+            storage_adapters=storage_adapters,
+            health=health,
+            ssh_configured=bool(self.settings.esxi_ssh_enabled),
+            capabilities=connection.capabilities,
+        )
+
+    def _require_quiescent_host(self, host: Any, action: str) -> None:
+        powered = [
+            str(getattr(vm, "name", "") or _moid(vm))
+            for vm in getattr(host, "vm", None) or []
+            if normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", "")) == "POWERED_ON"
+        ]
+        if powered:
+            preview = ", ".join(powered[:5])
+            suffix = "…" if len(powered) > 5 else ""
+            raise PermanentError(f"Cannot {action} while powered-on VMs remain: {preview}{suffix}")
+
+    def start_host_action(self, action: str, timeout_seconds: int = 900) -> str:
+        if not self._is_esxi():
+            raise PermanentError("Host actions require a direct ESXi connection")
+        host = self._host_obj()
+        action = (action or "").strip().lower()
+        if action == "maintenance_enter":
+            self._require_quiescent_host(host, "enter maintenance mode")
+            task = host.EnterMaintenanceMode_Task(timeout=int(timeout_seconds), evacuatePoweredOffVms=False)
+        elif action == "maintenance_exit":
+            task = host.ExitMaintenanceMode_Task(timeout=int(timeout_seconds))
+        elif action in {"reboot", "shutdown"}:
+            self._require_quiescent_host(host, action)
+            if not bool(getattr(getattr(host, "runtime", None), "inMaintenanceMode", False)):
+                raise PermanentError(f"Enter maintenance mode before host {action}")
+            task = host.RebootHost_Task(force=False) if action == "reboot" else host.ShutdownHost_Task(force=False)
+        else:
+            raise PermanentError("Host action must be maintenance_enter, maintenance_exit, reboot, or shutdown")
+        return _moid(task)
+
+    def host_service_action(self, service_key: str, action: str, policy: str = "") -> Dict[str, Any]:
+        if not self._is_esxi():
+            raise PermanentError("Host service controls require a direct ESXi connection")
+        key = (service_key or "").strip()
+        if key not in {"TSM", "TSM-SSH", "ntpd"}:
+            raise PermanentError("Only ESXi Shell, SSH, and NTP services are controllable from vFleet")
+        service_system = self._host_obj().configManager.serviceSystem
+        action = (action or "").strip().lower()
+        if action == "start":
+            service_system.StartService(id=key)
+        elif action == "stop":
+            service_system.StopService(id=key)
+        elif action == "restart":
+            service_system.RestartService(id=key)
+        elif action == "policy":
+            clean_policy = (policy or "").strip()
+            if clean_policy not in {"on", "off", "automatic"}:
+                raise PermanentError("Service policy must be on, off, or automatic")
+            service_system.UpdateServicePolicy(id=key, policy=clean_policy)
+        else:
+            raise PermanentError("Service action must be start, stop, restart, or policy")
+        return {"service_key": key, "action": action, "policy": policy}
+
+    def configure_host_time(self, ntp_servers: List[str], sync_now: bool = False) -> Dict[str, Any]:
+        if not self._is_esxi():
+            raise PermanentError("Host time controls require a direct ESXi connection")
+        clean = [item.strip() for item in ntp_servers if item and item.strip()]
+        if len(clean) > 8 or any(any(ch.isspace() for ch in item) for item in clean):
+            raise PermanentError("Provide up to eight valid NTP hostnames or addresses")
+        from pyVmomi import vim
+
+        system = self._host_obj().configManager.dateTimeSystem
+        ntp = vim.host.NtpConfig(server=clean)
+        system.UpdateDateTimeConfig(config=vim.host.DateTimeConfig(ntpConfig=ntp))
+        if sync_now:
+            try:
+                self._host_obj().configManager.serviceSystem.RestartService(id="ntpd")
+            except Exception as exc:
+                raise PermanentError(f"NTP configuration was saved, but ntpd could not be restarted: {exc}") from exc
+        return {"ntp_servers": clean, "sync_now": sync_now}
+
+    def rescan_storage(self) -> Dict[str, Any]:
+        if not self._is_esxi():
+            raise PermanentError("Storage rescan requires a direct ESXi connection")
+        storage = self._host_obj().configManager.storageSystem
+        storage.RescanAllHba()
+        storage.RescanVmfs()
+        return {"rescanned": True}
+
+    def start_support_bundle(self) -> str:
+        if not self._is_esxi():
+            raise PermanentError("Support bundles require a direct ESXi connection")
+        host = self._host_obj()
+        diagnostic = host.configManager.diagnosticSystem
+        task = diagnostic.GenerateLogBundles_Task(includeDefault=True, host=[host])
+        return _moid(task)
+
+    def disk_conversion_plan(self, spec: DiskConversionPlanRequest) -> DiskConversionPlan:
+        target = normalize_disk_transform(spec.target)
+        if not target:
+            raise PermanentError("Choose thin, lazy-zeroed thick, or eager-zeroed thick")
+        method = (spec.method or "auto").strip().lower()
+        if method not in {"auto", "soap", "ssh"}:
+            raise PermanentError("Conversion method must be auto, soap, or ssh")
+        vm = self._find_vm(self._session().content, spec.vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        devices = getattr(getattr(getattr(vm, "config", None), "hardware", None), "device", None) or []
+        disks = disk_summaries(devices)
+        power = normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", ""))
+        blockers: List[str] = []
+        warnings: List[str] = []
+        if not disks:
+            blockers.append("The VM has no supported virtual disks")
+        for disk in disks:
+            if disk.rdm:
+                blockers.append(f"{disk.label} is an RDM or device mapping")
+            if disk.encrypted:
+                blockers.append(f"{disk.label} is encrypted")
+            if disk.sharing and disk.sharing.lower() not in {"", "sharingnone"}:
+                blockers.append(f"{disk.label} uses shared-disk mode {disk.sharing}")
+        noop = bool(disks) and all(disk.provisioning == target for disk in disks)
+        selected = "soap" if method == "auto" else method
+        if selected == "ssh":
+            if not self._is_esxi():
+                blockers.append("SSH conversion is only available for a direct ESXi connection")
+            if not self.settings.esxi_ssh_enabled:
+                blockers.append("SSH fallback is not configured for this host")
+            if power != "POWERED_OFF":
+                blockers.append("SSH conversion requires the VM to be powered off")
+            if getattr(vm, "snapshot", None) is not None:
+                blockers.append("SSH conversion requires all VM snapshots to be removed first")
+        else:
+            warnings.append("The vSphere API performs a storage relocation; required API privileges and free space are checked by ESXi")
+        if self._is_esxi() and selected == "soap" and self.settings.esxi_ssh_enabled:
+            warnings.append("If this ESXi license blocks write APIs, re-plan with the SSH method")
+        change_version = str(getattr(getattr(vm, "config", None), "changeVersion", "") or "")
+        token_data = {
+            "endpoint": self.endpoint_fingerprint(),
+            "vm": spec.vm_id,
+            "change": change_version,
+            "power": power,
+            "target": target,
+            "method": selected,
+            "disks": [disk.model_dump() for disk in disks],
+        }
+        token = hashlib.sha256(json.dumps(token_data, sort_keys=True).encode("utf-8")).hexdigest()
+        return DiskConversionPlan(
+            vm_id=spec.vm_id,
+            vm_name=str(getattr(vm, "name", "") or spec.vm_id),
+            target=target,
+            method=selected,
+            fallback_method="ssh" if selected == "soap" and self._is_esxi() and self.settings.esxi_ssh_enabled else "",
+            plan_token=token,
+            power_state=power,
+            disks=disks,
+            blockers=blockers,
+            warnings=warnings,
+            estimated_scratch_bytes=sum(disk.capacity_bytes for disk in disks),
+            noop=noop,
+            can_execute=not blockers and not noop,
+        )
+
+    def execute_ssh_disk_conversion(
+        self,
+        plan: DiskConversionPlan,
+        on_progress: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        if plan.method != "ssh" or not self._is_esxi() or not self.settings.esxi_ssh_enabled:
+            raise PermanentError("This disk plan is not authorized for the ESXi SSH fallback")
+        current = self.disk_conversion_plan(
+            DiskConversionPlanRequest(vm_id=plan.vm_id, target=plan.target, method="ssh")
+        )
+        if current.plan_token != plan.plan_token:
+            raise PermanentError("The VM changed after this plan was created; review and confirm a new plan")
+        if not current.can_execute:
+            raise PermanentError("; ".join(current.blockers) or "Disk conversion cannot be executed")
+
+        from pyVmomi import vim
+
+        from ..esxi_ssh import EsxiSshExecutor, datastore_path
+
+        vm = self._find_vm(self._session().content, plan.vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        devices = getattr(getattr(getattr(vm, "config", None), "hardware", None), "device", None) or []
+        by_key = {int(getattr(device, "key", 0) or 0): device for device in devices}
+        executor = EsxiSshExecutor(self.settings)
+        changes: List[Any] = []
+        converted: List[Dict[str, str]] = []
+        total = len(plan.disks)
+        for index, disk in enumerate(plan.disks):
+            _datastore, relative, source = datastore_path(disk.file_name)
+            if not relative.lower().endswith(".vmdk"):
+                raise PermanentError(f"{disk.label} does not reference a VMDK descriptor")
+            suffix = plan.plan_token[:12]
+            relative_dest = f"{relative[:-5]}.vfleet-{suffix}.vmdk"
+            _ds2, _rel2, destination = datastore_path(f"[{_datastore}] {relative_dest}")
+            if on_progress:
+                on_progress(index, {"phase": "clone", "disk": disk.label, "index": index, "total": total})
+            executor.clone_disk(source, destination, plan.target)
+            device = by_key.get(disk.key)
+            if device is None:
+                raise PermanentError(f"Disk device {disk.key} changed while converting")
+            device.backing.fileName = f"[{_datastore}] {relative_dest}"
+            change = vim.vm.device.VirtualDeviceSpec()
+            change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+            change.device = device
+            changes.append(change)
+            converted.append({"label": disk.label, "source": disk.file_name, "destination": device.backing.fileName})
+
+        if on_progress:
+            on_progress(total, {"phase": "reconfigure", "index": total, "total": total})
+        spec = vim.vm.ConfigSpec(deviceChange=changes)
+        task = vm.ReconfigVM_Task(spec=spec)
+        self.wait_task(_moid(task))
+        self._cache_at = 0.0
+        return {
+            "vm_id": plan.vm_id,
+            "target": plan.target,
+            "method": "ssh",
+            "converted": converted,
+            "source_disks_preserved": True,
+        }
+
     def _cluster_or_root(self, cluster_id: str, scope: str):
         from pyVmomi import vim
 
@@ -1199,6 +1982,8 @@ class VCenterAdapter(InventoryAdapter):
         return granted
 
     def migration_access(self, cluster_id: str = "") -> Dict[str, Any]:
+        if self._is_esxi():
+            raise PermanentError("vCenter roles and DRS permissions do not exist on a standalone ESXi host")
         from ..migration_access import ROLE_NAME, privilege_rows
 
         user = self._session_user()
@@ -1235,6 +2020,8 @@ class VCenterAdapter(InventoryAdapter):
         }
 
     def grant_migration_access(self, cluster_id: str = "", scope: str = "cluster") -> Dict[str, Any]:
+        if self._is_esxi():
+            raise PermanentError("vCenter roles and DRS permissions do not exist on a standalone ESXi host")
         from pyVmomi import vim
 
         from ..migration_access import MIGRATE_PRIV_IDS, ROLE_NAME
@@ -1338,7 +2125,7 @@ class VCenterAdapter(InventoryAdapter):
                 "vCenter cannot write files here. Use a writable datastore, or follow "
                 "'How to Upload your own Images.txt' on this datastore."
             )
-        if use_library:
+        if use_library and not self._is_esxi():
             try:
                 return library_upload(self._rest, datastore_id, Path(remote_path).name or path.name, path, size, state, on_progress)
             except TransientError:
@@ -1492,4 +2279,3 @@ class VCenterAdapter(InventoryAdapter):
                 return current
             current = getattr(current, "parent", None)
         raise PermanentError("Could not resolve datacenter for datastore")
-

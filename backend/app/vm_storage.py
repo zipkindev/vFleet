@@ -1,19 +1,29 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, Tuple
+from typing import Any, Iterable, List, Tuple
+
+from .models import VirtualDiskSummary
 
 Provisioning = str  # thin | thick | mixed | unknown
-DISK_TRANSFORMS = {"thin", "thick"}
+DISK_TRANSFORMS = {"thin", "thick", "lazy_zeroed_thick", "eager_zeroed_thick"}
 
 
 def normalize_disk_transform(value: str | None) -> str:
     text = (value or "").strip().lower()
     if text in {"", "keep", "unchanged", "current"}:
         return ""
-    if text in {"eagerzeroedthick", "eager_zeroed_thick"}:
-        return "thick"
+    aliases = {
+        "lazyzeroedthick": "lazy_zeroed_thick",
+        "lazy-zeroed-thick": "lazy_zeroed_thick",
+        "zeroedthick": "lazy_zeroed_thick",
+        "eagerzeroedthick": "eager_zeroed_thick",
+        "eager-zeroed-thick": "eager_zeroed_thick",
+    }
+    text = aliases.get(text, text)
     if text not in DISK_TRANSFORMS:
-        raise ValueError("disk_provisioning must be keep, thin, or thick")
+        raise ValueError(
+            "disk_provisioning must be keep, thin, thick, lazy_zeroed_thick, or eager_zeroed_thick"
+        )
     return text
 
 
@@ -54,6 +64,57 @@ def classify_backing(backing: Any) -> Provisioning:
     if bool(getattr(backing, "thinProvisioned", False)):
         return "thin"
     return "thick"
+
+
+def detailed_backing_type(backing: Any) -> Provisioning:
+    kind = classify_backing(backing)
+    if kind != "thick":
+        return kind
+    if bool(getattr(backing, "eagerlyScrub", False)):
+        return "eager_zeroed_thick"
+    return "lazy_zeroed_thick"
+
+
+def _parent_depth(backing: Any) -> int:
+    depth = 0
+    seen: set[int] = set()
+    current = getattr(backing, "parent", None)
+    while current is not None and id(current) not in seen and depth < 64:
+        seen.add(id(current))
+        depth += 1
+        current = getattr(current, "parent", None)
+    return depth
+
+
+def disk_summaries(devices: Iterable[Any] | None) -> List[VirtualDiskSummary]:
+    rows: List[VirtualDiskSummary] = []
+    for device in devices or []:
+        if not is_virtual_disk(device):
+            continue
+        backing = getattr(device, "backing", None)
+        datastore = getattr(backing, "datastore", None) if backing is not None else None
+        backing_name = type(backing).__name__.rsplit(".", 1)[-1] if backing is not None else ""
+        lowered = backing_name.lower()
+        rows.append(
+            VirtualDiskSummary(
+                key=int(getattr(device, "key", 0) or 0),
+                label=str(getattr(getattr(device, "deviceInfo", None), "label", "") or "Virtual disk"),
+                capacity_bytes=disk_capacity_bytes(device),
+                file_name=str(getattr(backing, "fileName", "") or ""),
+                datastore_id=str(
+                    (datastore._GetMoId() if datastore is not None and hasattr(datastore, "_GetMoId") else "") or ""
+                ),
+                datastore_name=str(getattr(datastore, "name", "") or ""),
+                provisioning=detailed_backing_type(backing),
+                disk_mode=str(getattr(backing, "diskMode", "") or ""),
+                backing_type=backing_name,
+                parent_depth=_parent_depth(backing),
+                rdm="rawdisk" in lowered or bool(getattr(backing, "deviceName", "")),
+                encrypted=getattr(backing, "keyId", None) is not None,
+                sharing=str(getattr(backing, "sharing", "") or ""),
+            )
+        )
+    return rows
 
 
 def summarize_disks(

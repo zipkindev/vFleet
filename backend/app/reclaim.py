@@ -60,10 +60,18 @@ def annotate_idle(vm: VirtualMachine, settings: Settings, now: Optional[datetime
     return vm
 
 
-def build_owner_reports(vms: list[VirtualMachine]) -> list[OwnerReport]:
+def build_owner_reports(
+    vms: list[VirtualMachine],
+    *,
+    group_by: str = "owner_key",
+) -> list[OwnerReport]:
     grouped: dict[str, list[VirtualMachine]] = {}
     for vm in vms:
-        grouped.setdefault(vm.owner_key, []).append(vm)
+        if group_by == "deployed_by":
+            key = (vm.deployed_by or "").strip() or "unknown"
+        else:
+            key = vm.owner_key
+        grouped.setdefault(key, []).append(vm)
 
     reports: list[OwnerReport] = []
     for owner, members in grouped.items():
@@ -73,10 +81,14 @@ def build_owner_reports(vms: list[VirtualMachine]) -> list[OwnerReport]:
             for vm in members
             if vm.idle_score >= 40 and normalize_power_state(vm.power_state) == "POWERED_ON"
         ]
+        if group_by == "deployed_by":
+            source = "deployed_by" if owner != "unknown" else "unknown"
+        else:
+            source = members[0].owner_source
         reports.append(
             OwnerReport(
                 owner_key=owner,
-                owner_source=members[0].owner_source,
+                owner_source=source,
                 vm_count=len(members),
                 powered_on=powered_on,
                 powered_off=sum(1 for vm in members if normalize_power_state(vm.power_state) == "POWERED_OFF"),

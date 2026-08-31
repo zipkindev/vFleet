@@ -34,7 +34,7 @@ def test_synthesized_history_covers_two_weeks(tmp_path: Path):
 
     catalog = Catalog(datastores=adapter.list_datastores())
     current = build_metric_samples(snapshot, catalog)
-    now = datetime(2026, 8, 19, 16, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
     history = synthesize_history(current, days=HISTORY_DAYS, now=now)
     cluster = [item for item in history if item.owner_key == "" and item.host_id == "" and item.datastore_id == ""]
     assert cluster

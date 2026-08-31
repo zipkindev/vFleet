@@ -3,13 +3,17 @@ import type {
   ActionResult,
   Catalog,
   ConnectionInfo,
+  ConsoleTicket,
   DatastoreListing,
+  DiskConversionPlan,
+  HostManagementInfo,
   InventorySnapshot,
   Job,
   JobList,
   MetricsResponse,
   MigrationAccessStatus,
   StagingSession,
+  VmFolder,
 } from "./types";
 
 export class ApiError extends Error {
@@ -88,6 +92,12 @@ export async function login(body: {
   insecure: boolean;
   remember: boolean;
   connect: boolean;
+  endpoint_kind?: string;
+  ssh_enabled?: boolean;
+  ssh_user?: string;
+  ssh_password?: string;
+  ssh_port?: number;
+  ssh_host_key_sha256?: string;
 }): Promise<ConnectionInfo> {
   return request<ConnectionInfo>("/api/login", { method: "POST", body: JSON.stringify(body) });
 }
@@ -104,8 +114,42 @@ export async function runActions(vmIds: string[], action: ActionName): Promise<A
   return payload.results;
 }
 
+export async function fetchConsoleTicket(vmId: string, type: "vmrc" | "webmks" = "vmrc"): Promise<ConsoleTicket> {
+  return request<ConsoleTicket>(`/api/vms/${encodeURIComponent(vmId)}/console`, {
+    method: "POST",
+    body: JSON.stringify({ type }),
+  });
+}
+
+export function vcenterVmConsoleUrl(host: string, vmId: string, port = 443): string {
+  const authority = !host || port === 443 ? host : `${host}:${port}`;
+  return `https://${authority}/ui/app/vm;nav=s/urn:vmomi:VirtualMachine:${vmId}/console`;
+}
+
+export const VMRC_INSTALL_URL =
+  "https://support.broadcom.com/group/ecx/productdownloads?subfamily=VMware%20Remote%20Console";
+
+/** Launch vmrc:// and other custom protocol URIs without leaving a blank browser tab. */
+export function launchExternalUri(uri: string): void {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(uri) && !/^https?:/i.test(uri)) {
+    const link = document.createElement("a");
+    link.href = uri;
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return;
+  }
+  window.open(uri, "_blank", "noopener,noreferrer");
+}
+
 export async function fetchCatalog(): Promise<Catalog> {
   return request<Catalog>("/api/catalog");
+}
+
+export async function listVmFolders(datacenter = ""): Promise<VmFolder[]> {
+  const query = datacenter ? `?datacenter=${encodeURIComponent(datacenter)}` : "";
+  return request<VmFolder[]>(`/api/folders${query}`);
 }
 
 export async function fetchMetrics(
@@ -161,11 +205,43 @@ export async function cloneVm(body: {
   name: string;
   datastore_id: string;
   cluster_id?: string;
+  host_id?: string;
+  folder_id?: string;
+  disable_drs?: boolean;
   cpu_count?: number;
   memory_mib?: number;
   power_on?: boolean;
 }): Promise<Job> {
   return request<Job>("/api/vms", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function deployFromTemplate(body: {
+  template_id: string;
+  name: string;
+  datastore_id: string;
+  cluster_id?: string;
+  host_id?: string;
+  folder_id?: string;
+  disable_drs?: boolean;
+  cpu_count?: number;
+  memory_mib?: number;
+  power_on?: boolean;
+}): Promise<Job> {
+  return request<Job>("/api/vms/deploy", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function renameVm(vmId: string, name: string): Promise<Job> {
+  return request<Job>(`/api/vms/${encodeURIComponent(vmId)}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name, confirm: true }),
+  });
+}
+
+export async function applyDrsOverride(vmIds: string[]): Promise<Job> {
+  return request<Job>("/api/vms/drs-override", {
+    method: "POST",
+    body: JSON.stringify({ vm_ids: vmIds, confirm: true }),
+  });
 }
 
 export async function migrateVms(body: {
@@ -174,9 +250,87 @@ export async function migrateVms(body: {
   datastore_id?: string;
   network_id?: string;
   disk_provisioning?: string;
+  folder_id?: string;
   confirm: boolean;
 }): Promise<Job> {
   return request<Job>("/api/vms/migrate", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function planDiskConversion(body: {
+  vm_id: string;
+  target: string;
+  method: string;
+}): Promise<DiskConversionPlan> {
+  return request<DiskConversionPlan>("/api/vms/disk-conversion/plan", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function convertVmDisks(plan: DiskConversionPlan): Promise<Job> {
+  return request<Job>("/api/vms/disk-conversion", {
+    method: "POST",
+    body: JSON.stringify({
+      vm_id: plan.vm_id,
+      target: plan.target,
+      method: plan.method,
+      plan_token: plan.plan_token,
+      confirm: true,
+    }),
+  });
+}
+
+export async function fetchHostManagement(): Promise<HostManagementInfo> {
+  return request<HostManagementInfo>("/api/host");
+}
+
+export async function queueHostAction(action: string): Promise<Job> {
+  return request<Job>("/api/host/actions", {
+    method: "POST",
+    body: JSON.stringify({ action, confirm: true, timeout_seconds: 900 }),
+  });
+}
+
+export async function queueHostService(service_key: string, action: string, policy = ""): Promise<Job> {
+  return request<Job>("/api/host/services", {
+    method: "POST",
+    body: JSON.stringify({ service_key, action, policy, confirm: true }),
+  });
+}
+
+export async function queueHostTime(ntp_servers: string[], sync_now: boolean): Promise<Job> {
+  return request<Job>("/api/host/time", {
+    method: "POST",
+    body: JSON.stringify({ ntp_servers, sync_now, confirm: true }),
+  });
+}
+
+export async function queueStorageRescan(): Promise<Job> {
+  return request<Job>("/api/host/storage/rescan", {
+    method: "POST",
+    body: JSON.stringify({ action: "rescan", confirm: true }),
+  });
+}
+
+export async function queueSupportBundle(): Promise<Job> {
+  return request<Job>("/api/host/support-bundle", {
+    method: "POST",
+    body: JSON.stringify({ action: "support_bundle", confirm: true }),
+  });
+}
+
+export async function cloneMigrate(body: {
+  vm_id: string;
+  host_id: string;
+  name?: string;
+  destroy_source?: boolean;
+  disable_drs?: boolean;
+  datastore_id?: string;
+  folder_id?: string;
+  power_on?: boolean;
+  confirm: boolean;
+}): Promise<Job> {
+  return request<Job>("/api/vms/clone-migrate", { method: "POST", body: JSON.stringify(body) });
 }
 
 export async function mkdir(datastoreId: string, path: string): Promise<Job> {

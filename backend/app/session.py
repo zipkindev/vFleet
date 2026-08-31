@@ -71,7 +71,21 @@ def resolve_login_password(provided: str, host: str, user: str, port: int, setti
     return ""
 
 
-def persist_vcenter(settings: Settings, host: str, user: str, password: str, port: int, insecure: bool) -> None:
+def persist_vcenter(
+    settings: Settings,
+    host: str,
+    user: str,
+    password: str,
+    port: int,
+    insecure: bool,
+    *,
+    endpoint_kind: str = "auto",
+    ssh_enabled: bool = False,
+    ssh_user: str = "",
+    ssh_password: str = "",
+    ssh_port: int = 22,
+    ssh_host_key_sha256: str = "",
+) -> None:
     upsert_env(
         ROOT / ".env",
         {
@@ -81,6 +95,11 @@ def persist_vcenter(settings: Settings, host: str, user: str, password: str, por
             "VCENTER_PASSWORD": password,
             "VCENTER_PORT": str(port),
             "VCENTER_INSECURE": "true" if insecure else "false",
+            "ESXI_SSH_ENABLED": "true" if ssh_enabled else "false",
+            "ESXI_SSH_USER": ssh_user,
+            "ESXI_SSH_PASSWORD": ssh_password,
+            "ESXI_SSH_PORT": str(ssh_port),
+            "ESXI_SSH_HOST_KEY_SHA256": ssh_host_key_sha256,
         },
     )
     settings.app_mode = "auto"
@@ -89,16 +108,49 @@ def persist_vcenter(settings: Settings, host: str, user: str, password: str, por
     settings.vcenter_password = password
     settings.vcenter_port = port
     settings.vcenter_insecure = insecure
+    settings.esxi_ssh_enabled = ssh_enabled
+    settings.esxi_ssh_user = ssh_user
+    settings.esxi_ssh_password = ssh_password
+    settings.esxi_ssh_port = ssh_port
+    settings.esxi_ssh_host_key_sha256 = ssh_host_key_sha256
 
 
 def forget_vcenter(settings: Settings) -> None:
-    upsert_env(ROOT / ".env", {"VCENTER_HOST": "", "VCENTER_USER": "", "VCENTER_PASSWORD": ""})
+    upsert_env(
+        ROOT / ".env",
+        {
+            "VCENTER_HOST": "",
+            "VCENTER_USER": "",
+            "VCENTER_PASSWORD": "",
+            "ESXI_SSH_ENABLED": "false",
+            "ESXI_SSH_USER": "",
+            "ESXI_SSH_PASSWORD": "",
+            "ESXI_SSH_HOST_KEY_SHA256": "",
+        },
+    )
     settings.vcenter_host = ""
     settings.vcenter_user = ""
     settings.vcenter_password = ""
+    settings.esxi_ssh_enabled = False
+    settings.esxi_ssh_user = ""
+    settings.esxi_ssh_password = ""
+    settings.esxi_ssh_host_key_sha256 = ""
 
 
-def apply_runtime(settings: Settings, host: str, user: str, password: str, port: int, insecure: bool) -> Settings:
+def apply_runtime(
+    settings: Settings,
+    host: str,
+    user: str,
+    password: str,
+    port: int,
+    insecure: bool,
+    *,
+    ssh_enabled: bool = False,
+    ssh_user: str = "",
+    ssh_password: str = "",
+    ssh_port: int = 22,
+    ssh_host_key_sha256: str = "",
+) -> Settings:
     return settings.model_copy(
         update={
             "app_mode": "vcenter",
@@ -107,5 +159,10 @@ def apply_runtime(settings: Settings, host: str, user: str, password: str, port:
             "vcenter_password": password,
             "vcenter_port": port,
             "vcenter_insecure": insecure,
+            "esxi_ssh_enabled": ssh_enabled,
+            "esxi_ssh_user": ssh_user,
+            "esxi_ssh_password": ssh_password,
+            "esxi_ssh_port": ssh_port,
+            "esxi_ssh_host_key_sha256": ssh_host_key_sha256,
         }
     )

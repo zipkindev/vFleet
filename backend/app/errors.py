@@ -116,6 +116,8 @@ _PRIVILEGE_HINTS = {
     "virtualmachine.interact.poweron": "Power on. Grant VirtualMachine.Interact.PowerOn.",
     "virtualmachine.interact.poweroff": "Power off. Grant VirtualMachine.Interact.PowerOff.",
     "virtualmachine.inventory.createfromexisting": "Clone. Grant VirtualMachine.Inventory.CreateFromExisting.",
+    "host.inventory.editcluster": "DRS / cluster reconfigure. Grant Host.Inventory.EditCluster on the cluster (needed to pin a VM after deploy).",
+    "virtualmachine.inventory.move": "Move VM into a folder. Grant VirtualMachine.Inventory.Move.",
 }
 
 

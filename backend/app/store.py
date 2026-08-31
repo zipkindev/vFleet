@@ -153,6 +153,20 @@ class LocalStore:
         row = self._get_kv(f"browse:{datastore_id}:{path}")
         return None if row is None else str(row["value"])
 
+    def clear_runtime_cache(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM kv WHERE key IN ('inventory','catalog','metrics_history_seeded') OR key LIKE 'browse:%'"
+            )
+            self._conn.commit()
+
+    def open_jobs(self) -> List[Job]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','running','retrying') ORDER BY created_at"
+            ).fetchall()
+        return [self._job(row) for row in rows]
+
     def enqueue(
         self,
         kind: str,

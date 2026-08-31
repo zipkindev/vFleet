@@ -7,8 +7,49 @@ from typing import Optional
 from .adapters.base import InventoryAdapter
 from .config import Settings
 from .errors import PermanentError, humanize_vcenter_error, is_permanent, is_transient
-from .models import Catalog, CloneVmRequest, ConnectionInfo, InventorySnapshot, Job, MigrateVmRequest
+from .models import (
+    Catalog,
+    CloneMigrateRequest,
+    CloneVmRequest,
+    ConnectionInfo,
+    DrsOverrideRequest,
+    DiskConversionPlan,
+    DiskConversionPlanRequest,
+    HostActionRequest,
+    HostServiceActionRequest,
+    HostTimeRequest,
+    InventorySnapshot,
+    Job,
+    MigrateVmRequest,
+    RenameVmRequest,
+)
 from .store import LocalStore
+from .reclaim import build_owner_reports
+
+
+def _clone_result_id(adapter: InventoryAdapter, result, task_id: str, clone_name: str) -> str:
+    if result is not None:
+        getter = getattr(result, "_GetMoId", None)
+        if callable(getter):
+            moid = str(getter() or "")
+            if moid:
+                return moid
+        moid = str(getattr(result, "_moId", "") or getattr(result, "id", "") or "")
+        if moid:
+            return moid
+    if task_id.startswith("demo-clone-"):
+        return task_id[len("demo-clone-") :]
+    name = (clone_name or "").strip()
+    if name:
+        try:
+            snapshot = adapter.snapshot()
+        except Exception:
+            snapshot = None
+        if snapshot is not None:
+            found = next((vm for vm in snapshot.vms if vm.name == name), None)
+            if found is not None:
+                return found.id
+    return ""
 
 
 class RelayWorker(threading.Thread):
@@ -69,6 +110,13 @@ class RelayWorker(threading.Thread):
         self.syncing = True
         try:
             snapshot = adapter.snapshot()
+            previous = self.store.load_inventory()
+            if previous is not None:
+                known = {vm.id: vm.deployed_by for vm in previous.vms if vm.deployed_by}
+                for vm in snapshot.vms:
+                    if not vm.deployed_by and vm.id in known:
+                        vm.deployed_by = known[vm.id]
+                snapshot.owners = build_owner_reports(snapshot.vms)
             self.store.save_inventory(snapshot)
             catalog: Optional[Catalog] = None
             try:
@@ -106,7 +154,7 @@ class RelayWorker(threading.Thread):
         if saved_at is not None:
             age = max(0.0, (datetime.now(timezone.utc) - saved_at).total_seconds())
         stale = False
-        if conn.mode == "vcenter":
+        if conn.mode in {"vcenter", "esxi"}:
             if self.reachable is False:
                 conn = conn.model_copy(update={"connected": False})
             # A full inventory pull of a large vCenter can exceed sync_interval.
@@ -138,13 +186,21 @@ class RelayWorker(threading.Thread):
         if isinstance(adapter, DemoAdapter):
             live = adapter.connection()
         else:
-            live = snapshot.connection.model_copy(
+            try:
+                connection = adapter.connection()
+            except Exception:
+                connection = snapshot.connection
+            if not connection.endpoint_fingerprint and snapshot.connection.endpoint_fingerprint:
+                connection = snapshot.connection.model_copy(
+                    update={
+                        "connected": False,
+                        "message": self.last_error or connection.message or snapshot.connection.message,
+                    }
+                )
+            live = connection.model_copy(
                 update={
-                    "mode": "vcenter",
                     "connected": self.reachable is not False and not self.last_error,
-                    "message": self.last_error or snapshot.connection.message,
-                    "host": self.settings.vcenter_host or snapshot.connection.host,
-                    "user": self.settings.vcenter_user or snapshot.connection.user,
+                    "message": self.last_error or connection.message or snapshot.connection.message,
                 }
             )
         snapshot.connection = self.overlay(live)
@@ -191,6 +247,13 @@ class RelayWorker(threading.Thread):
         adapter = self.adapter()
         kind = job.kind
         payload = job.payload
+        bound = str(payload.get("_endpoint_fingerprint") or "")
+        if bound:
+            current = adapter.endpoint_fingerprint()
+            if not current or current != bound:
+                raise PermanentError(
+                    "This job was created for a different vSphere endpoint and will not be executed here"
+                )
         progress = dict(job.progress)
 
         def persist(sent: int, extra: dict) -> None:
@@ -209,27 +272,160 @@ class RelayWorker(threading.Thread):
                     raise PermanentError(messages)
             return {"results": [row.model_dump() for row in results]}
 
-        if kind == "clone":
+        if kind in {"clone", "deploy"}:
             spec = CloneVmRequest.model_validate(payload)
             task_id = str(progress.get("task_id") or "")
             if not task_id:
                 task_id = adapter.start_clone(spec)
                 progress["task_id"] = task_id
                 self.store.save_progress(job.id, progress)
-            adapter.wait_task(task_id)
-            return {"name": spec.name, "task_id": task_id}
+            vm = adapter.wait_task(task_id)
+            progress["clone_complete"] = True
+            self.store.save_progress(job.id, progress)
+            if spec.disable_drs and not progress.get("drs_disabled"):
+                try:
+                    drs_task = adapter.disable_vm_drs(vm, cluster_id=spec.cluster_id, vm_name=spec.name)
+                    if drs_task:
+                        adapter.wait_task(drs_task)
+                    progress["drs_disabled"] = True
+                    self.store.save_progress(job.id, progress)
+                except Exception as exc:
+                    detail = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
+                    raise PermanentError(
+                        f"VM {spec.name} was created, but DRS pin failed: {detail}"
+                    ) from exc
+            return {"name": spec.name, "task_id": task_id, "drs_disabled": bool(progress.get("drs_disabled"))}
 
-        if kind == "migrate":
-            spec = MigrateVmRequest.model_validate(payload)
-            vm_ids = list(spec.vm_ids)
+        if kind == "clone_migrate":
+            spec = CloneMigrateRequest.model_validate(payload)
+            phase = str(progress.get("phase") or "clone")
+            source_id = (spec.vm_id or "").strip()
+            original_name = str(progress.get("original_name") or payload.get("original_name") or "")
+            clone_name = str(progress.get("clone_name") or spec.name or "").strip()
+            source_old_name = str(progress.get("source_old_name") or "")
+            clone_vm_id = str(progress.get("clone_vm_id") or "")
+
+            if phase == "clone":
+                task_id = str(progress.get("task_id") or "")
+                if not task_id:
+                    task_id = adapter.start_clone_migrate(spec)
+                    progress["task_id"] = task_id
+                    progress["phase"] = "clone_wait"
+                    progress["clone_name"] = clone_name
+                    progress["original_name"] = original_name
+                    self.store.save_progress(job.id, progress)
+                phase = "clone_wait"
+
+            if phase == "clone_wait":
+                result = adapter.wait_task(str(progress.get("task_id") or ""))
+                clone_vm_id = _clone_result_id(adapter, result, str(progress.get("task_id") or ""), clone_name)
+                if not clone_vm_id:
+                    raise PermanentError("Clone finished but the new VM could not be resolved")
+                progress["clone_vm_id"] = clone_vm_id
+                progress["task_id"] = ""
+                progress["phase"] = "drs" if spec.disable_drs else ("rename_source" if spec.destroy_source else "done")
+                self.store.save_progress(job.id, progress)
+                phase = progress["phase"]
+
+            if phase == "drs":
+                task_id = str(progress.get("task_id") or "")
+                if not task_id:
+                    try:
+                        task_id = adapter.disable_vm_drs(None, vm_id=clone_vm_id, vm_name=clone_name) or ""
+                    except Exception as exc:
+                        detail = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
+                        raise PermanentError(
+                            f"Clone {clone_name or clone_vm_id} was created, but DRS pin failed: {detail}"
+                        ) from exc
+                    progress["task_id"] = task_id
+                    progress["phase"] = "drs_wait" if task_id else ("rename_source" if spec.destroy_source else "done")
+                    progress["drs_disabled"] = True
+                    self.store.save_progress(job.id, progress)
+                    phase = progress["phase"]
+                else:
+                    phase = "drs_wait"
+
+            if phase == "drs_wait":
+                try:
+                    adapter.wait_task(str(progress.get("task_id") or ""))
+                except Exception as exc:
+                    detail = humanize_vcenter_error(exc, host=self.settings.vcenter_host)
+                    raise PermanentError(
+                        f"Clone {clone_name or clone_vm_id} was created, but DRS pin failed: {detail}"
+                    ) from exc
+                progress["task_id"] = ""
+                progress["phase"] = "rename_source" if spec.destroy_source else "done"
+                self.store.save_progress(job.id, progress)
+                phase = progress["phase"]
+
+            if phase == "rename_source":
+                if not source_old_name:
+                    short = (clone_vm_id or source_id).replace("vm-", "")[-6:] or "tmp"
+                    source_old_name = f"{original_name}-old-{short}"
+                    progress["source_old_name"] = source_old_name
+                task_id = str(progress.get("task_id") or "")
+                if not task_id:
+                    task_id = adapter.rename_vm(source_id, source_old_name) or ""
+                    progress["task_id"] = task_id
+                    progress["phase"] = "rename_source_wait" if task_id else "rename_clone"
+                    self.store.save_progress(job.id, progress)
+                    phase = progress["phase"]
+                else:
+                    phase = "rename_source_wait"
+
+            if phase == "rename_source_wait":
+                adapter.wait_task(str(progress.get("task_id") or ""))
+                progress["task_id"] = ""
+                progress["phase"] = "rename_clone"
+                self.store.save_progress(job.id, progress)
+                phase = "rename_clone"
+
+            if phase == "rename_clone":
+                task_id = str(progress.get("task_id") or "")
+                if not task_id:
+                    task_id = adapter.rename_vm(clone_vm_id, original_name) or ""
+                    progress["task_id"] = task_id
+                    progress["phase"] = "rename_clone_wait" if task_id else "destroy_source"
+                    progress["clone_name"] = original_name
+                    self.store.save_progress(job.id, progress)
+                    phase = progress["phase"]
+                else:
+                    phase = "rename_clone_wait"
+
+            if phase == "rename_clone_wait":
+                adapter.wait_task(str(progress.get("task_id") or ""))
+                progress["task_id"] = ""
+                progress["phase"] = "destroy_source"
+                self.store.save_progress(job.id, progress)
+                phase = "destroy_source"
+
+            if phase == "destroy_source":
+                results = adapter.apply_actions([source_id], "destroy")
+                failed = [row for row in results if not row.ok]
+                if failed:
+                    messages = "; ".join(f"{row.name or row.vm_id}: {row.message}" for row in failed)
+                    raise PermanentError(messages)
+                progress["phase"] = "done"
+                self.store.save_progress(job.id, progress)
+
+            return {
+                "vm_id": source_id,
+                "clone_vm_id": clone_vm_id,
+                "name": progress.get("clone_name") or clone_name,
+                "destroy_source": bool(spec.destroy_source),
+                "drs_disabled": bool(progress.get("drs_disabled")),
+            }
+
+        if kind == "drs_override":
+            spec = DrsOverrideRequest.model_validate(payload)
+            vm_ids = [item.strip() for item in spec.vm_ids if item and item.strip()]
             index = int(progress.get("index") or 0)
             results = list(progress.get("results") or [])
             while index < len(vm_ids):
                 task_id = str(progress.get("task_id") or "")
                 phase = str(progress.get("phase") or "start")
                 if phase == "start":
-                    one = spec.model_copy(update={"vm_ids": [vm_ids[index]]})
-                    task_id = adapter.start_migrate(one) or ""
+                    task_id = adapter.disable_vm_drs(None, vm_id=vm_ids[index]) or ""
                     progress["task_id"] = task_id
                     progress["index"] = index
                     progress["phase"] = "wait" if task_id else "next"
@@ -239,17 +435,151 @@ class RelayWorker(threading.Thread):
                     adapter.wait_task(str(progress.get("task_id") or ""))
                     progress["phase"] = "next"
                     self.store.save_progress(job.id, progress)
+                results.append({"vm_id": vm_ids[index], "ok": True, "skipped": not bool(progress.get("task_id"))})
+                index += 1
+                progress = {"index": index, "phase": "start", "task_id": "", "results": results}
+                self.store.save_progress(job.id, progress)
+            return {"results": results}
+
+        if kind == "rename":
+            spec = RenameVmRequest.model_validate(payload)
+            vm_id = str(payload.get("vm_id") or "").strip()
+            name = spec.name.strip()
+            if not vm_id:
+                raise PermanentError("vm_id is required")
+            task_id = str(progress.get("task_id") or "")
+            if not task_id:
+                task_id = adapter.rename_vm(vm_id, name) or ""
+                progress["task_id"] = task_id
+                self.store.save_progress(job.id, progress)
+            if task_id:
+                adapter.wait_task(task_id)
+            return {"vm_id": vm_id, "name": name}
+
+        if kind == "migrate":
+            spec = MigrateVmRequest.model_validate(payload)
+            vm_ids = list(spec.vm_ids)
+            folder_id = (spec.folder_id or "").strip()
+            index = int(progress.get("index") or 0)
+            results = list(progress.get("results") or [])
+            while index < len(vm_ids):
+                task_id = str(progress.get("task_id") or "")
+                phase = str(progress.get("phase") or "start")
+                did_work = bool(progress.get("did_work"))
+                if phase == "start":
+                    one = spec.model_copy(update={"vm_ids": [vm_ids[index]]})
+                    task_id = adapter.start_migrate(one) or ""
+                    progress["task_id"] = task_id
+                    progress["index"] = index
+                    progress["did_work"] = bool(task_id)
+                    progress["phase"] = "wait" if task_id else "folder"
+                    self.store.save_progress(job.id, progress)
+                    phase = progress["phase"]
+                    did_work = bool(progress.get("did_work"))
+                if phase == "wait":
+                    adapter.wait_task(str(progress.get("task_id") or ""))
+                    progress["task_id"] = ""
+                    progress["did_work"] = True
+                    progress["phase"] = "folder"
+                    self.store.save_progress(job.id, progress)
+                    phase = "folder"
+                    did_work = True
+                if phase == "folder":
+                    move_task = ""
+                    if folder_id:
+                        move_task = adapter.start_move_into_folder(vm_ids[index], folder_id) or ""
+                    progress["task_id"] = move_task
+                    if move_task:
+                        progress["did_work"] = True
+                        did_work = True
+                    progress["phase"] = "folder_wait" if move_task else "next"
+                    self.store.save_progress(job.id, progress)
+                    phase = progress["phase"]
+                if phase == "folder_wait":
+                    adapter.wait_task(str(progress.get("task_id") or ""))
+                    progress["did_work"] = True
+                    did_work = True
+                    progress["phase"] = "next"
+                    self.store.save_progress(job.id, progress)
                 results.append(
                     {
                         "vm_id": vm_ids[index],
                         "ok": True,
-                        "skipped": not bool(progress.get("task_id")),
+                        "skipped": not did_work,
                     }
                 )
                 index += 1
                 progress = {"index": index, "phase": "start", "task_id": "", "results": results}
                 self.store.save_progress(job.id, progress)
             return {"results": results}
+
+        if kind == "disk_convert":
+            plan = DiskConversionPlan.model_validate(payload.get("plan") or {})
+            fresh = adapter.disk_conversion_plan(
+                DiskConversionPlanRequest(vm_id=plan.vm_id, target=plan.target, method=plan.method)
+            )
+            if fresh.plan_token != plan.plan_token:
+                raise PermanentError("The VM changed after this disk plan was confirmed")
+            if not fresh.can_execute:
+                raise PermanentError("; ".join(fresh.blockers) or "Disk conversion is no longer safe")
+            if plan.method == "ssh":
+                def disk_progress(index: int, extra: dict) -> None:
+                    self.store.save_progress(job.id, dict(extra))
+
+                return adapter.execute_ssh_disk_conversion(fresh, on_progress=disk_progress)
+            task_id = str(progress.get("task_id") or "")
+            if not task_id:
+                task_id = adapter.start_migrate(
+                    MigrateVmRequest(
+                        vm_ids=[plan.vm_id],
+                        disk_provisioning=plan.target,
+                        confirm=True,
+                    )
+                )
+                if not task_id:
+                    raise PermanentError("ESXi did not start a disk relocation task")
+                progress.update({"task_id": task_id, "phase": "relocate"})
+                self.store.save_progress(job.id, progress)
+            adapter.wait_task(task_id)
+            return {"vm_id": plan.vm_id, "target": plan.target, "method": "soap", "task_id": task_id}
+
+        if kind == "host_action":
+            spec = HostActionRequest.model_validate(payload)
+            task_id = str(progress.get("task_id") or "")
+            if not task_id:
+                task_id = adapter.start_host_action(spec.action, spec.timeout_seconds)
+                progress.update({"task_id": task_id, "phase": "wait"})
+                self.store.save_progress(job.id, progress)
+            adapter.wait_task(task_id)
+            return {"action": spec.action, "task_id": task_id}
+
+        if kind == "host_service":
+            spec = HostServiceActionRequest.model_validate(payload)
+            return adapter.host_service_action(spec.service_key, spec.action, spec.policy)
+
+        if kind == "host_time":
+            spec = HostTimeRequest.model_validate(payload)
+            return adapter.configure_host_time(spec.ntp_servers, spec.sync_now)
+
+        if kind == "host_storage_rescan":
+            return adapter.rescan_storage()
+
+        if kind == "host_support_bundle":
+            task_id = str(progress.get("task_id") or "")
+            if not task_id:
+                task_id = adapter.start_support_bundle()
+                progress.update({"task_id": task_id, "phase": "collect"})
+                self.store.save_progress(job.id, progress)
+            result = adapter.wait_task(task_id)
+            bundles = []
+            for item in result or []:
+                bundles.append(
+                    {
+                        "url": str(getattr(item, "url", "") or ""),
+                        "error": str(getattr(item, "error", "") or ""),
+                    }
+                )
+            return {"task_id": task_id, "bundles": bundles}
 
         if kind == "mkdir":
             adapter.mkdir(payload["datastore_id"], payload["path"])

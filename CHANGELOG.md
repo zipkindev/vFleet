@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.10] — 2026-08-30
+
+fix: reject uploads to read-only datastores and PUT via ESXi
+
+- 50 files changed, 6316 insertions(+), 863 deletions(-) · .env.example, AGENTS.md, AGENT_PROJECT_INDEX.md, README.md, backend/app/adapters/__init__.py, backend/app/adapters/base.py, …
+
 ## [1.0.9] — 2026-08-19
 
 fix: stream ISO uploads and keep saved vCenter passwords
