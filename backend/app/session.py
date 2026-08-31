@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
+
+from dotenv import dotenv_values
 
 from .config import ROOT, Settings
 
@@ -51,11 +54,23 @@ def upsert_env(path: Path, updates: Dict[str, str]) -> None:
             lines.append("")
         for key, value in remaining.items():
             lines.append(f"{key}={quote_env_value(value)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def resolve_login_password(provided: str, host: str, user: str, port: int, settings: Settings) -> str:
@@ -100,23 +115,8 @@ def persist_vcenter(
     ssh_port: int = 22,
     ssh_host_key_sha256: str = "",
 ) -> None:
-    upsert_env(
-        ROOT / ".env",
-        {
-            "APP_MODE": "auto",
-            "VCENTER_HOST": host,
-            "VCENTER_USER": user,
-            "VCENTER_PASSWORD": password,
-            "VCENTER_PORT": str(port),
-            "VCENTER_INSECURE": "true" if insecure else "false",
-            "ESXI_SSH_ENABLED": "true" if ssh_enabled else "false",
-            "ESXI_SSH_USER": ssh_user,
-            "ESXI_SSH_PASSWORD": ssh_password,
-            "ESXI_SSH_PORT": str(ssh_port),
-            "ESXI_SSH_HOST_KEY_SHA256": ssh_host_key_sha256,
-        },
-    )
-    settings.app_mode = "auto"
+    """Apply a saved connection in memory without persisting secrets to .env."""
+    settings.app_mode = endpoint_kind if endpoint_kind in {"vcenter", "esxi"} else "auto"
     settings.vcenter_host = host
     settings.vcenter_user = user
     settings.vcenter_password = password
@@ -127,6 +127,41 @@ def persist_vcenter(
     settings.esxi_ssh_password = ssh_password
     settings.esxi_ssh_port = ssh_port
     settings.esxi_ssh_host_key_sha256 = ssh_host_key_sha256
+
+
+def clear_legacy_env_secrets(
+    path: Path = ROOT / ".env",
+    *,
+    expected_host: Optional[str] = None,
+    expected_user: Optional[str] = None,
+    expected_port: Optional[int] = None,
+    expected_password: Optional[str] = None,
+    expected_ssh_password: Optional[str] = None,
+) -> None:
+    """Remove legacy plaintext secrets after they have been migrated to the vault."""
+    if not path.exists():
+        return
+    updates: Dict[str, str] = {}
+    if expected_host is None:
+        updates = {"VCENTER_PASSWORD": "", "ESXI_SSH_PASSWORD": ""}
+    else:
+        values = dotenv_values(path)
+        try:
+            env_port = int(str(values.get("VCENTER_PORT", "443") or "443"))
+        except ValueError:
+            env_port = 443
+        same_identity = (
+            str(values.get("VCENTER_HOST", "") or "").strip().lower() == expected_host.strip().lower()
+            and str(values.get("VCENTER_USER", "") or "").strip().lower()
+            == str(expected_user or "").strip().lower()
+            and env_port == (expected_port or 443)
+        )
+        if same_identity and str(values.get("VCENTER_PASSWORD", "") or "") == str(expected_password or ""):
+            updates["VCENTER_PASSWORD"] = ""
+        if same_identity and str(values.get("ESXI_SSH_PASSWORD", "") or "") == str(expected_ssh_password or ""):
+            updates["ESXI_SSH_PASSWORD"] = ""
+    if updates:
+        upsert_env(path, updates)
 
 
 def forget_vcenter(settings: Settings) -> None:

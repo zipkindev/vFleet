@@ -17,6 +17,7 @@ from .adapters.base import InventoryAdapter
 from .adapters.demo import DemoAdapter
 from .adapters.vcenter import VCenterAdapter
 from .config import settings
+from .credential_vault import CredentialVault
 from .models import (
     ActionRequest,
     ActionResponse,
@@ -64,6 +65,7 @@ from .power import normalize_power_state
 from .relay import RelayWorker
 from .session import (
     apply_runtime,
+    clear_legacy_env_secrets,
     forget_vcenter,
     parse_endpoint,
     persist_vcenter,
@@ -227,14 +229,56 @@ def _enqueue(request: Request, kind: str, title: str, payload: dict, idempotency
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = LocalStore(settings.data_dir / "vfleet.db")
-    profile_store = ConnectionProfileStore(settings.data_dir / "connections.json")
+    credential_vault = CredentialVault(
+        settings.data_dir / "credentials.enc.json",
+        key_file=settings.credential_key_file,
+        master_key=settings.vfleet_master_key.get_secret_value(),
+    )
+    profile_store = ConnectionProfileStore(settings.data_dir / "connections.json", credential_vault)
+    active_profile_id = ""
+    session_source = "demo"
+    if settings.has_vcenter_creds:
+        migrated_password = settings.vcenter_password
+        migrated_ssh_password = settings.esxi_ssh_password
+        active_profile_id = profile_store.import_settings(settings)
+        profile_store.set_active(active_profile_id)
+        clear_legacy_env_secrets(
+            expected_host=settings.vcenter_host,
+            expected_user=settings.vcenter_user,
+            expected_port=settings.vcenter_port,
+            expected_password=migrated_password,
+            expected_ssh_password=migrated_ssh_password,
+        )
+        session_source = "env-migrated"
+    elif settings.app_mode != "demo":
+        active_profile_id = profile_store.active_profile_id()
+        active_profile = profile_store.get(active_profile_id) if active_profile_id else None
+        if active_profile is not None and active_profile.password:
+            persist_vcenter(
+                settings,
+                active_profile.host,
+                active_profile.user,
+                active_profile.password,
+                active_profile.port,
+                active_profile.insecure,
+                endpoint_kind=active_profile.endpoint_kind,
+                ssh_enabled=active_profile.ssh_enabled,
+                ssh_user=active_profile.ssh_user,
+                ssh_password=active_profile.ssh_password,
+                ssh_port=active_profile.ssh_port,
+                ssh_host_key_sha256=active_profile.ssh_host_key_sha256,
+            )
+            session_source = "vault"
+        elif active_profile_id:
+            profile_store.set_active("")
+            active_profile_id = ""
     adapter = build_adapter(settings)
     app.state.store = store
     app.state.profile_store = profile_store
     app.state.adapter = adapter
-    app.state.session_source = "env" if settings.resolved_mode in {"vcenter", "esxi"} else "demo"
+    app.state.session_source = session_source if settings.resolved_mode in {"vcenter", "esxi"} else "demo"
     app.state.swap_lock = threading.Lock()
-    app.state.active_profile_id = profile_store.import_settings(settings) if settings.has_vcenter_creds else ""
+    app.state.active_profile_id = active_profile_id
     app.state.current_endpoint_fingerprint = "demo" if settings.resolved_mode == "demo" else ""
     worker = RelayWorker(settings, store, lambda: app.state.adapter)
     app.state.worker = worker
@@ -247,7 +291,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.17"
+APP_VERSION = "1.1.1"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -320,7 +364,11 @@ def connection_profiles(request: Request) -> ConnectionProfileList:
     active_profile_id = str(getattr(request.app.state, "active_profile_id", "") or "")
     summaries = [profile.summary(active_profile_id) for profile in profile_store.list()]
     summaries.sort(key=lambda item: (not item.active, item.name.lower(), item.host.lower()))
-    return ConnectionProfileList(profiles=summaries, active_profile_id=active_profile_id)
+    return ConnectionProfileList(
+        profiles=summaries,
+        active_profile_id=active_profile_id,
+        credential_storage=profile_store.vault.storage_label,
+    )
 
 
 @app.post(
@@ -481,20 +529,6 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     settings.esxi_ssh_port = body.ssh_port
     settings.esxi_ssh_host_key_sha256 = body.ssh_host_key_sha256
     if body.remember:
-        persist_vcenter(
-            settings,
-            endpoint,
-            user,
-            password,
-            port,
-            body.insecure,
-            endpoint_kind=info.endpoint_kind,
-            ssh_enabled=body.ssh_enabled,
-            ssh_user=ssh_user,
-            ssh_password=ssh_password,
-            ssh_port=body.ssh_port,
-            ssh_host_key_sha256=body.ssh_host_key_sha256,
-        )
         profile_id = saved_profile.id if saved_profile is not None else ""
         if not profile_id:
             existing = profile_store.find(endpoint, user, port)
@@ -517,9 +551,11 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
             last_used_at=datetime.now(timezone.utc).isoformat(),
         )
         profile_store.save(profile)
+        profile_store.set_active(profile.id)
         request.app.state.active_profile_id = profile.id
-        info.message = f"{info.message}. Saved on this machine for the next start."
+        info.message = f"{info.message}. Saved in the encrypted local credential vault."
     else:
+        profile_store.set_active("")
         request.app.state.active_profile_id = ""
         info.message = f"{info.message}. Connected for this server session only."
     request.app.state.worker.wake()
@@ -540,6 +576,7 @@ def logout(request: Request, body: Optional[LogoutRequest] = None) -> Connection
         if active_profile_id:
             request.app.state.profile_store.delete(active_profile_id)
         forget_vcenter(settings)
+    request.app.state.profile_store.set_active("")
     request.app.state.active_profile_id = ""
     request.app.state.current_endpoint_fingerprint = "demo"
     request.app.state.worker.wake()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     sync_interval_seconds: int = Field(default=30, ge=10, le=600)
     connect_timeout_seconds: int = Field(default=20, ge=5, le=120)
     upload_chunk_bytes: int = Field(default=4 * 1024 * 1024, ge=256 * 1024)
+
+    # Portable encrypted JSON credential vault. The key is kept outside DATA_DIR
+    # by default and can be injected by a service/container at runtime.
+    vfleet_master_key_file: str = ""
+    vfleet_master_key: SecretStr = SecretStr("")
+
+    @property
+    def credential_key_file(self) -> Path:
+        if self.vfleet_master_key_file.strip():
+            return Path(self.vfleet_master_key_file).expanduser()
+        return Path.home() / ".vfleet" / "credential.key"
 
     @field_validator("app_mode")
     @classmethod

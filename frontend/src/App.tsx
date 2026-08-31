@@ -1150,8 +1150,8 @@ const Overview = React.memo(function Overview({
             <div>
               <h2>Sign in to vSphere</h2>
               <p>
-                Add a vCenter or standalone ESXi hostname and account here. You can keep using demo data until you connect. Saving credentials
-                writes them into local <code>.env</code> so the next launch can reconnect.
+                Add a vCenter or standalone ESXi hostname and account here. You can keep using demo data until you connect. Saved credentials
+                are protected in a portable encrypted JSON vault with a separate master key.
               </p>
             </div>
             <button className="accent" onClick={onConnect}>

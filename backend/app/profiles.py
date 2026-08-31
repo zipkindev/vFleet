@@ -11,6 +11,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .credential_vault import CredentialVault
 from .models import ConnectionProfileSummary
 
 
@@ -23,7 +24,8 @@ class ConnectionProfile(BaseModel):
     name: str
     host: str
     user: str
-    password: str
+    password: str = ""
+    credential_id: str = ""
     port: int = 443
     insecure: bool = True
     endpoint_kind: str = "auto"
@@ -59,41 +61,107 @@ class ConnectionProfile(BaseModel):
 
 
 class ConnectionProfileStore:
-    """Owner-only local persistence for vCenter and standalone ESXi credentials."""
+    """Metadata-only profiles paired with a portable encrypted credential vault."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, vault: CredentialVault) -> None:
         self.path = path
-        self._lock = threading.Lock()
+        self.vault = vault
+        self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.path.parent.chmod(0o700)
         except OSError:
             pass
 
-    def _load_unlocked(self) -> List[ConnectionProfile]:
+    def _load_unlocked(self) -> tuple[List[ConnectionProfile], str]:
         if not self.path.exists():
-            return []
+            return [], ""
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            rows = payload.get("profiles", []) if isinstance(payload, dict) else []
-            return [ConnectionProfile.model_validate(row) for row in rows]
-        except (OSError, ValueError, TypeError):
-            return []
+            if not isinstance(payload, dict):
+                raise ValueError("profile document must be an object")
+            version = payload.get("version", 1)
+            if version not in {1, 2}:
+                raise ValueError(f"unsupported profile document version: {version}")
+            rows = payload.get("profiles", [])
+            if not isinstance(rows, list):
+                raise ValueError("profiles must be a list")
+            profiles = [ConnectionProfile.model_validate(row) for row in rows]
+            active_profile_id = str(payload.get("active_profile_id", "") or "")
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Could not read saved connection profiles: {exc}") from exc
 
-    def _save_unlocked(self, profiles: List[ConnectionProfile]) -> None:
-        payload = {"version": 1, "profiles": [profile.model_dump() for profile in profiles]}
+        legacy_credentials = {}
+        profile_ids = set()
+        credential_ids = set()
+        for profile in profiles:
+            if not profile.id or profile.id in profile_ids:
+                raise RuntimeError("Saved connection profile identifiers must be non-empty and unique")
+            profile_ids.add(profile.id)
+            profile.credential_id = profile.credential_id or profile.id
+            if profile.credential_id in credential_ids:
+                raise RuntimeError("Saved credential identifiers must be unique per connection profile")
+            credential_ids.add(profile.credential_id)
+            if profile.password or profile.ssh_password:
+                legacy_credentials[profile.credential_id] = {
+                    "password": profile.password,
+                    "ssh_password": profile.ssh_password,
+                }
+        if version == 1 or legacy_credentials:
+            if legacy_credentials:
+                self.vault.put_many(legacy_credentials)
+            self._save_unlocked(profiles, active_profile_id)
+
+        if profiles and version >= 2 and not self.vault.path.exists():
+            raise RuntimeError("Saved connection profiles exist but the encrypted credential vault is missing")
+
+        for profile in profiles:
+            credentials = self.vault.get(profile.credential_id)
+            profile.password = credentials["password"]
+            profile.ssh_password = credentials["ssh_password"]
+        return profiles, active_profile_id
+
+    def _save_unlocked(self, profiles: List[ConnectionProfile], active_profile_id: str) -> None:
+        rows = []
+        for profile in profiles:
+            profile.credential_id = profile.credential_id or profile.id
+            rows.append(profile.model_dump(exclude={"password", "ssh_password"}))
+        payload = {"version": 2, "active_profile_id": active_profile_id, "profiles": rows}
         temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
-        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        temporary.chmod(0o600)
-        os.replace(temporary, self.path)
         try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.chmod(0o600)
+            os.replace(temporary, self.path)
+            try:
+                self.path.chmod(0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def list(self) -> List[ConnectionProfile]:
         with self._lock:
-            return self._load_unlocked()
+            profiles, _ = self._load_unlocked()
+            return profiles
+
+    def active_profile_id(self) -> str:
+        with self._lock:
+            _, active_profile_id = self._load_unlocked()
+            return active_profile_id
+
+    def set_active(self, profile_id: str) -> None:
+        with self._lock:
+            profiles, _ = self._load_unlocked()
+            if profile_id and not any(profile.id == profile_id for profile in profiles):
+                raise ValueError("Unknown connection profile")
+            self._save_unlocked(profiles, profile_id)
 
     def get(self, profile_id: str) -> Optional[ConnectionProfile]:
         return next((profile for profile in self.list() if profile.id == profile_id), None)
@@ -112,8 +180,9 @@ class ConnectionProfileStore:
 
     def save(self, profile: ConnectionProfile) -> ConnectionProfile:
         with self._lock:
-            profiles = self._load_unlocked()
+            profiles, active_profile_id = self._load_unlocked()
             now = _now_iso()
+            profile.credential_id = profile.credential_id or profile.id
             for index, current in enumerate(profiles):
                 if current.id == profile.id:
                     profile.created_at = current.created_at
@@ -124,16 +193,20 @@ class ConnectionProfileStore:
                 profile.created_at = now
                 profile.updated_at = now
                 profiles.append(profile)
-            self._save_unlocked(profiles)
+            self.vault.put(profile.credential_id, profile.password, profile.ssh_password)
+            self._save_unlocked(profiles, active_profile_id)
         return profile
 
     def delete(self, profile_id: str) -> bool:
         with self._lock:
-            profiles = self._load_unlocked()
+            profiles, active_profile_id = self._load_unlocked()
+            removed = next((profile for profile in profiles if profile.id == profile_id), None)
             remaining = [profile for profile in profiles if profile.id != profile_id]
-            if len(remaining) == len(profiles):
+            if removed is None:
                 return False
-            self._save_unlocked(remaining)
+            next_active = "" if active_profile_id == profile_id else active_profile_id
+            self._save_unlocked(remaining, next_active)
+            self.vault.delete(removed.credential_id or removed.id)
             return True
 
     def mark_connected(self, profile_id: str, endpoint_kind: str, endpoint_fingerprint: str) -> None:

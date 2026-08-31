@@ -2,7 +2,7 @@
 
 A local web console for **your** vCenter or standalone ESXi host: inventory clusters/hosts/VMs, group labs by naming convention, report resource use by owner, and run guarded operator workflows.
 
-This talks to vCenter with credentials **you** put in `.env`. It is an operator tool, not a scanner for systems you do not administer.
+This talks only to endpoints you configure. UI-saved credentials live in vFleet's portable encrypted JSON vault; `.env` is retained as an explicit bootstrap option. It is an operator tool, not a scanner for systems you do not administer.
 
 ## What is possible
 
@@ -67,14 +67,16 @@ Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a 
 The connection card in the left rail opens a searchable drawer of saved vCenter and standalone ESXi endpoints. Add, edit, switch, or remove profiles there; vFleet detects the endpoint type after connecting and exposes only the supported controls.
 
 - **Test** detects and reports the endpoint without saving credentials or switching away from the current session.
-- **Connect & save** tests first, stores the profile in an owner-only `data/connections.json`, mirrors the active profile to the gitignored local `.env` for startup compatibility, and switches to live inventory.
+- **Connect & save** tests first, stores non-secret profile metadata in `data/connections.json`, encrypts passwords in `data/credentials.enc.json`, and switches to live inventory.
 - Profile API responses never include passwords. A blank password while editing reuses the retained secret only when the saved endpoint, user, and port still match.
 - Switching is refused while queued or running work is bound to the current endpoint.
 - **Stay in demo** closes the dialog. **Disconnect** / **Forget saved credentials** are in the rail after you connect.
 
 The Jobs view is scoped to the current endpoint fingerprint. Completed history from other profiles stays hidden until that profile is selected. Queued/retrying jobs can be cancelled; terminal rows can be removed individually or cleared together without deleting active work.
 
-`.env` still works if you prefer to pre-fill values before start.
+The credential vault uses AES-256-GCM with a unique nonce and profile-bound authenticated data for every saved connection. Its randomly generated master key defaults to `~/.vfleet/credential.key`, outside the repository and `DATA_DIR`. Override that portable path with `VFLEET_MASTER_KEY_FILE`; service deployments should mount the key separately. `VFLEET_MASTER_KEY` can inject a base64-encoded 32-byte key directly into the process environment.
+
+Legacy plaintext profiles and `.env` passwords are migrated automatically after the encrypted records are written successfully. `.env` remains an explicit bootstrap/development input, but UI-created connections never write secrets into it.
 
 ## Connect your vCenter via `.env`
 
@@ -89,7 +91,7 @@ VCENTER_PASSWORD=...
 VCENTER_INSECURE=true
 ```
 
-3. Restart `./scripts/dev.sh`. `APP_MODE=auto` uses vCenter whenever host/user/password are set, otherwise demo.
+3. Restart `./scripts/dev.sh`. On the first successful start, vFleet imports the connection into the encrypted vault and clears the plaintext password fields from `.env`.
 
 For a standalone host, use the same variables with its management address and an ESXi account. Optional SSH fallback settings are documented in `.env.example`; leave `ESXI_SSH_ENABLED=false` unless you specifically need it.
 
@@ -109,7 +111,7 @@ scripts/vfleet job JOB_ID --wait
 
 Host lifecycle, service, NTP, storage-rescan, and support-bundle commands are listed by `scripts/vfleet --help`. Mutating commands require an interactive `yes` or `--yes`. Override the local endpoint with `VFLEET_API_URL`; use `VFLEET_UI_TOKEN` when the API is protected.
 
-Keep `.env` off git. Use a dedicated service account with least privilege:
+Keep `.env`, the encrypted vault, and especially the separate master key off git. Back up the key separately: losing it makes saved credentials unrecoverable. Use a dedicated service account with least privilege:
 
 - Read-only on datacenters/clusters/hosts/VMs for inventory
 - Virtual machine **Interaction** (power on/off/reset/console) only if you want actions enabled

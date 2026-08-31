@@ -4,7 +4,14 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import app
-from app.session import parse_endpoint, quote_env_value, resolve_login_password, resolve_ssh_password, upsert_env
+from app.session import (
+    clear_legacy_env_secrets,
+    parse_endpoint,
+    quote_env_value,
+    resolve_login_password,
+    resolve_ssh_password,
+    upsert_env,
+)
 
 
 def test_parse_endpoint_strips_scheme_and_port():
@@ -20,6 +27,39 @@ def test_upsert_env_quotes_password(tmp_path: Path):
     assert "VCENTER_HOST=vc.example" in text
     assert "VCENTER_PASSWORD=" + quote_env_value("p@ss#word") in text
     assert "APP_MODE=demo" in text
+
+
+def test_clear_legacy_env_secrets_preserves_non_secret_configuration(tmp_path: Path):
+    path = tmp_path / ".env"
+    path.write_text(
+        "APP_MODE=auto\nVCENTER_HOST=vc.example\nVCENTER_PASSWORD=plain\nESXI_SSH_PASSWORD=ssh-plain\n",
+        encoding="utf-8",
+    )
+
+    clear_legacy_env_secrets(path)
+
+    text = path.read_text(encoding="utf-8")
+    assert "VCENTER_HOST=vc.example" in text
+    assert 'VCENTER_PASSWORD=""\n' in text
+    assert 'ESXI_SSH_PASSWORD=""\n' in text
+    assert "plain" not in text
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_clear_legacy_env_secrets_does_not_clear_a_different_env_profile(tmp_path: Path):
+    path = tmp_path / ".env"
+    original = "VCENTER_HOST=vc.file\nVCENTER_USER=file-user\nVCENTER_PASSWORD=file-secret\n"
+    path.write_text(original, encoding="utf-8")
+
+    clear_legacy_env_secrets(
+        path,
+        expected_host="vc.process",
+        expected_user="process-user",
+        expected_port=443,
+        expected_password="process-secret",
+    )
+
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_resolve_login_password_reuses_saved_secret():

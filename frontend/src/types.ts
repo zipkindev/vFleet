@@ -60,6 +60,7 @@ export type ConnectionProfile = {
 export type ConnectionProfileList = {
   profiles: ConnectionProfile[];
   active_profile_id: string;
+  credential_storage: string;
 };
 
 export type HostSummary = {

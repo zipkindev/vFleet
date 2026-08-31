@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.1] — 2026-08-31
+
+feat: encrypt saved connection credentials in a portable JSON vault
+
+- Stores only non-secret endpoint metadata in `connections.json`.
+- Protects vSphere and SSH passwords with per-profile AES-256-GCM records in `credentials.enc.json`.
+- Keeps the generated master key outside the repository and supports service-injected key files or environment keys.
+- Migrates legacy plaintext profiles and `.env` secrets after verified encrypted storage.
+- Persists the active profile without copying credentials back into `.env`.
+
 ## [1.0.17] — 2026-08-31
 
 fix: default direct ESXi disk conversion to SSH

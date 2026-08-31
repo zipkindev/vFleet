@@ -13,3 +13,4 @@ os.environ["DATA_DIR"] = str(_TEST_DATA)
 os.environ["VCENTER_HOST"] = ""
 os.environ["VCENTER_USER"] = ""
 os.environ["VCENTER_PASSWORD"] = ""
+os.environ["VFLEET_MASTER_KEY_FILE"] = str(_TEST_DATA / "credential.key")

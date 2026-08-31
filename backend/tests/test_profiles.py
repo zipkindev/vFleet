@@ -1,13 +1,23 @@
+import json
 from pathlib import Path
 
 from app.config import Settings
+from app.credential_vault import CredentialVault
 from app.profiles import ConnectionProfile, ConnectionProfileStore
 from app.store import LocalStore
 
 
-def test_connection_profiles_persist_secrets_but_never_return_them_in_summary(tmp_path: Path):
+def profile_store(tmp_path: Path) -> ConnectionProfileStore:
+    vault = CredentialVault(
+        tmp_path / "credentials.enc.json",
+        key_file=tmp_path / "secrets" / "credential.key",
+    )
+    return ConnectionProfileStore(tmp_path / "connections.json", vault)
+
+
+def test_connection_profiles_encrypt_secrets_and_never_return_them_in_summary(tmp_path: Path):
     path = tmp_path / "connections.json"
-    store = ConnectionProfileStore(path)
+    store = profile_store(tmp_path)
     saved = store.save(
         ConnectionProfile(
             name="Lab ESXi",
@@ -23,7 +33,7 @@ def test_connection_profiles_persist_secrets_but_never_return_them_in_summary(tm
         )
     )
 
-    reloaded = ConnectionProfileStore(path).get(saved.id)
+    reloaded = profile_store(tmp_path).get(saved.id)
     assert reloaded is not None
     assert reloaded.password == "endpoint-secret"
     assert reloaded.ssh_password == "ssh-secret"
@@ -34,10 +44,18 @@ def test_connection_profiles_persist_secrets_but_never_return_them_in_summary(tm
     assert summary["has_saved_ssh_password"] is True
     assert summary["active"] is True
     assert path.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "credentials.enc.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "secrets" / "credential.key").stat().st_mode & 0o777 == 0o600
+    metadata = path.read_text(encoding="utf-8")
+    encrypted = (tmp_path / "credentials.enc.json").read_text(encoding="utf-8")
+    assert "endpoint-secret" not in metadata
+    assert "ssh-secret" not in metadata
+    assert "endpoint-secret" not in encrypted
+    assert "ssh-secret" not in encrypted
 
 
 def test_import_settings_keeps_multiple_endpoints_and_deduplicates_identity(tmp_path: Path):
-    store = ConnectionProfileStore(tmp_path / "connections.json")
+    store = profile_store(tmp_path)
     first = Settings(vcenter_host="vc.one", vcenter_user="admin", vcenter_password="one", vcenter_port=443)
     second = Settings(vcenter_host="esxi.two", vcenter_user="root", vcenter_password="two", vcenter_port=443)
 
@@ -46,6 +64,45 @@ def test_import_settings_keeps_multiple_endpoints_and_deduplicates_identity(tmp_
     second_id = store.import_settings(second)
     assert second_id != first_id
     assert {profile.host for profile in store.list()} == {"vc.one", "esxi.two"}
+
+
+def test_legacy_plaintext_profile_is_migrated_atomically(tmp_path: Path):
+    path = tmp_path / "connections.json"
+    legacy = ConnectionProfile(
+        id="legacy-profile",
+        name="Legacy",
+        host="legacy.example",
+        user="administrator",
+        password="legacy-password",
+        ssh_password="legacy-ssh-password",
+    )
+    path.write_text(json.dumps({"version": 1, "profiles": [legacy.model_dump()]}), encoding="utf-8")
+
+    store = profile_store(tmp_path)
+    migrated = store.get("legacy-profile")
+
+    assert migrated is not None
+    assert migrated.password == "legacy-password"
+    assert migrated.ssh_password == "legacy-ssh-password"
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    assert metadata["version"] == 2
+    assert "password" not in metadata["profiles"][0]
+    assert "ssh_password" not in metadata["profiles"][0]
+
+
+def test_active_profile_and_credential_deletion_are_persistent(tmp_path: Path):
+    store = profile_store(tmp_path)
+    saved = store.save(
+        ConnectionProfile(name="Lab", host="lab.example", user="root", password="secret")
+    )
+    store.set_active(saved.id)
+    assert profile_store(tmp_path).active_profile_id() == saved.id
+
+    store.set_active("")
+    assert store.delete(saved.id) is True
+    assert store.get(saved.id) is None
+    vault_payload = json.loads((tmp_path / "credentials.enc.json").read_text(encoding="utf-8"))
+    assert vault_payload["records"] == {}
 
 
 def test_job_history_is_scoped_and_only_terminal_rows_are_cleared(tmp_path: Path):

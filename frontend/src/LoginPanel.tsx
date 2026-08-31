@@ -106,7 +106,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
         <h2>{profile ? "Edit connection" : "Add vSphere connection"}</h2>
         <p>
           Enter either a vCenter Server or a standalone ESXi host. vFleet detects which one it is.
-          Test does not save or switch connections; Connect retains this profile locally and makes it active.
+          Test does not save or switch connections; Connect encrypts this profile locally and makes it active.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
         {ok ? <div className="banner ok">{ok}</div> : null}

@@ -148,7 +148,7 @@ export function ConnectionSwitcher({
               <button className="accent wide" onClick={() => { setOpen(false); onAdd(); }}>
                 Add connection
               </button>
-              <small>Credentials stay in an owner-only, gitignored file on this machine.</small>
+              <small>{profiles?.credential_storage || "Encrypted credential storage"}. The master key is stored separately.</small>
             </footer>
           </aside>
         </div>

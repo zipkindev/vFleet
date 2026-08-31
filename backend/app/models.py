@@ -66,6 +66,7 @@ class ConnectionProfileSummary(BaseModel):
 class ConnectionProfileList(BaseModel):
     profiles: List[ConnectionProfileSummary] = Field(default_factory=list)
     active_profile_id: str = ""
+    credential_storage: str = ""
 
 
 class ProfileDeleteRequest(BaseModel):
