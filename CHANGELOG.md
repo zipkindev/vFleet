@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2] — 2026-08-31
+
+fix: delete VMDKs through the safe virtual-disk manager
+
+- Routes `.vmdk` cleanup through vSphere's virtual-disk API so descriptor and extent files are removed together.
+- Fails closed when an endpoint cannot provide safe virtual-disk deletion instead of falling back to raw datastore-file removal.
+
 ## [1.1.1] — 2026-08-31
 
 feat: encrypt saved connection credentials in a portable JSON vault

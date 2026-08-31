@@ -2129,7 +2129,15 @@ class VCenterAdapter(InventoryAdapter):
         datastore = self._obj(vim.Datastore, datastore_id)
         datacenter = self._find_datacenter(datastore)
         name = f"[{datastore.name}] {path.strip('/')}"
-        task = self._session().content.fileManager.DeleteDatastoreFile_Task(name=name, datacenter=datacenter)
+        content = self._session().content
+        if path.lower().endswith(".vmdk"):
+            manager = getattr(content, "virtualDiskManager", None)
+            delete_disk = getattr(manager, "DeleteVirtualDisk_Task", None)
+            if not callable(delete_disk):
+                raise PermanentError("This endpoint does not expose safe virtual-disk deletion")
+            task = delete_disk(name=name, datacenter=datacenter)
+        else:
+            task = content.fileManager.DeleteDatastoreFile_Task(name=name, datacenter=datacenter)
         self.wait_task(_moid(task))
 
     def stat_file(self, datastore_id: str, path: str) -> Optional[int]:
