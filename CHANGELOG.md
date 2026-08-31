@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.11] — 2026-08-30
+
+feat: add direct ESXi management and automation
+
+- 1 file changed, 58 insertions(+), 1 deletion(-) · frontend/src/styles.css
+
 ## [1.0.10] — 2026-08-30
 
 fix: reject uploads to read-only datastores and PUT via ESXi

@@ -2138,4 +2138,61 @@ tr.clickable:hover td {
 .button-grid { align-items: stretch; }
 .button-grid button { flex: 1 1 150px; }
 .host-admin .panel > label { display: grid; gap: 0.4rem; margin-bottom: 0.75rem; }
-.inline-actions button { padding: 0.35rem 0.55rem; }
+
+/* Host controls must not fall back to the browser's light button/input theme. */
+.host-admin button {
+  appearance: none;
+  min-height: 38px;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.host-admin button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-2));
+}
+
+.host-admin button:focus-visible,
+.host-admin input:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 2px;
+}
+
+.host-admin button.accent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.host-admin button.danger:not(:disabled) {
+  background: color-mix(in srgb, var(--hot) 65%, var(--bg));
+  border-color: color-mix(in srgb, var(--hot) 78%, var(--line));
+  color: #fff;
+}
+
+.host-admin button:disabled {
+  background: color-mix(in srgb, var(--muted) 18%, var(--panel));
+  border-color: color-mix(in srgb, var(--muted) 38%, var(--line));
+  color: color-mix(in srgb, var(--muted) 72%, var(--ink));
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.host-admin input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--ink);
+}
+
+.host-admin input::placeholder { color: var(--muted); opacity: 1; }
+.inline-actions button { min-height: 34px; padding: 0.35rem 0.65rem; }
