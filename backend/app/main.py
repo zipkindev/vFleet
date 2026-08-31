@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -23,6 +24,7 @@ from .models import (
     Catalog,
     CloneVmRequest,
     ConnectionInfo,
+    ConnectionProfileList,
     ConsoleTicket,
     ConsoleTicketRequest,
     DatastoreListing,
@@ -35,9 +37,11 @@ from .models import (
     CloneMigrateRequest,
     InventorySnapshot,
     Job,
+    JobHistoryClearRequest,
     JobList,
     LoginRequest,
     LogoutRequest,
+    ProfileDeleteRequest,
     MetricsResponse,
     MigrateVmRequest,
     GrantMigrationRequest,
@@ -67,6 +71,7 @@ from .session import (
     resolve_ssh_password,
 )
 from .store import LocalStore
+from .profiles import ConnectionProfile, ConnectionProfileStore
 from .vm_storage import normalize_disk_transform
 from .errors import PermanentError
 
@@ -104,9 +109,33 @@ def _source(request: Request) -> str:
     return getattr(request.app.state, "session_source", "demo")
 
 
+def _current_endpoint_fingerprint(request: Request) -> str:
+    fingerprint = str(getattr(request.app.state, "current_endpoint_fingerprint", "") or "")
+    if fingerprint:
+        return fingerprint
+    adapter: InventoryAdapter = request.app.state.adapter
+    try:
+        connection = adapter.connection()
+        fingerprint = connection.endpoint_fingerprint
+    except Exception:
+        fingerprint = ""
+    if not fingerprint:
+        cached = request.app.state.store.load_inventory()
+        fingerprint = cached.connection.endpoint_fingerprint if cached is not None else ""
+    request.app.state.current_endpoint_fingerprint = fingerprint
+    return fingerprint
+
+
 def decorate_connection(conn: ConnectionInfo, request: Request) -> ConnectionInfo:
     worker: RelayWorker = request.app.state.worker
     decorated = worker.overlay(conn)
+    active_profile_id = str(getattr(request.app.state, "active_profile_id", "") or "")
+    if decorated.endpoint_fingerprint:
+        request.app.state.current_endpoint_fingerprint = decorated.endpoint_fingerprint
+        if active_profile_id:
+            request.app.state.profile_store.mark_connected(
+                active_profile_id, decorated.endpoint_kind, decorated.endpoint_fingerprint
+            )
     return decorated.model_copy(
         update={
             "source": _source(request),
@@ -120,6 +149,7 @@ def decorate_connection(conn: ConnectionInfo, request: Request) -> ConnectionInf
             "ssh_port": settings.esxi_ssh_port,
             "ssh_host_key_sha256": settings.esxi_ssh_host_key_sha256,
             "has_saved_ssh_password": bool(settings.esxi_ssh_password),
+            "active_profile_id": active_profile_id,
             "can_disconnect": conn.mode in {"vcenter", "esxi"},
         }
     )
@@ -197,11 +227,15 @@ def _enqueue(request: Request, kind: str, title: str, payload: dict, idempotency
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = LocalStore(settings.data_dir / "vfleet.db")
+    profile_store = ConnectionProfileStore(settings.data_dir / "connections.json")
     adapter = build_adapter(settings)
     app.state.store = store
+    app.state.profile_store = profile_store
     app.state.adapter = adapter
     app.state.session_source = "env" if settings.resolved_mode in {"vcenter", "esxi"} else "demo"
     app.state.swap_lock = threading.Lock()
+    app.state.active_profile_id = profile_store.import_settings(settings) if settings.has_vcenter_creds else ""
+    app.state.current_endpoint_fingerprint = "demo" if settings.resolved_mode == "demo" else ""
     worker = RelayWorker(settings, store, lambda: app.state.adapter)
     app.state.worker = worker
     worker.start()
@@ -213,7 +247,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.0.14"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -280,6 +314,57 @@ def connection(request: Request, adapter: InventoryAdapter = Depends(get_adapter
     return decorate_connection(info, request)
 
 
+@app.get("/api/connection-profiles", response_model=ConnectionProfileList, dependencies=[Depends(require_token)])
+def connection_profiles(request: Request) -> ConnectionProfileList:
+    profile_store: ConnectionProfileStore = request.app.state.profile_store
+    active_profile_id = str(getattr(request.app.state, "active_profile_id", "") or "")
+    summaries = [profile.summary(active_profile_id) for profile in profile_store.list()]
+    summaries.sort(key=lambda item: (not item.active, item.name.lower(), item.host.lower()))
+    return ConnectionProfileList(profiles=summaries, active_profile_id=active_profile_id)
+
+
+@app.post(
+    "/api/connection-profiles/{profile_id}/connect",
+    response_model=ConnectionInfo,
+    dependencies=[Depends(require_token)],
+)
+def connect_profile(profile_id: str, request: Request) -> ConnectionInfo:
+    profile = request.app.state.profile_store.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Unknown connection profile")
+    return login(
+        LoginRequest(
+            host=profile.host,
+            user=profile.user,
+            password=profile.password,
+            port=profile.port,
+            insecure=profile.insecure,
+            remember=True,
+            connect=True,
+            endpoint_kind=profile.endpoint_kind,
+            ssh_enabled=profile.ssh_enabled,
+            ssh_user=profile.ssh_user,
+            ssh_password=profile.ssh_password,
+            ssh_port=profile.ssh_port,
+            ssh_host_key_sha256=profile.ssh_host_key_sha256,
+            profile_id=profile.id,
+            profile_name=profile.name,
+        ),
+        request,
+    )
+
+
+@app.delete("/api/connection-profiles/{profile_id}", dependencies=[Depends(require_token)])
+def delete_connection_profile(profile_id: str, body: ProfileDeleteRequest, request: Request) -> dict:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Profile removal requires confirm=true")
+    if profile_id == str(getattr(request.app.state, "active_profile_id", "") or ""):
+        raise HTTPException(status_code=409, detail="Work offline or switch connections before removing the active profile")
+    if not request.app.state.profile_store.delete(profile_id):
+        raise HTTPException(status_code=404, detail="Unknown connection profile")
+    return {"deleted": True, "profile_id": profile_id}
+
+
 @app.post("/api/login", response_model=ConnectionInfo, dependencies=[Depends(require_token)])
 def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     host = body.host.strip()
@@ -290,12 +375,33 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         endpoint, port = parse_endpoint(host, body.port)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    password = resolve_login_password(body.password or "", endpoint, user, port, settings)
+    profile_store: ConnectionProfileStore = request.app.state.profile_store
+    saved_profile = profile_store.get(body.profile_id) if body.profile_id else None
+    if body.profile_id and saved_profile is None:
+        raise HTTPException(status_code=404, detail="Unknown connection profile")
+    matching_profile = bool(
+        saved_profile
+        and saved_profile.host.lower() == endpoint.lower()
+        and saved_profile.user.lower() == user.lower()
+        and saved_profile.port == port
+    )
+    password = body.password or (saved_profile.password if matching_profile and saved_profile else "")
+    password = resolve_login_password(password, endpoint, user, port, settings)
     if not password:
         raise HTTPException(status_code=400, detail="Host, username, and password are required")
     ssh_user = body.ssh_user.strip()
+    saved_ssh_password = ""
+    if (
+        matching_profile
+        and saved_profile
+        and saved_profile.ssh_user == ssh_user
+        and saved_profile.ssh_port == body.ssh_port
+    ):
+        saved_ssh_password = saved_profile.ssh_password
     ssh_password = (
-        resolve_ssh_password(body.ssh_password or "", endpoint, ssh_user, body.ssh_port, settings)
+        resolve_ssh_password(
+            body.ssh_password or saved_ssh_password, endpoint, ssh_user, body.ssh_port, settings
+        )
         if body.ssh_enabled
         else ""
     )
@@ -345,7 +451,8 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         )
 
     current = request.app.state.adapter.connection()
-    if current.endpoint_fingerprint and current.endpoint_fingerprint != info.endpoint_fingerprint:
+    current_fingerprint = current.endpoint_fingerprint or _current_endpoint_fingerprint(request)
+    if current_fingerprint and current_fingerprint != info.endpoint_fingerprint:
         open_jobs = request.app.state.store.open_jobs()
         if open_jobs:
             _close(candidate)
@@ -360,6 +467,7 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         request.app.state.session_source = "ui"
         _close(previous)
         request.app.state.store.clear_runtime_cache()
+        request.app.state.current_endpoint_fingerprint = info.endpoint_fingerprint
 
     settings.app_mode = info.endpoint_kind
     settings.vcenter_host = endpoint
@@ -387,8 +495,32 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
             ssh_port=body.ssh_port,
             ssh_host_key_sha256=body.ssh_host_key_sha256,
         )
+        profile_id = saved_profile.id if saved_profile is not None else ""
+        if not profile_id:
+            existing = profile_store.find(endpoint, user, port)
+            profile_id = existing.id if existing is not None else ""
+        profile = ConnectionProfile(
+            id=profile_id or str(uuid.uuid4()),
+            name=body.profile_name.strip() or (saved_profile.name if saved_profile else "") or endpoint,
+            host=endpoint,
+            user=user,
+            password=password,
+            port=port,
+            insecure=body.insecure,
+            endpoint_kind=info.endpoint_kind,
+            endpoint_fingerprint=info.endpoint_fingerprint,
+            ssh_enabled=body.ssh_enabled,
+            ssh_user=ssh_user,
+            ssh_password=ssh_password,
+            ssh_port=body.ssh_port,
+            ssh_host_key_sha256=body.ssh_host_key_sha256,
+            last_used_at=datetime.now(timezone.utc).isoformat(),
+        )
+        profile_store.save(profile)
+        request.app.state.active_profile_id = profile.id
         info.message = f"{info.message}. Saved on this machine for the next start."
     else:
+        request.app.state.active_profile_id = ""
         info.message = f"{info.message}. Connected for this server session only."
     request.app.state.worker.wake()
     return decorate_connection(info, request)
@@ -404,7 +536,12 @@ def logout(request: Request, body: Optional[LogoutRequest] = None) -> Connection
         _close(previous)
         request.app.state.store.clear_runtime_cache()
     if payload.forget:
+        active_profile_id = str(getattr(request.app.state, "active_profile_id", "") or "")
+        if active_profile_id:
+            request.app.state.profile_store.delete(active_profile_id)
         forget_vcenter(settings)
+    request.app.state.active_profile_id = ""
+    request.app.state.current_endpoint_fingerprint = "demo"
     request.app.state.worker.wake()
     return decorate_connection(request.app.state.adapter.connection(), request)
 
@@ -990,22 +1127,47 @@ def uploads(body: UploadRequest, request: Request, store: LocalStore = Depends(g
 
 
 @app.get("/api/jobs", response_model=JobList, dependencies=[Depends(require_token)])
-def jobs(store: LocalStore = Depends(get_store)) -> JobList:
-    rows = store.list_jobs()
-    counts = store.counts()
-    return JobList(jobs=rows, queued=counts["queued"], active=counts["active"])
+def jobs(request: Request, store: LocalStore = Depends(get_store)) -> JobList:
+    fingerprint = _current_endpoint_fingerprint(request)
+    rows = store.list_jobs(endpoint_fingerprint=fingerprint)
+    counts = store.counts(endpoint_fingerprint=fingerprint)
+    hidden = max(0, store.job_count() - store.job_count(fingerprint))
+    return JobList(
+        jobs=rows,
+        queued=counts["queued"],
+        active=counts["active"],
+        endpoint_fingerprint=fingerprint,
+        hidden_other_endpoints=hidden,
+    )
+
+
+@app.delete("/api/jobs/history", dependencies=[Depends(require_token)])
+def clear_job_history(body: JobHistoryClearRequest, request: Request) -> dict:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Clearing job history requires confirm=true")
+    fingerprint = _current_endpoint_fingerprint(request)
+    if not fingerprint:
+        raise HTTPException(status_code=409, detail="No active endpoint is available for scoped cleanup")
+    if body.other_endpoints:
+        deleted = request.app.state.store.clear_other_job_history(fingerprint)
+    else:
+        deleted = request.app.state.store.clear_job_history(fingerprint)
+    return {"deleted": deleted, "endpoint_fingerprint": "other" if body.other_endpoints else fingerprint}
 
 
 @app.get("/api/jobs/{job_id}", response_model=Job, dependencies=[Depends(require_token)])
-def job_detail(job_id: str, store: LocalStore = Depends(get_store)) -> Job:
+def job_detail(job_id: str, request: Request, store: LocalStore = Depends(get_store)) -> Job:
     job = store.get(job_id)
-    if job is None:
+    if job is None or str(job.payload.get("_endpoint_fingerprint") or "") != _current_endpoint_fingerprint(request):
         raise HTTPException(status_code=404, detail="Unknown job")
     return job
 
 
 @app.post("/api/jobs/{job_id}/cancel", response_model=Job, dependencies=[Depends(require_token)])
-def cancel_job(job_id: str, store: LocalStore = Depends(get_store)) -> Job:
+def cancel_job(job_id: str, request: Request, store: LocalStore = Depends(get_store)) -> Job:
+    existing = store.get(job_id)
+    if existing is None or str(existing.payload.get("_endpoint_fingerprint") or "") != _current_endpoint_fingerprint(request):
+        raise HTTPException(status_code=404, detail="Unknown job")
     job = store.cancel(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job")
@@ -1015,11 +1177,28 @@ def cancel_job(job_id: str, store: LocalStore = Depends(get_store)) -> Job:
 @app.post("/api/jobs/{job_id}/retry", response_model=Job, dependencies=[Depends(require_token)])
 def retry_job(job_id: str, request: Request) -> Job:
     store: LocalStore = request.app.state.store
+    existing = store.get(job_id)
+    if existing is None or str(existing.payload.get("_endpoint_fingerprint") or "") != _current_endpoint_fingerprint(request):
+        raise HTTPException(status_code=404, detail="Unknown job")
     job = store.requeue(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job")
     request.app.state.worker.wake()
     return job
+
+
+@app.delete("/api/jobs/{job_id}", dependencies=[Depends(require_token)])
+def delete_job(job_id: str, request: Request) -> dict:
+    store: LocalStore = request.app.state.store
+    existing = store.get(job_id)
+    fingerprint = _current_endpoint_fingerprint(request)
+    if existing is None or str(existing.payload.get("_endpoint_fingerprint") or "") != fingerprint:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    if existing.status not in {"succeeded", "failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="Only completed, failed, or cancelled jobs can be removed")
+    if not store.delete_terminal_job(job_id, fingerprint):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    return {"deleted": True, "job_id": job_id}
 
 
 @app.get("/api/migration-access", response_model=MigrationAccessStatus, dependencies=[Depends(require_token)])

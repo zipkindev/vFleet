@@ -62,13 +62,17 @@ chmod +x scripts/dev.sh scripts/run.sh
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a lab cluster with user-prefixed VM names so grouping and reclaim can be clicked through immediately.
 
-## Connect from the UI
+## Manage connections from the UI
 
-The left rail has **Connect to vSphere**. Enter either a vCenter address or a standalone ESXi host, username, and password.
+The connection card in the left rail opens a searchable drawer of saved vCenter and standalone ESXi endpoints. Add, edit, switch, or remove profiles there; vFleet detects the endpoint type after connecting and exposes only the supported controls.
 
 - **Test** detects and reports the endpoint without saving credentials or switching away from the current session.
-- **Connect & save** tests first, then writes host and credentials to the gitignored local `.env` and switches to live inventory.
+- **Connect & save** tests first, stores the profile in an owner-only `data/connections.json`, mirrors the active profile to the gitignored local `.env` for startup compatibility, and switches to live inventory.
+- Profile API responses never include passwords. A blank password while editing reuses the retained secret only when the saved endpoint, user, and port still match.
+- Switching is refused while queued or running work is bound to the current endpoint.
 - **Stay in demo** closes the dialog. **Disconnect** / **Forget saved credentials** are in the rail after you connect.
+
+The Jobs view is scoped to the current endpoint fingerprint. Completed history from other profiles stays hidden until that profile is selected. Queued/retrying jobs can be cancelled; terminal rows can be removed individually or cleared together without deleting active work.
 
 `.env` still works if you prefer to pre-fill values before start.
 

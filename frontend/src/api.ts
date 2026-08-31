@@ -3,6 +3,7 @@ import type {
   ActionResult,
   Catalog,
   ConnectionInfo,
+  ConnectionProfileList,
   ConsoleTicket,
   DatastoreListing,
   DiskConversionPlan,
@@ -84,6 +85,21 @@ export async function fetchConnection(): Promise<ConnectionInfo> {
   return request<ConnectionInfo>("/api/connection");
 }
 
+export async function fetchConnectionProfiles(): Promise<ConnectionProfileList> {
+  return request<ConnectionProfileList>("/api/connection-profiles");
+}
+
+export async function connectProfile(profileId: string): Promise<ConnectionInfo> {
+  return request<ConnectionInfo>(`/api/connection-profiles/${encodeURIComponent(profileId)}/connect`, { method: "POST" });
+}
+
+export async function deleteConnectionProfile(profileId: string): Promise<void> {
+  await request<{ deleted: boolean }>(`/api/connection-profiles/${encodeURIComponent(profileId)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirm: true }),
+  });
+}
+
 export async function login(body: {
   host: string;
   user: string;
@@ -98,6 +114,8 @@ export async function login(body: {
   ssh_password?: string;
   ssh_port?: number;
   ssh_host_key_sha256?: string;
+  profile_id?: string;
+  profile_name?: string;
 }): Promise<ConnectionInfo> {
   return request<ConnectionInfo>("/api/login", { method: "POST", body: JSON.stringify(body) });
 }
@@ -181,6 +199,18 @@ export async function cancelJob(jobId: string): Promise<Job> {
 
 export async function retryJob(jobId: string): Promise<Job> {
   return request<Job>(`/api/jobs/${jobId}/retry`, { method: "POST" });
+}
+
+export async function deleteJob(jobId: string): Promise<void> {
+  await request<{ deleted: boolean }>(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+}
+
+export async function clearJobHistory(otherEndpoints = false): Promise<number> {
+  const result = await request<{ deleted: number }>("/api/jobs/history", {
+    method: "DELETE",
+    body: JSON.stringify({ confirm: true, other_endpoints: otherEndpoints }),
+  });
+  return result.deleted;
 }
 
 export async function fetchMigrationAccess(clusterId = ""): Promise<MigrationAccessStatus> {

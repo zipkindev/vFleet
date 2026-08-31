@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { applyDrsOverride, fetchCatalog, fetchConnection, fetchConsoleTicket, fetchInventory, fetchJobs, launchExternalUri, logout, renameVm, runActions, setUiToken, vcenterVmConsoleUrl, VMRC_INSTALL_URL } from "./api";
+import { applyDrsOverride, connectProfile, deleteConnectionProfile, fetchCatalog, fetchConnection, fetchConnectionProfiles, fetchConsoleTicket, fetchInventory, fetchJobs, launchExternalUri, logout, renameVm, runActions, setUiToken, vcenterVmConsoleUrl, VMRC_INSTALL_URL } from "./api";
 import { BatchCount } from "./BatchCount";
 import { ChangelogModal } from "./ChangelogModal";
 import { BatchLimitDialog } from "./BatchLimitDialog";
@@ -11,6 +11,7 @@ import { downloadText, gib, bytes, powerLabel, powerClass, relTime, csvEscape, d
 import { JobsView } from "./JobsView";
 import { HostManagementView } from "./HostManagementView";
 import { LoginPanel } from "./LoginPanel";
+import { ConnectionSwitcher } from "./ConnectionSwitcher";
 import { MigrateVmModal } from "./MigrateVmModal";
 import { MonitoringView } from "./MonitoringView";
 import {
@@ -27,7 +28,7 @@ import {
   type ReclaimSortKey,
   type SortDir,
 } from "./sort";
-import type { ActionName, Catalog, ConnectionInfo, InventorySnapshot, JobList, OwnerReport, VirtualMachine } from "./types";
+import type { ActionName, Catalog, ConnectionInfo, ConnectionProfile, ConnectionProfileList, InventorySnapshot, JobList, OwnerReport, VirtualMachine } from "./types";
 import { APP_VERSION } from "./version";
 import { ThemePanel } from "./ThemePanel";
 import { ThemeProvider } from "./ThemeContext";
@@ -106,7 +107,12 @@ export function App() {
   const [notice, setNotice] = useState<React.ReactNode>("");
   const [expandedOwner, setExpandedOwner] = useState("");
   const [showLogin, setShowLogin] = useState(false);
+  const [loginProfile, setLoginProfile] = useState<ConnectionProfile | null>(null);
+  const [loginBlank, setLoginBlank] = useState(false);
   const [connection, setConnection] = useState<ConnectionInfo | null>(null);
+  const [profiles, setProfiles] = useState<ConnectionProfileList | null>(null);
+  const [profilesLoading, setProfilesLoading] = useState(true);
+  const [profilesError, setProfilesError] = useState("");
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [jobs, setJobs] = useState<JobList | null>(null);
   const [showNewVm, setShowNewVm] = useState(false);
@@ -170,6 +176,65 @@ export function App() {
       setJobsIfChanged(await fetchJobs());
     } catch {
       /* jobs endpoint should exist once the API is up */
+    }
+    try {
+      setProfiles(await fetchConnectionProfiles());
+      setProfilesError("");
+    } catch (err) {
+      setProfilesError(err instanceof Error ? err.message : "Could not load saved connections");
+    } finally {
+      setProfilesLoading(false);
+    }
+  }
+
+  function openAddConnection() {
+    setLoginProfile(null);
+    setLoginBlank(true);
+    setShowLogin(true);
+  }
+
+  function openEditConnection(profile: ConnectionProfile) {
+    setLoginProfile(profile);
+    setLoginBlank(false);
+    setShowLogin(true);
+  }
+
+  function openReconnect() {
+    const active = profiles?.profiles.find((profile) => profile.id === profiles.active_profile_id) ?? null;
+    if (active) {
+      openEditConnection(active);
+      return;
+    }
+    setLoginBlank(false);
+    setLoginProfile(null);
+    setShowLogin(true);
+  }
+
+  async function switchConnection(profile: ConnectionProfile) {
+    setProfilesError("");
+    try {
+      const info = await connectProfile(profile.id);
+      setConnection(info);
+      setSelected({});
+      setNotice(`Connected to ${profile.name} (${profile.host}).`);
+      await load();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not switch connections";
+      setProfilesError(message);
+      throw err;
+    }
+  }
+
+  async function removeConnection(profile: ConnectionProfile) {
+    setProfilesError("");
+    try {
+      await deleteConnectionProfile(profile.id);
+      setProfiles(await fetchConnectionProfiles());
+      setNotice(`Removed saved connection ${profile.name}.`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not remove connection";
+      setProfilesError(message);
+      throw err;
     }
   }
 
@@ -449,7 +514,7 @@ export function App() {
     try {
       const info = await logout(forget);
       setConnection(info);
-      setNotice(forget ? "Disconnected and cleared saved vCenter credentials." : "Disconnected. Demo inventory is active.");
+      setNotice(forget ? "Disconnected and removed the active saved connection." : "Disconnected. Demo inventory is active.");
       await load();
     } catch (err) {
       setNotice(err instanceof Error ? err.message : "Disconnect failed");
@@ -558,11 +623,23 @@ export function App() {
           ))}
         </nav>
         <div className="rail-foot">
-          <StatusPill connection={connection} loading={!data && !error} />
+          <ConnectionSwitcher
+            connection={connection}
+            profiles={profiles}
+            loading={profilesLoading}
+            error={profilesError}
+            onSwitch={switchConnection}
+            onAdd={openAddConnection}
+            onEdit={openEditConnection}
+            onRemove={removeConnection}
+          />
           {connection && connection.mode !== "demo" ? (
             <>
               {!connection.connected ? (
-                <button className="accent wide" onClick={() => setShowLogin(true)}>
+                <button
+                  className="accent wide"
+                  onClick={openReconnect}
+                >
                   Reconnect to vSphere
                 </button>
               ) : null}
@@ -573,8 +650,8 @@ export function App() {
               ) : null}
             </>
           ) : (
-            <button className="accent wide" onClick={() => setShowLogin(true)}>
-              Connect to vSphere
+            <button className="accent wide" onClick={openAddConnection}>
+              Add connection
             </button>
           )}
         </div>
@@ -700,7 +777,7 @@ export function App() {
             The vSphere endpoint is unreachable. Showing the last local snapshot
             {connection.last_sync ? ` from ${relTime(connection.last_sync)}` : ""}. Clones, uploads, migrates, and power
             actions stay in the Jobs queue and resume automatically.
-            <button onClick={() => setShowLogin(true)}>Reconnect</button>
+            <button onClick={openReconnect}>Reconnect</button>
           </div>
         ) : null}
         {error ? <div className="banner bad">{error}</div> : null}
@@ -746,7 +823,7 @@ export function App() {
             reclaim={reclaim}
             connection={connection}
             onOpen={setView}
-            onConnect={() => setShowLogin(true)}
+            onConnect={openAddConnection}
           />
         ) : null}
         {view === "monitoring" ? (
@@ -825,10 +902,14 @@ export function App() {
       {showLogin ? (
         <LoginPanel
           connection={connection}
-          onClose={() => setShowLogin(false)}
+          profile={loginProfile}
+          blank={loginBlank}
+          onClose={() => { setShowLogin(false); setLoginProfile(null); setLoginBlank(false); }}
           onConnected={(info) => {
             setConnection(info);
             setShowLogin(false);
+            setLoginProfile(null);
+            setLoginBlank(false);
             setNotice(info.message);
             void load();
           }}
@@ -1032,39 +1113,6 @@ function summarize(vms: VirtualMachine[]) {
     mem: vms.reduce((sum, vm) => sum + vm.memory_mib, 0),
     idle: vms.filter((vm) => vm.idle_score >= 40 && vm.power_state === "POWERED_ON").length,
   };
-}
-
-function StatusPill({ connection, loading }: { connection: ConnectionInfo | null; loading: boolean }) {
-  if (!connection) return <div className="pill muted">{loading ? "Connecting…" : "Not signed in"}</div>;
-  const tone = connection.stale ? "warm" : connection.connected ? "ok" : "bad";
-  return (
-    <div className={`pill ${tone}`}>
-      <span>
-        {connection.mode === "vcenter"
-          ? connection.stale
-            ? "Relay · stale"
-            : connection.syncing
-              ? "vCenter · syncing"
-              : "vCenter"
-          : connection.mode === "esxi"
-            ? connection.syncing ? "ESXi · syncing" : "Direct ESXi"
-            : "Demo"}
-      </span>
-      <small>{connection.host || "local demo"}</small>
-      <small>
-        {connection.stale
-          ? connection.last_sync
-            ? `last sync ${relTime(connection.last_sync)}`
-            : "waiting for vSphere"
-          : connection.user || connection.message}
-      </small>
-      {(connection.queued_jobs || 0) + (connection.active_jobs || 0) > 0 ? (
-        <small>
-          {connection.active_jobs} running · {connection.queued_jobs} queued
-        </small>
-      ) : null}
-    </div>
-  );
 }
 
 function Meter({ value, warn = 80 }: { value: number; warn?: number }) {

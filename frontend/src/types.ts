@@ -35,6 +35,31 @@ export type ConnectionInfo = {
   ssh_port: number;
   ssh_host_key_sha256: string;
   has_saved_ssh_password: boolean;
+  active_profile_id: string;
+};
+
+export type ConnectionProfile = {
+  id: string;
+  name: string;
+  host: string;
+  user: string;
+  port: number;
+  insecure: boolean;
+  endpoint_kind: "auto" | "vcenter" | "esxi" | string;
+  endpoint_fingerprint: string;
+  ssh_enabled: boolean;
+  ssh_user: string;
+  ssh_port: number;
+  ssh_host_key_sha256: string;
+  has_saved_password: boolean;
+  has_saved_ssh_password: boolean;
+  active: boolean;
+  last_used_at: string | null;
+};
+
+export type ConnectionProfileList = {
+  profiles: ConnectionProfile[];
+  active_profile_id: string;
 };
 
 export type HostSummary = {
@@ -319,6 +344,8 @@ export type JobList = {
   jobs: Job[];
   queued: number;
   active: number;
+  endpoint_fingerprint: string;
+  hidden_other_endpoints: number;
 };
 
 export type MetricPoint = {

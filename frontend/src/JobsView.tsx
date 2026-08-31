@@ -1,5 +1,5 @@
 import React from "react";
-import { cancelJob, grantMigrationAccess, retryJob } from "./api";
+import { cancelJob, clearJobHistory, deleteJob, grantMigrationAccess, retryJob } from "./api";
 import { bytes, relTime } from "./format";
 import { isPermissionJobError } from "./MigrationAccessPanel";
 import { TableFit } from "./TableFit";
@@ -55,23 +55,49 @@ function diskFallbackHint(job: Job): string {
 
 export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh: () => void }) {
   const jobs = data?.jobs ?? [];
+  const terminalCount = jobs.filter((job) => ["succeeded", "failed", "cancelled"].includes(job.status)).length;
   return (
     <div className="panel">
       <header>
         <div>
           <h2>Local relay queue</h2>
           <p>
-            Work is stored on this machine. If the VPN drops, queued deploys, clones, uploads, migrates, and power actions resume
-            from the last checkpoint instead of starting over. Permission errors can be granted from Datastores → vMotion
-            / migration access, or with Grant & retry on the job.
+            Work and history shown here belong only to the current vSphere endpoint. Queued work resumes after a connection
+            drop, but endpoint-bound jobs never execute against another saved connection.
           </p>
         </div>
         <div className="header-meta">
           <span>
             {data?.queued ?? 0} queued · {data?.active ?? 0} running
           </span>
+          {terminalCount > 0 ? (
+            <button
+              className="ghost compact"
+              onClick={() => {
+                if (!window.confirm(`Clear ${terminalCount} completed, failed, or cancelled job${terminalCount === 1 ? "" : "s"} for this endpoint?`)) return;
+                void clearJobHistory().then(onRefresh);
+              }}
+            >
+              Clear history
+            </button>
+          ) : null}
         </div>
       </header>
+      {(data?.hidden_other_endpoints ?? 0) > 0 ? (
+        <div className="banner">
+          <span>
+            {data?.hidden_other_endpoints} job{data?.hidden_other_endpoints === 1 ? "" : "s"} from other endpoints hidden. Switch connections to view them.
+          </span>{" "}
+          <button
+            onClick={() => {
+              if (!window.confirm("Clear completed, failed, and cancelled history from the hidden endpoints? Current-endpoint, queued, and running jobs will be retained.")) return;
+              void clearJobHistory(true).then(onRefresh);
+            }}
+          >
+            Clear hidden history
+          </button>
+        </div>
+      ) : null}
       {jobs.length === 0 ? (
         <p className="empty pad">No jobs yet. Deploy, migrate/clone, or upload an ISO to see the relay at work.</p>
       ) : (
@@ -141,6 +167,16 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                         }}
                       >
                         Cancel
+                      </button>
+                    ) : null}
+                    {["succeeded", "failed", "cancelled"].includes(job.status) ? (
+                      <button
+                        className="text danger-text"
+                        onClick={() => {
+                          void deleteJob(job.id).then(onRefresh);
+                        }}
+                      >
+                        Remove
                       </button>
                     ) : null}
                   </td>

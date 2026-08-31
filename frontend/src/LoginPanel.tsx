@@ -1,38 +1,50 @@
 import { useState } from "react";
 import { login } from "./api";
-import type { ConnectionInfo } from "./types";
+import type { ConnectionInfo, ConnectionProfile } from "./types";
 
 type Props = {
   connection: ConnectionInfo | null;
+  profile?: ConnectionProfile | null;
+  blank?: boolean;
   onClose: () => void;
   onConnected: (info: ConnectionInfo) => void;
 };
 
-export function LoginPanel({ connection, onClose, onConnected }: Props) {
-  const [host, setHost] = useState(connection?.saved_host || "");
-  const [user, setUser] = useState(connection?.saved_user || "");
+export function LoginPanel({ connection, profile, blank = false, onClose, onConnected }: Props) {
+  const fallback = blank ? null : connection;
+  const [profileName, setProfileName] = useState(profile?.name || "");
+  const [host, setHost] = useState(profile?.host || fallback?.saved_host || "");
+  const [user, setUser] = useState(profile?.user || fallback?.saved_user || "");
   const [password, setPassword] = useState("");
-  const [port, setPort] = useState(String(connection?.saved_port || 443));
-  const [insecure, setInsecure] = useState(connection?.insecure ?? true);
-  const [sshEnabled, setSshEnabled] = useState(connection?.ssh_configured ?? false);
-  const [sshUser, setSshUser] = useState(connection?.ssh_user || "root");
+  const [port, setPort] = useState(String(profile?.port || fallback?.saved_port || 443));
+  const [insecure, setInsecure] = useState(profile?.insecure ?? fallback?.insecure ?? true);
+  const [sshEnabled, setSshEnabled] = useState(profile?.ssh_enabled ?? fallback?.ssh_configured ?? false);
+  const [sshUser, setSshUser] = useState(profile?.ssh_user || fallback?.ssh_user || "root");
   const [sshPassword, setSshPassword] = useState("");
-  const [sshPort, setSshPort] = useState(String(connection?.ssh_port || 22));
-  const [sshFingerprint, setSshFingerprint] = useState(connection?.ssh_host_key_sha256 || "");
+  const [sshPort, setSshPort] = useState(String(profile?.ssh_port || fallback?.ssh_port || 22));
+  const [sshFingerprint, setSshFingerprint] = useState(profile?.ssh_host_key_sha256 || fallback?.ssh_host_key_sha256 || "");
   const [busy, setBusy] = useState<"test" | "save" | null>(null);
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
   const savedPassword = Boolean(
-    connection?.has_saved_password &&
-      host.trim() === (connection?.saved_host || "") &&
-      user.trim() === (connection?.saved_user || "") &&
-      (Number(port) || 443) === (connection?.saved_port || 443)
+    (profile?.has_saved_password &&
+      host.trim() === profile.host &&
+      user.trim() === profile.user &&
+      (Number(port) || 443) === profile.port) ||
+      (fallback?.has_saved_password &&
+        host.trim() === (fallback?.saved_host || "") &&
+        user.trim() === (fallback?.saved_user || "") &&
+        (Number(port) || 443) === (fallback?.saved_port || 443))
   );
   const savedSshPassword = Boolean(
-    connection?.has_saved_ssh_password &&
-      host.trim() === (connection?.saved_host || "") &&
-      sshUser.trim() === (connection?.ssh_user || "") &&
-      (Number(sshPort) || 22) === (connection?.ssh_port || 22)
+    (profile?.has_saved_ssh_password &&
+      host.trim() === profile.host &&
+      sshUser.trim() === profile.ssh_user &&
+      (Number(sshPort) || 22) === profile.ssh_port) ||
+      (fallback?.has_saved_ssh_password &&
+        host.trim() === (fallback?.saved_host || "") &&
+        sshUser.trim() === (fallback?.ssh_user || "") &&
+        (Number(sshPort) || 22) === (fallback?.ssh_port || 22))
   );
 
   async function submit(kind: "test" | "save") {
@@ -66,6 +78,8 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
         ssh_password: sshPassword,
         ssh_port: Number(sshPort) || 22,
         ssh_host_key_sha256: sshFingerprint,
+        profile_id: profile?.id,
+        profile_name: profileName.trim() || host.trim(),
       });
       if (kind === "save") {
         onConnected(info);
@@ -89,13 +103,23 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
           void submit("save");
         }}
       >
-        <h2>Connect to vSphere</h2>
+        <h2>{profile ? "Edit connection" : "Add vSphere connection"}</h2>
         <p>
           Enter either a vCenter Server or a standalone ESXi host. vFleet detects which one it is.
-          Test does not save or switch connections; Connect stores the endpoint in the local, ignored <code>.env</code>.
+          Test does not save or switch connections; Connect retains this profile locally and makes it active.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
         {ok ? <div className="banner ok">{ok}</div> : null}
+        <label>
+          Display name
+          <input
+            value={profileName}
+            onChange={(event) => setProfileName(event.target.value)}
+            placeholder="Production vCenter or Lab ESXi"
+            autoComplete="off"
+            name="profile-name"
+          />
+        </label>
         <label>
           Server
           <input

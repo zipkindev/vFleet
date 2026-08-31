@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     next_run_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL DEFAULT ''
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    endpoint_fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status_run ON jobs (status, next_run_at);
 CREATE INDEX IF NOT EXISTS jobs_idem ON jobs (idempotency_key);
@@ -91,8 +92,13 @@ class LocalStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate_jobs()
             self._migrate_metrics()
             self._conn.commit()
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
     def close(self) -> None:
         with self._lock:
@@ -105,6 +111,26 @@ class LocalStore:
         if "datastore_id" not in cols:
             self._conn.execute("ALTER TABLE metrics ADD COLUMN datastore_id TEXT NOT NULL DEFAULT ''")
         self._conn.execute("CREATE INDEX IF NOT EXISTS metrics_scope_ts ON metrics (owner_key, host_id, datastore_id, ts)")
+
+    def _migrate_jobs(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "endpoint_fingerprint" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN endpoint_fingerprint TEXT NOT NULL DEFAULT ''")
+        rows = self._conn.execute("SELECT id, payload FROM jobs WHERE endpoint_fingerprint=''").fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+                fingerprint = str(payload.get("_endpoint_fingerprint") or "")
+            except (TypeError, ValueError):
+                fingerprint = ""
+            if fingerprint:
+                self._conn.execute(
+                    "UPDATE jobs SET endpoint_fingerprint=? WHERE id=?",
+                    (fingerprint, row["id"]),
+                )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_endpoint_updated ON jobs (endpoint_fingerprint, updated_at)"
+        )
 
     def history_seeded(self) -> bool:
         return self._get_kv("metrics_history_seeded") is not None
@@ -192,8 +218,8 @@ class LocalStore:
         )
         with self._lock:
             self._conn.execute(
-                """INSERT INTO jobs(id, kind, title, status, payload, progress, result, error, attempts, max_attempts, next_run_at, created_at, updated_at, idempotency_key)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO jobs(id, kind, title, status, payload, progress, result, error, attempts, max_attempts, next_run_at, created_at, updated_at, idempotency_key, endpoint_fingerprint)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job.id,
                     job.kind,
@@ -209,6 +235,7 @@ class LocalStore:
                     _iso(job.created_at),
                     _iso(job.updated_at),
                     job.idempotency_key,
+                    str(job.payload.get("_endpoint_fingerprint") or ""),
                 ),
             )
             self._conn.commit()
@@ -227,18 +254,70 @@ class LocalStore:
             row = self._conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job(row) if row else None
 
-    def list_jobs(self, limit: int = 80) -> List[Job]:
+    def list_jobs(self, limit: int = 80, endpoint_fingerprint: Optional[str] = None) -> List[Job]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            if endpoint_fingerprint is None:
+                rows = self._conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM jobs WHERE endpoint_fingerprint=? ORDER BY created_at DESC LIMIT ?",
+                    (endpoint_fingerprint, limit),
+                ).fetchall()
         return [self._job(row) for row in rows]
 
-    def counts(self) -> Dict[str, int]:
+    def counts(self, endpoint_fingerprint: Optional[str] = None) -> Dict[str, int]:
         with self._lock:
+            where = "" if endpoint_fingerprint is None else " AND endpoint_fingerprint=?"
+            params = () if endpoint_fingerprint is None else (endpoint_fingerprint,)
             queued = self._conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status IN ('queued','retrying')"
+                f"SELECT COUNT(*) FROM jobs WHERE status IN ('queued','retrying'){where}", params
             ).fetchone()[0]
-            active = self._conn.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0]
+            active = self._conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE status='running'{where}", params
+            ).fetchone()[0]
         return {"queued": int(queued), "active": int(active)}
+
+    def job_count(self, endpoint_fingerprint: Optional[str] = None) -> int:
+        with self._lock:
+            if endpoint_fingerprint is None:
+                row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE endpoint_fingerprint=?", (endpoint_fingerprint,)
+                ).fetchone()
+        return int(row[0])
+
+    def clear_job_history(self, endpoint_fingerprint: Optional[str] = None) -> int:
+        with self._lock:
+            if endpoint_fingerprint is None:
+                cursor = self._conn.execute(
+                    "DELETE FROM jobs WHERE status IN ('succeeded','failed','cancelled')"
+                )
+            else:
+                cursor = self._conn.execute(
+                    "DELETE FROM jobs WHERE endpoint_fingerprint=? AND status IN ('succeeded','failed','cancelled')",
+                    (endpoint_fingerprint,),
+                )
+            self._conn.commit()
+            return int(cursor.rowcount)
+
+    def clear_other_job_history(self, endpoint_fingerprint: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM jobs WHERE endpoint_fingerprint<>? AND status IN ('succeeded','failed','cancelled')",
+                (endpoint_fingerprint,),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount)
+
+    def delete_terminal_job(self, job_id: str, endpoint_fingerprint: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM jobs WHERE id=? AND endpoint_fingerprint=? AND status IN ('succeeded','failed','cancelled')",
+                (job_id, endpoint_fingerprint),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def requeue_orphans(self) -> None:
         now = _iso(_now())

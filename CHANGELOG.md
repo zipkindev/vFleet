@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.14] — 2026-08-31
+
+feat: add bulk disk conversion workflow
+
+- 13 files changed, 1114 insertions(+), 89 deletions(-) · README.md, backend/app/main.py, backend/app/models.py, backend/app/profiles.py, backend/app/store.py, backend/tests/test_profiles.py, …
+
 ## [1.0.13] — 2026-08-31
 
 fix: refine disk conversion workflow

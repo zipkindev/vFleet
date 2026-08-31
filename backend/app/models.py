@@ -41,6 +41,35 @@ class ConnectionInfo(BaseModel):
     ssh_port: int = 22
     ssh_host_key_sha256: str = ""
     has_saved_ssh_password: bool = False
+    active_profile_id: str = ""
+
+
+class ConnectionProfileSummary(BaseModel):
+    id: str
+    name: str
+    host: str
+    user: str
+    port: int = 443
+    insecure: bool = True
+    endpoint_kind: str = "auto"
+    endpoint_fingerprint: str = ""
+    ssh_enabled: bool = False
+    ssh_user: str = ""
+    ssh_port: int = 22
+    ssh_host_key_sha256: str = ""
+    has_saved_password: bool = False
+    has_saved_ssh_password: bool = False
+    active: bool = False
+    last_used_at: Optional[datetime] = None
+
+
+class ConnectionProfileList(BaseModel):
+    profiles: List[ConnectionProfileSummary] = Field(default_factory=list)
+    active_profile_id: str = ""
+
+
+class ProfileDeleteRequest(BaseModel):
+    confirm: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -57,6 +86,8 @@ class LoginRequest(BaseModel):
     ssh_password: str = ""
     ssh_port: int = 22
     ssh_host_key_sha256: str = ""
+    profile_id: str = ""
+    profile_name: str = ""
 
 
 class LogoutRequest(BaseModel):
@@ -482,6 +513,13 @@ class JobList(BaseModel):
     jobs: List[Job]
     queued: int = 0
     active: int = 0
+    endpoint_fingerprint: str = ""
+    hidden_other_endpoints: int = 0
+
+
+class JobHistoryClearRequest(BaseModel):
+    confirm: bool = False
+    other_endpoints: bool = False
 
 
 class PrivilegeCheck(BaseModel):
