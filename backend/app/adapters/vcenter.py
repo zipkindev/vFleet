@@ -1841,20 +1841,34 @@ class VCenterAdapter(InventoryAdapter):
             if disk.sharing and disk.sharing.lower() not in {"", "sharingnone"}:
                 blockers.append(f"{disk.label} uses shared-disk mode {disk.sharing}")
         noop = bool(disks) and all(disk.provisioning == target for disk in disks)
-        selected = "soap" if method == "auto" else method
+        direct_esxi = self._is_esxi()
+        # A standalone HostAgent can expose relocation capability flags yet reject an
+        # in-place provisioning change with vmodl.fault.NotSupported. vCenter has a
+        # provisioning checker for this workflow; HostAgent does not. Automatic mode
+        # therefore uses the verified, allowlisted SSH implementation on direct ESXi.
+        selected = ("ssh" if direct_esxi else "soap") if method == "auto" else method
         if selected == "ssh":
-            if not self._is_esxi():
+            if not direct_esxi:
                 blockers.append("SSH conversion is only available for a direct ESXi connection")
             if not self.settings.esxi_ssh_enabled:
-                blockers.append("SSH fallback is not configured for this host")
+                blockers.append("Verified SSH disk conversion is not configured for this host; edit the connection to enable it")
             if power != "POWERED_OFF":
                 blockers.append("SSH conversion requires the VM to be powered off")
             if getattr(vm, "snapshot", None) is not None:
                 blockers.append("SSH conversion requires all VM snapshots to be removed first")
+            if direct_esxi and self.settings.esxi_ssh_enabled:
+                warnings.append(
+                    "Verified SSH conversion temporarily starts the ESXi SSH service for the job and restores it afterward"
+                )
         else:
-            warnings.append("The vSphere API performs a storage relocation; required API privileges and free space are checked by ESXi")
-        if self._is_esxi() and selected == "soap" and self.settings.esxi_ssh_enabled:
-            warnings.append("If this ESXi license blocks write APIs, re-plan with the SSH method")
+            if direct_esxi:
+                warnings.append(
+                    "Advanced direct-ESXi API relocation may be rejected by HostAgent with NotSupported; verified SSH is recommended"
+                )
+            else:
+                warnings.append(
+                    "The vSphere API performs a storage relocation; required API privileges and free space are checked by vCenter"
+                )
         change_version = str(getattr(getattr(vm, "config", None), "changeVersion", "") or "")
         token_data = {
             "endpoint": self.endpoint_fingerprint(),
@@ -1871,7 +1885,7 @@ class VCenterAdapter(InventoryAdapter):
             vm_name=str(getattr(vm, "name", "") or spec.vm_id),
             target=target,
             method=selected,
-            fallback_method="ssh" if selected == "soap" and self._is_esxi() and self.settings.esxi_ssh_enabled else "",
+            fallback_method="ssh" if selected == "soap" and direct_esxi and self.settings.esxi_ssh_enabled else "",
             plan_token=token,
             power_state=power,
             disks=disks,
@@ -1904,37 +1918,58 @@ class VCenterAdapter(InventoryAdapter):
         vm = self._find_vm(self._session().content, plan.vm_id)
         if vm is None:
             raise PermanentError("Unknown VM")
+        service_system = self._host_obj().configManager.serviceSystem
+        services = getattr(getattr(service_system, "serviceInfo", None), "service", None) or []
+        ssh_service = next((item for item in services if str(getattr(item, "key", "")) == "TSM-SSH"), None)
+        if ssh_service is None:
+            raise PermanentError("This ESXi host does not expose the SSH service for temporary activation")
+        ssh_started_for_job = not bool(getattr(ssh_service, "running", False))
+        if ssh_started_for_job:
+            if on_progress:
+                on_progress(0, {"phase": "ssh_start", "index": 0, "total": len(plan.disks)})
+            service_system.StartService(id="TSM-SSH")
         devices = getattr(getattr(getattr(vm, "config", None), "hardware", None), "device", None) or []
         by_key = {int(getattr(device, "key", 0) or 0): device for device in devices}
         executor = EsxiSshExecutor(self.settings)
         changes: List[Any] = []
         converted: List[Dict[str, str]] = []
         total = len(plan.disks)
-        for index, disk in enumerate(plan.disks):
-            _datastore, relative, source = datastore_path(disk.file_name)
-            if not relative.lower().endswith(".vmdk"):
-                raise PermanentError(f"{disk.label} does not reference a VMDK descriptor")
-            suffix = plan.plan_token[:12]
-            relative_dest = f"{relative[:-5]}.vfleet-{suffix}.vmdk"
-            _ds2, _rel2, destination = datastore_path(f"[{_datastore}] {relative_dest}")
-            if on_progress:
-                on_progress(index, {"phase": "clone", "disk": disk.label, "index": index, "total": total})
-            executor.clone_disk(source, destination, plan.target)
-            device = by_key.get(disk.key)
-            if device is None:
-                raise PermanentError(f"Disk device {disk.key} changed while converting")
-            device.backing.fileName = f"[{_datastore}] {relative_dest}"
-            change = vim.vm.device.VirtualDeviceSpec()
-            change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
-            change.device = device
-            changes.append(change)
-            converted.append({"label": disk.label, "source": disk.file_name, "destination": device.backing.fileName})
+        ssh_service_restored = not ssh_started_for_job
+        try:
+            for index, disk in enumerate(plan.disks):
+                _datastore, relative, source = datastore_path(disk.file_name)
+                if not relative.lower().endswith(".vmdk"):
+                    raise PermanentError(f"{disk.label} does not reference a VMDK descriptor")
+                suffix = plan.plan_token[:12]
+                relative_dest = f"{relative[:-5]}.vfleet-{suffix}.vmdk"
+                _ds2, _rel2, destination = datastore_path(f"[{_datastore}] {relative_dest}")
+                if on_progress:
+                    on_progress(index, {"phase": "clone", "disk": disk.label, "index": index, "total": total})
+                executor.clone_disk(source, destination, plan.target)
+                device = by_key.get(disk.key)
+                if device is None:
+                    raise PermanentError(f"Disk device {disk.key} changed while converting")
+                device.backing.fileName = f"[{_datastore}] {relative_dest}"
+                change = vim.vm.device.VirtualDeviceSpec()
+                change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+                change.device = device
+                changes.append(change)
+                converted.append({"label": disk.label, "source": disk.file_name, "destination": device.backing.fileName})
 
-        if on_progress:
-            on_progress(total, {"phase": "reconfigure", "index": total, "total": total})
-        spec = vim.vm.ConfigSpec(deviceChange=changes)
-        task = vm.ReconfigVM_Task(spec=spec)
-        self.wait_task(_moid(task))
+            if on_progress:
+                on_progress(total, {"phase": "reconfigure", "index": total, "total": total})
+            spec = vim.vm.ConfigSpec(deviceChange=changes)
+            task = vm.ReconfigVM_Task(spec=spec)
+            self.wait_task(_moid(task))
+        finally:
+            if ssh_started_for_job:
+                if on_progress:
+                    on_progress(total, {"phase": "ssh_stop", "index": total, "total": total})
+                try:
+                    service_system.StopService(id="TSM-SSH")
+                    ssh_service_restored = True
+                except Exception:
+                    ssh_service_restored = False
         self._cache_at = 0.0
         return {
             "vm_id": plan.vm_id,
@@ -1942,6 +1977,8 @@ class VCenterAdapter(InventoryAdapter):
             "method": "ssh",
             "converted": converted,
             "source_disks_preserved": True,
+            "ssh_service_temporarily_started": ssh_started_for_job,
+            "ssh_service_restored": ssh_service_restored,
         }
 
     def _cluster_or_root(self, cluster_id: str, scope: str):

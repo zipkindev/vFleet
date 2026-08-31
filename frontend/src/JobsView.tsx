@@ -32,8 +32,10 @@ function progressLabel(job: Job): string {
     const disk = String(job.progress.disk || "disk");
     const index = Number(job.progress.index ?? 0);
     const total = Number(job.progress.total ?? 0);
+    if (phase === "ssh_start") return "Starting temporary SSH service";
     if (phase === "clone") return `Cloning ${disk}${total > 0 ? ` (${Math.min(index + 1, total)}/${total})` : ""}`;
     if (phase === "reconfigure") return "Attaching converted disk";
+    if (phase === "ssh_stop") return "Restoring SSH service";
     if (phase === "relocate" || job.progress.task_id) return "vSphere task running";
   }
   if (job.progress.task_id) {
@@ -44,11 +46,12 @@ function progressLabel(job: Job): string {
 
 function diskFallbackHint(job: Job): string {
   const plan = job.payload.plan;
-  const fallback = plan && typeof plan === "object" && "fallback_method" in plan
-    ? String((plan as Record<string, unknown>).fallback_method || "")
+  const method = plan && typeof plan === "object" && "method" in plan
+    ? String((plan as Record<string, unknown>).method || "")
     : "";
-  if (job.kind === "disk_convert" && fallback === "ssh" && /not supported/i.test(job.error)) {
-    return "This host rejected API relocation. Re-plan from Machines and choose Verified SSH fallback.";
+  const directEsxi = String(job.payload._endpoint_kind || "") === "esxi";
+  if (job.kind === "disk_convert" && method === "soap" && directEsxi && /not supported/i.test(job.error)) {
+    return "This host rejected API relocation. Re-plan from Machines; Automatic uses Verified SSH on direct ESXi.";
   }
   return "";
 }

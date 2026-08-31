@@ -408,9 +408,9 @@ class LocalStore:
         if job.status not in {"failed", "retrying", "cancelled"}:
             return job
         progress = dict(job.progress)
-        if job.kind == "migrate":
+        if job.kind in {"migrate", "disk_convert"}:
             progress["task_id"] = ""
-            progress["phase"] = "start"
+            progress["phase"] = "start" if job.kind == "migrate" else ""
         now = _now()
         with self._lock:
             self._conn.execute(

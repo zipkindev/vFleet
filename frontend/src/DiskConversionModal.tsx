@@ -29,6 +29,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [showConfirmation, setShowConfirmation] = useState(false);
+  const directEsxi = connection.endpoint_kind === "esxi";
 
   useEffect(() => {
     setRows(null);
@@ -104,10 +105,16 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
         <div className="modal disk-convert-modal" onClick={(event) => event.stopPropagation()}>
         <h2>{batch ? `Convert disks · ${vms.length} selected VMs` : `Convert disks · ${vms[0]?.name ?? "VM"}`}</h2>
         <p>
-          Each VM is safety-checked and queued as an independent persistent job. The vSphere API uses storage relocation;
-          SSH clones new VMDKs and preserves the original source files.
+          Each VM is safety-checked and queued as an independent persistent job. vCenter uses storage relocation;
+          direct ESXi defaults to verified SSH, clones new VMDKs, and preserves the original source files.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
+        {directEsxi && !connection.ssh_configured ? (
+          <div className="banner warm disk-convert-method-note">
+            Direct ESXi conversion requires verified SSH because HostAgent cannot reliably perform an in-place API relocation.
+            Edit this connection to enable SSH fallback before queueing.
+          </div>
+        ) : null}
         <div className="disk-convert-settings">
           <label>
             Target provisioning
@@ -120,8 +127,13 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
           <label>
             Execution method
             <select value={method} onChange={(event) => setMethod(event.target.value)}>
-              <option value="auto">vSphere API (recommended)</option>
-              {connection.endpoint_kind === "esxi" && connection.ssh_configured ? <option value="ssh">Verified SSH fallback</option> : null}
+              <option value="auto">
+                {directEsxi
+                  ? connection.ssh_configured ? "Automatic · Verified SSH (recommended)" : "Automatic · SSH setup required"
+                  : "Automatic · vSphere API (recommended)"}
+              </option>
+              {directEsxi && connection.ssh_configured ? <option value="ssh">Verified SSH</option> : null}
+              {directEsxi ? <option value="soap">vSphere API relocation (advanced)</option> : null}
             </select>
           </label>
         </div>
@@ -160,7 +172,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
                   {row.plan ? (
                     <>
                       <div className="disk-card-meta">
-                        <span>{row.plan.method.toUpperCase()}</span>
+                        <span>{row.plan.method === "ssh" ? "VERIFIED SSH" : "VSPHERE API"}</span>
                         <span>{row.plan.disks.length} disk(s)</span>
                         <span>Up to {bytes(row.plan.estimated_scratch_bytes)} temporary</span>
                       </div>

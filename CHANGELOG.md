@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.17] — 2026-08-31
+
+fix: default direct ESXi disk conversion to SSH
+
+- 1 file changed, 1 insertion(+), 6 deletions(-) · frontend/src/JobsView.tsx
+
+## [1.0.16] — 2026-08-31
+
+fix: replace typed disk conversion confirmation
+
+- 7 files changed, 212 insertions(+), 43 deletions(-) · README.md, backend/app/adapters/vcenter.py, backend/app/store.py, backend/tests/test_disk_conversion.py, frontend/src/DiskConversionModal.tsx, frontend/src/JobsView.tsx, …
+
 ## [1.0.15] — 2026-08-31
 
 feat: add multi-endpoint connection profiles

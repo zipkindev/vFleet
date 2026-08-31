@@ -12,7 +12,7 @@ This talks to vCenter with credentials **you** put in `.env`. It is an operator 
 | Clusters, hosts, VMs | PropertyCollector inventory | Names, power state, guest OS, Tools, IP, configured vCPU/RAM, current host/cluster. Cached locally so the UI keeps working if the VPN drops. |
 | CPU / memory utilization | `summary.quickStats` | Live usage (MHz / guest memory). This is the same family of numbers the vSphere UI uses, not guest-inside telemetry. |
 | Power on / off / reset / suspend | Local job queue → VIM power methods | **Guest shutdown/reboot** needs VMware Tools. Hard power-off does not. Queued on disk; retried after disconnects. |
-| Migrate host / convert disks | Local job → `RelocateVM` (vMotion / Storage vMotion) | Default keeps datastore and NICs. Thick→Thin is a Storage vMotion transform (same datastore is fine). Same cluster only when changing hosts. **50 VMs per job** is a vFleet relay cap (not vMotion); extra VMs are deferred to a second batch. |
+| Migrate host / convert disks | Local job → vCenter `RelocateVM` or verified ESXi SSH | vCenter uses Storage vMotion. Direct ESXi uses an allowlisted `vmkfstools` clone because HostAgent can reject in-place relocation. **50 VMs per job** is a vFleet relay cap; extra VMs are deferred to a second batch. |
 | Create VM | Clone from a template already on the remote side | Small SOAP call. Prefer this over uploading an OVA across a WAN. Resumes by reattaching the vCenter task. |
 | Datastores | Inventory + datastore browser | Capacity, free space, browse folders, mkdir, delete file. Last listing is cached when vCenter is unreachable. |
 | Upload ISO / OVA | Local staging, then resumable push | File lands on this machine first. The relay then uploads via Content Library (byte resume) or datastore PUT with retry. |
@@ -27,11 +27,11 @@ The vSphere **REST** Automation API can list VMs and do power operations, but li
 
 Connect to an ESXi management address exactly as you would connect to vCenter. vFleet detects the endpoint and keeps the existing vCenter adapter/relay architecture intact; vCenter-only controls are hidden rather than emulated.
 
-- Inventory, VM console/power/rename/delete, datastore access, and disk relocation use the vSphere SOAP API directly on the host.
+- Inventory, VM console/power/rename/delete, datastore access, and host administration use the vSphere SOAP API directly on the host.
 - The **Hosts** view becomes a direct-host console for maintenance mode, guarded reboot/shutdown, ESXi Shell/SSH/NTP service state, NTP configuration, storage rescan, and support-bundle generation.
 - VM **Actions → Convert disk provisioning** first builds a disk-by-disk plan. RDM, encrypted, shared, snapshot-dependent SSH, stale-plan, and endpoint-switch hazards are blocked before a job is queued.
 - vCenter-only DRS, roles, templates, Content Library, and cross-host migration remain available only when a vCenter endpoint reports those capabilities.
-- Some free ESXi licenses expose write APIs as read-only. Use the API method first. The optional SSH fallback is explicitly selected, host-key verified, and limited to `vmkfstools` cloning; it never accepts arbitrary shell commands and preserves source VMDKs.
+- Standalone HostAgent can advertise relocation capabilities but reject an in-place disk format change with `NotSupported`, even on a licensed host. Automatic disk conversion therefore uses verified SSH on direct ESXi. vFleet temporarily starts the SSH service for the job, restores its prior stopped state afterward, limits execution to `vmkfstools` cloning, and preserves source VMDKs. The API relocation path remains an explicitly labeled advanced option.
 
 Every job records the endpoint fingerprint it was created for. A queued task will fail closed rather than run after the operator switches to a different vCenter or ESXi host.
 
