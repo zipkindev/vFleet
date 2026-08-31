@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.0] — 2026-08-31
+
+feat: automate bulk VMware Tools deployment with an encrypted Automation Vault
+
+- Adds single-VM and bulk Tools deployment from the Machines UI with an explicit review and final confirmation.
+- Automates Windows installation through WinRM, the host-provided VMware Tools ISO, reboot-aware verification, and restoration of the prior virtual CD media.
+- Supports Linux guests through pinned-host-key SSH and distribution packages for `open-vm-tools` across apt, dnf/yum, zypper, tdnf, and apk systems.
+- Adds reusable Windows, Linux/SSH, and service credentials to the portable AES-256-GCM JSON vault; secrets never enter API responses or persistent job payloads.
+- Adds CLI commands for vault metadata, credential creation/deletion, and bulk Windows/Linux Tools deployment.
+- Keeps every guest as an endpoint-bound independent relay job so bulk failures and retries remain isolated.
+
 ## [1.1.3] — 2026-08-31
 
 feat: mount VMware Tools installers from VM actions

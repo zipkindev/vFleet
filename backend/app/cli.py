@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from typing import Any, Dict
+from urllib.parse import urlencode
 
 import httpx
 
@@ -90,6 +91,26 @@ def parser() -> argparse.ArgumentParser:
     disk_convert.add_argument("--method", choices=["auto", "soap", "ssh"], default="auto")
     disk_convert.add_argument("--yes", action="store_true")
 
+    commands.add_parser("credentials", help="List Automation Vault credential metadata (never secrets)")
+    credential_add = commands.add_parser("credential-add", help="Add a reusable encrypted automation credential")
+    credential_add.add_argument("name")
+    credential_add.add_argument("--kind", choices=["windows", "ssh", "service"], required=True)
+    credential_add.add_argument("--user", default="")
+    credential_add.add_argument("--scope", choices=["endpoint", "global"], default="endpoint")
+    credential_delete = commands.add_parser("credential-delete", help="Delete an Automation Vault credential")
+    credential_delete.add_argument("credential_id")
+    credential_delete.add_argument("--yes", action="store_true")
+    tools = commands.add_parser("tools-deploy", help="Queue bulk Windows/Linux VMware Tools deployment")
+    tools.add_argument("credential_id")
+    tools.add_argument("targets", nargs="+", metavar="VM_ID=ADDRESS")
+    tools.add_argument("--os", choices=["auto", "windows", "linux"], default="auto")
+    tools.add_argument("--windows-https", action="store_true")
+    tools.add_argument("--windows-port", type=int, default=0)
+    tools.add_argument("--no-verify-tls", action="store_true")
+    tools.add_argument("--ssh-port", type=int, default=22)
+    tools.add_argument("--no-sudo", action="store_true")
+    tools.add_argument("--yes", action="store_true")
+
     jobs = commands.add_parser("jobs", help="List persistent jobs")
     jobs.add_argument("--limit", type=int, default=80)
     job = commands.add_parser("job", help="Show or wait for one job")
@@ -151,13 +172,58 @@ def main(argv: list[str] | None = None) -> int:
             emit(plan); raise SystemExit("Plan is not executable")
         elif confirmed(args.yes, f"Convert {plan['vm_name']} disks to {plan['target']} using {plan['method']}?"):
             emit(api.request("POST", "/api/vms/disk-conversion", {"vm_id": plan["vm_id"], "target": plan["target"], "method": plan["method"], "plan_token": plan["plan_token"], "confirm": True}))
+    elif command == "credentials":
+        emit(api.request("GET", "/api/automation-credentials"))
+    elif command == "credential-add":
+        secret = getpass.getpass("Password or token: ")
+        if not secret:
+            raise SystemExit("A non-empty password or token is required")
+        emit(api.request("POST", "/api/automation-credentials", {
+            "name": args.name, "kind": args.kind, "username": args.user,
+            "secret": secret, "scope": args.scope, "confirm": True,
+        }))
+    elif command == "credential-delete":
+        if confirmed(args.yes, f"Delete Automation Vault credential {args.credential_id}?"):
+            emit(api.request("DELETE", f"/api/automation-credentials/{args.credential_id}", {"confirm": True}))
+    elif command == "tools-deploy":
+        inventory = api.request("GET", "/api/inventory")
+        by_id = {item["id"]: item for item in inventory["vms"]}
+        targets = []
+        for raw in args.targets:
+            if "=" not in raw:
+                raise SystemExit(f"Invalid target {raw!r}; use VM_ID=ADDRESS")
+            vm_id, address = (part.strip() for part in raw.split("=", 1))
+            vm = by_id.get(vm_id)
+            if vm is None or not address:
+                raise SystemExit(f"Unknown VM or blank address: {raw}")
+            family = args.os
+            if family == "auto":
+                guest = str(vm.get("guest_os") or "").lower()
+                family = "windows" if "win" in guest else "linux" if any(
+                    token in guest for token in ("linux", "ubuntu", "debian", "rhel", "centos", "suse", "oracle", "photon", "fedora")
+                ) else "auto"
+            target = {"vm_id": vm_id, "address": address, "os_family": family}
+            if family == "linux":
+                query = urlencode({"address": address, "port": args.ssh_port})
+                host_key = api.request("GET", f"/api/tools/ssh-host-key?{query}")
+                target["ssh_host_key_sha256"] = host_key["fingerprint"]
+            targets.append(target)
+        preview = ", ".join(f"{by_id[item['vm_id']]['name']} ({item['os_family']})" for item in targets)
+        if confirmed(args.yes, f"Queue VMware Tools deployment for {preview}?"):
+            emit(api.request("POST", "/api/tools/deploy", {
+                "targets": targets, "credential_id": args.credential_id,
+                "windows_transport": "https" if args.windows_https else "http",
+                "windows_port": args.windows_port or (5986 if args.windows_https else 5985),
+                "validate_certificate": not args.no_verify_tls,
+                "linux_port": args.ssh_port, "sudo": not args.no_sudo, "confirm": True,
+            }))
     elif command == "jobs":
         emit(api.request("GET", "/api/jobs"))
     elif command == "job":
         deadline = time.monotonic() + args.timeout
         while True:
             job = api.request("GET", f"/api/jobs/{args.job_id}")
-            if not args.wait or job["status"] in {"complete", "failed", "cancelled"}:
+            if not args.wait or job["status"] in {"succeeded", "failed", "cancelled"}:
                 emit(job)
                 return 1 if job["status"] == "failed" else 0
             if time.monotonic() >= deadline:

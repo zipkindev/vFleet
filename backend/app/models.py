@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class ConnectionInfo(BaseModel):
@@ -578,3 +578,63 @@ class MetricsResponse(BaseModel):
     host: str = ""
     datastore: str = ""
     points: int = 0
+
+
+class AutomationCredentialSummary(BaseModel):
+    id: str
+    name: str
+    kind: Literal["windows", "ssh", "service"]
+    username: str = ""
+    scope: Literal["global", "endpoint"] = "global"
+    endpoint_fingerprint: str = ""
+    has_secret: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+
+class AutomationCredentialList(BaseModel):
+    credentials: List[AutomationCredentialSummary] = Field(default_factory=list)
+    storage: str = "Encrypted JSON vault (AES-256-GCM)"
+
+
+class AutomationCredentialRequest(BaseModel):
+    id: str = ""
+    name: str
+    kind: Literal["windows", "ssh", "service"]
+    username: str = ""
+    secret: SecretStr = SecretStr("")
+    scope: Literal["global", "endpoint"] = "global"
+    confirm: bool = False
+
+
+class AutomationCredentialDeleteRequest(BaseModel):
+    confirm: bool = False
+
+
+class ToolsDeploymentTarget(BaseModel):
+    vm_id: str
+    address: str
+    os_family: Literal["auto", "windows", "linux"] = "auto"
+    ssh_host_key_sha256: str = ""
+
+
+class ToolsDeploymentRequest(BaseModel):
+    targets: List[ToolsDeploymentTarget]
+    credential_id: str
+    windows_transport: Literal["http", "https"] = "http"
+    windows_port: int = Field(default=5985, ge=1, le=65535)
+    validate_certificate: bool = True
+    linux_port: int = Field(default=22, ge=1, le=65535)
+    sudo: bool = True
+    confirm: bool = False
+
+
+class ToolsDeploymentResponse(BaseModel):
+    jobs: List[Job] = Field(default_factory=list)
+    failures: List[str] = Field(default_factory=list)
+
+
+class SshHostKeyInfo(BaseModel):
+    address: str
+    port: int
+    fingerprint: str

@@ -154,12 +154,9 @@ class CredentialVault:
     def _aad(credential_id: str) -> bytes:
         return _AAD_PREFIX + credential_id.encode("utf-8")
 
-    def _encrypt(self, credential_id: str, password: str, ssh_password: str) -> dict:
-        plaintext = json.dumps(
-            {"password": password, "ssh_password": ssh_password},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+    def _encrypt_fields(self, credential_id: str, values: Mapping[str, str]) -> dict:
+        normalized = {str(key): str(value) for key, value in values.items()}
+        plaintext = json.dumps(normalized, separators=(",", ":"), sort_keys=True).encode("utf-8")
         nonce = os.urandom(12)
         ciphertext = AESGCM(self._key(create=True)).encrypt(nonce, plaintext, self._aad(credential_id))
         return {
@@ -167,7 +164,7 @@ class CredentialVault:
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
         }
 
-    def _decrypt(self, credential_id: str, record: object) -> Dict[str, str]:
+    def _decrypt_fields(self, credential_id: str, record: object) -> Dict[str, str]:
         if not isinstance(record, dict):
             raise CredentialVaultError(f"Malformed credential record for profile {credential_id}")
         try:
@@ -177,25 +174,39 @@ class CredentialVault:
                 nonce, ciphertext, self._aad(credential_id)
             )
             payload = json.loads(plaintext.decode("utf-8"))
-            password = payload.get("password", "")
-            ssh_password = payload.get("ssh_password", "")
-            if not isinstance(password, str) or not isinstance(ssh_password, str):
+            if not isinstance(payload, dict) or not all(
+                isinstance(key, str) and isinstance(value, str) for key, value in payload.items()
+            ):
                 raise ValueError("credential values must be strings")
-            return {"password": password, "ssh_password": ssh_password}
+            return dict(payload)
         except (InvalidTag, KeyError, ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CredentialVaultError(
                 f"Credential record {credential_id} could not be authenticated or decrypted"
             ) from exc
 
     def get(self, credential_id: str) -> Dict[str, str]:
+        fields = self.get_fields(credential_id)
+        return {"password": fields.get("password", ""), "ssh_password": fields.get("ssh_password", "")}
+
+    def get_fields(self, credential_id: str) -> Dict[str, str]:
         with self._lock:
             record = self._load_records_unlocked().get(credential_id)
             if record is None:
-                return {"password": "", "ssh_password": ""}
-            return self._decrypt(credential_id, record)
+                return {}
+            return self._decrypt_fields(credential_id, record)
 
     def put(self, credential_id: str, password: str, ssh_password: str = "") -> None:
         self.put_many({credential_id: {"password": password, "ssh_password": ssh_password}})
+
+    def put_fields(self, credential_id: str, values: Mapping[str, str]) -> None:
+        with self._lock:
+            records = self._load_records_unlocked()
+            for existing_id, existing_record in records.items():
+                self._decrypt_fields(existing_id, existing_record)
+            record = self._encrypt_fields(credential_id, values)
+            self._decrypt_fields(credential_id, record)
+            records[credential_id] = record
+            self._save_records_unlocked(records)
 
     def put_many(self, credentials: Mapping[str, Mapping[str, str]]) -> None:
         if not credentials:
@@ -203,14 +214,16 @@ class CredentialVault:
         with self._lock:
             records = self._load_records_unlocked()
             for existing_id, existing_record in records.items():
-                self._decrypt(existing_id, existing_record)
+                self._decrypt_fields(existing_id, existing_record)
             for credential_id, values in credentials.items():
-                record = self._encrypt(
+                record = self._encrypt_fields(
                     credential_id,
-                    str(values.get("password", "")),
-                    str(values.get("ssh_password", "")),
+                    {
+                        "password": str(values.get("password", "")),
+                        "ssh_password": str(values.get("ssh_password", "")),
+                    },
                 )
-                self._decrypt(credential_id, record)
+                self._decrypt_fields(credential_id, record)
                 records[credential_id] = record
             self._save_records_unlocked(records)
 
@@ -220,7 +233,7 @@ class CredentialVault:
             if credential_id not in records:
                 return False
             for existing_id, existing_record in records.items():
-                self._decrypt(existing_id, existing_record)
+                self._decrypt_fields(existing_id, existing_record)
             del records[credential_id]
             self._save_records_unlocked(records)
             return True

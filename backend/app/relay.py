@@ -25,6 +25,7 @@ from .models import (
 )
 from .store import LocalStore
 from .reclaim import build_owner_reports
+from .automation_vault import AutomationCredentialStore
 
 
 def _clone_result_id(adapter: InventoryAdapter, result, task_id: str, clone_name: str) -> str:
@@ -53,11 +54,18 @@ def _clone_result_id(adapter: InventoryAdapter, result, task_id: str, clone_name
 
 
 class RelayWorker(threading.Thread):
-    def __init__(self, settings: Settings, store: LocalStore, adapter_getter) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        store: LocalStore,
+        adapter_getter,
+        automation_credentials: Optional[AutomationCredentialStore] = None,
+    ) -> None:
         super().__init__(daemon=True, name="vfleet-relay")
         self.settings = settings
         self.store = store
         self._adapter_getter = adapter_getter
+        self.automation_credentials = automation_credentials
         self._halt = threading.Event()
         self._wake = threading.Event()
         self.syncing = False
@@ -543,6 +551,9 @@ class RelayWorker(threading.Thread):
             adapter.wait_task(task_id)
             return {"vm_id": plan.vm_id, "target": plan.target, "method": "soap", "task_id": task_id}
 
+        if kind == "tools_deploy":
+            return self._deploy_guest_tools(job, adapter, progress)
+
         if kind == "host_action":
             spec = HostActionRequest.model_validate(payload)
             task_id = str(progress.get("task_id") or "")
@@ -603,3 +614,92 @@ class RelayWorker(threading.Thread):
             return extra
 
         raise PermanentError(f"Unknown job kind {kind}")
+
+    def _deploy_guest_tools(self, job: Job, adapter: InventoryAdapter, progress: dict) -> dict:
+        from . import guest_tools
+
+        if self.automation_credentials is None:
+            raise PermanentError("The Automation Vault is unavailable")
+        payload = job.payload
+        credential_id = str(payload.get("credential_id") or "")
+        credential = self.automation_credentials.get(credential_id)
+        if credential is None:
+            raise PermanentError("The selected Automation Vault credential no longer exists")
+        bound = str(payload.get("_endpoint_fingerprint") or "")
+        if credential.scope == "endpoint" and credential.endpoint_fingerprint != bound:
+            raise PermanentError("The selected credential belongs to a different vSphere endpoint")
+        secret = self.automation_credentials.secret(credential_id)
+        if not secret:
+            raise PermanentError("The selected Automation Vault credential has no stored secret")
+        family = str(payload.get("os_family") or "")
+        address = str(payload.get("address") or "")
+        vm_id = str(payload.get("vm_id") or "")
+        username = credential.username
+        if family == "windows" and credential.kind not in {"windows", "service"}:
+            raise PermanentError("A Windows or service credential is required for this guest")
+        if family == "linux" and credential.kind not in {"ssh", "service"}:
+            raise PermanentError("An SSH or service credential is required for this guest")
+
+        status = adapter.tools_status(vm_id)
+        if status.get("running"):
+            return {"vm_id": vm_id, "os_family": family, "already_running": True, "tools": status}
+
+        phase = str(progress.get("phase") or "preflight")
+        if family == "windows":
+            options = {
+                "transport": str(payload.get("windows_transport") or "http"),
+                "port": int(payload.get("windows_port") or 5985),
+                "validate_certificate": bool(payload.get("validate_certificate", True)),
+            }
+            if phase == "preflight":
+                progress["preflight"] = guest_tools.windows_preflight(address, username, secret, **options)
+                progress["phase"] = "mount"
+                self.store.save_progress(job.id, progress)
+                phase = "mount"
+            if phase == "mount":
+                context = adapter.mount_tools_installer(vm_id)
+                progress["original_media"] = context.get("media") or {}
+                progress["phase"] = "install"
+                self.store.save_progress(job.id, progress)
+                phase = "install"
+            if phase == "install":
+                try:
+                    progress["install"] = guest_tools.windows_install(address, username, secret, **options)
+                except PermanentError:
+                    adapter.restore_tools_media(vm_id, dict(progress.get("original_media") or {}))
+                    raise
+                progress["phase"] = "verify"
+                self.store.save_progress(job.id, progress)
+        elif family == "linux":
+            options = {
+                "port": int(payload.get("linux_port") or 22),
+                "host_key_sha256": str(payload.get("ssh_host_key_sha256") or ""),
+                "sudo": bool(payload.get("sudo", True)),
+            }
+            if phase == "preflight":
+                progress["preflight"] = guest_tools.linux_preflight(address, username, secret, **options)
+                progress["phase"] = "install"
+                self.store.save_progress(job.id, progress)
+                phase = "install"
+            if phase == "install":
+                progress["install"] = guest_tools.linux_install(address, username, secret, **options)
+                progress["phase"] = "verify"
+                self.store.save_progress(job.id, progress)
+        else:
+            raise PermanentError("Unsupported guest operating system for VMware Tools deployment")
+
+        checks = int(progress.get("verification_checks") or 0)
+        limit = 180 if family == "windows" else 36
+        while checks < limit and not self._halt.is_set():
+            status = adapter.tools_status(vm_id)
+            checks += 1
+            progress.update({"phase": "verify", "verification_checks": checks, "tools": status})
+            self.store.save_progress(job.id, progress)
+            if status.get("running"):
+                if family == "windows":
+                    adapter.restore_tools_media(vm_id, dict(progress.get("original_media") or {}))
+                progress["phase"] = "done"
+                self.store.save_progress(job.id, progress)
+                return {"vm_id": vm_id, "os_family": family, "tools": status, "install": progress.get("install") or {}}
+            self._halt.wait(5)
+        raise PermanentError("VMware Tools did not report as running before the verification timeout")

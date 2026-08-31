@@ -253,6 +253,34 @@ class DemoAdapter(InventoryAdapter):
             results.append(ActionResult(vm_id=vm_id, name=vm.name, action=action, ok=True, message="Applied in demo mode"))
         return results
 
+    def tools_install_context(self, vm_id: str) -> Dict[str, Any]:
+        vm = self._vms.get(vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        return {
+            "vm_id": vm_id,
+            "name": vm.name,
+            "power_state": "poweredOn" if vm.power_state == "POWERED_ON" else "poweredOff",
+            "guest_id": vm.guest_os,
+            "tools_installer_mounted": False,
+            "tools_version_status": vm.tools_status,
+            "tools_running_status": vm.tools_status,
+            "media": {},
+        }
+
+    def mount_tools_installer(self, vm_id: str) -> Dict[str, Any]:
+        return self.tools_install_context(vm_id)
+
+    def tools_status(self, vm_id: str) -> Dict[str, Any]:
+        vm = self._vms.get(vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        running = vm.tools_status in {"toolsOk", "guestToolsRunning"}
+        return {"version_status": vm.tools_status, "running_status": vm.tools_status, "running": running}
+
+    def restore_tools_media(self, vm_id: str, media: Dict[str, Any]) -> None:
+        return None
+
     def console_ticket(self, vm_id: str, ticket_type: str = "vmrc") -> ConsoleTicket:
         vm = self._vms.get(vm_id)
         if vm is None:

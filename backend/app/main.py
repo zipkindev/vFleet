@@ -18,10 +18,15 @@ from .adapters.demo import DemoAdapter
 from .adapters.vcenter import VCenterAdapter
 from .config import settings
 from .credential_vault import CredentialVault
+from .automation_vault import AutomationCredential, AutomationCredentialStore
 from .models import (
     ActionRequest,
     ActionResponse,
     ActionResult,
+    AutomationCredentialDeleteRequest,
+    AutomationCredentialList,
+    AutomationCredentialRequest,
+    AutomationCredentialSummary,
     Catalog,
     CloneVmRequest,
     ConnectionInfo,
@@ -55,6 +60,9 @@ from .models import (
     RenameVmRequest,
     StagingCreateRequest,
     StagingSession,
+    SshHostKeyInfo,
+    ToolsDeploymentRequest,
+    ToolsDeploymentResponse,
     UploadRequest,
     VmFolder,
 )
@@ -91,6 +99,20 @@ def get_store(request: Request) -> LocalStore:
 
 def get_worker(request: Request) -> RelayWorker:
     return request.app.state.worker
+
+
+def _automation_summary(credential: AutomationCredential, store: AutomationCredentialStore) -> AutomationCredentialSummary:
+    return AutomationCredentialSummary(
+        id=credential.id,
+        name=credential.name,
+        kind=credential.kind,
+        username=credential.username,
+        scope=credential.scope,
+        endpoint_fingerprint=credential.endpoint_fingerprint,
+        has_secret=bool(store.secret(credential.id)),
+        created_at=datetime.fromisoformat(credential.created_at),
+        updated_at=datetime.fromisoformat(credential.updated_at),
+    )
 
 
 def require_token(x_ui_token: Optional[str] = Header(default=None, alias="X-UI-Token")) -> None:
@@ -235,6 +257,7 @@ async def lifespan(app: FastAPI):
         master_key=settings.vfleet_master_key.get_secret_value(),
     )
     profile_store = ConnectionProfileStore(settings.data_dir / "connections.json", credential_vault)
+    automation_store = AutomationCredentialStore(settings.data_dir / "automation_credentials.json", credential_vault)
     active_profile_id = ""
     session_source = "demo"
     if settings.has_vcenter_creds:
@@ -275,12 +298,13 @@ async def lifespan(app: FastAPI):
     adapter = build_adapter(settings)
     app.state.store = store
     app.state.profile_store = profile_store
+    app.state.automation_credentials = automation_store
     app.state.adapter = adapter
     app.state.session_source = session_source if settings.resolved_mode in {"vcenter", "esxi"} else "demo"
     app.state.swap_lock = threading.Lock()
     app.state.active_profile_id = active_profile_id
     app.state.current_endpoint_fingerprint = "demo" if settings.resolved_mode == "demo" else ""
-    worker = RelayWorker(settings, store, lambda: app.state.adapter)
+    worker = RelayWorker(settings, store, lambda: app.state.adapter, automation_store)
     app.state.worker = worker
     worker.start()
     try:
@@ -291,7 +315,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.2.0"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -369,6 +393,95 @@ def connection_profiles(request: Request) -> ConnectionProfileList:
         active_profile_id=active_profile_id,
         credential_storage=profile_store.vault.storage_label,
     )
+
+
+@app.get(
+    "/api/automation-credentials",
+    response_model=AutomationCredentialList,
+    dependencies=[Depends(require_token)],
+)
+def automation_credentials(request: Request) -> AutomationCredentialList:
+    credential_store: AutomationCredentialStore = request.app.state.automation_credentials
+    fingerprint = _current_endpoint_fingerprint(request)
+    visible = [
+        credential
+        for credential in credential_store.list()
+        if credential.scope == "global" or credential.endpoint_fingerprint == fingerprint
+    ]
+    visible.sort(key=lambda item: (item.kind, item.name.lower(), item.username.lower()))
+    return AutomationCredentialList(
+        credentials=[_automation_summary(item, credential_store) for item in visible],
+        storage=credential_store.vault.storage_label,
+    )
+
+
+@app.post(
+    "/api/automation-credentials",
+    response_model=AutomationCredentialSummary,
+    dependencies=[Depends(require_token)],
+)
+def save_automation_credential(body: AutomationCredentialRequest, request: Request) -> AutomationCredentialSummary:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to save this credential")
+    name = body.name.strip()
+    username = body.username.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Credential name is required")
+    if body.kind in {"windows", "ssh"} and not username:
+        raise HTTPException(status_code=400, detail="A username is required for Windows and SSH credentials")
+    credential_store: AutomationCredentialStore = request.app.state.automation_credentials
+    existing = credential_store.get(body.id.strip()) if body.id.strip() else None
+    if existing and existing.scope == "endpoint" and existing.endpoint_fingerprint != _current_endpoint_fingerprint(request):
+        raise HTTPException(status_code=404, detail="Unknown credential")
+    try:
+        saved = credential_store.save(
+            credential_id=body.id.strip(),
+            name=name,
+            kind=body.kind,
+            username=username,
+            secret=body.secret.get_secret_value(),
+            scope=body.scope,
+            endpoint_fingerprint=_current_endpoint_fingerprint(request),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _automation_summary(saved, credential_store)
+
+
+@app.delete("/api/automation-credentials/{credential_id}", dependencies=[Depends(require_token)])
+def delete_automation_credential(
+    credential_id: str,
+    body: AutomationCredentialDeleteRequest,
+    request: Request,
+) -> dict:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Deleting a credential requires confirm=true")
+    credential_store: AutomationCredentialStore = request.app.state.automation_credentials
+    credential = credential_store.get(credential_id)
+    fingerprint = _current_endpoint_fingerprint(request)
+    if credential is None or (credential.scope == "endpoint" and credential.endpoint_fingerprint != fingerprint):
+        raise HTTPException(status_code=404, detail="Unknown credential")
+    in_use = [job for job in request.app.state.store.open_jobs() if job.payload.get("credential_id") == credential_id]
+    if in_use:
+        raise HTTPException(status_code=409, detail="This credential is referenced by queued or running jobs")
+    credential_store.delete(credential_id)
+    return {"deleted": True, "credential_id": credential_id}
+
+
+@app.get("/api/tools/ssh-host-key", response_model=SshHostKeyInfo, dependencies=[Depends(require_token)])
+def tools_ssh_host_key(address: str = Query(...), port: int = Query(default=22, ge=1, le=65535)) -> SshHostKeyInfo:
+    target = address.strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Address is required")
+    from .guest_tools import ssh_host_key_sha256
+
+    try:
+        fingerprint = ssh_host_key_sha256(target, port)
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return SshHostKeyInfo(address=target, port=port, fingerprint=fingerprint)
 
 
 @app.post(
@@ -737,6 +850,88 @@ def actions(body: ActionRequest, request: Request) -> ActionResponse:
         job_id=job.id,
         queued=True,
     )
+
+
+def _guest_os_family(value: str) -> str:
+    label = value.lower()
+    if "windows" in label or label.startswith("win"):
+        return "windows"
+    if any(token in label for token in ("linux", "ubuntu", "debian", "rhel", "red hat", "centos", "suse", "oracle", "photon", "fedora")):
+        return "linux"
+    return ""
+
+
+@app.post("/api/tools/deploy", response_model=ToolsDeploymentResponse, dependencies=[Depends(require_token)])
+def deploy_guest_tools(body: ToolsDeploymentRequest, request: Request) -> ToolsDeploymentResponse:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Review the targets and set confirm=true to deploy VMware Tools")
+    if not body.targets:
+        raise HTTPException(status_code=400, detail="No virtual machines selected")
+    if len(body.targets) > 50:
+        raise HTTPException(status_code=400, detail="Refusing more than 50 VMs in one deployment batch")
+    credential_store: AutomationCredentialStore = request.app.state.automation_credentials
+    credential = credential_store.get(body.credential_id.strip())
+    fingerprint = _current_endpoint_fingerprint(request)
+    if credential is None or (credential.scope == "endpoint" and credential.endpoint_fingerprint != fingerprint):
+        raise HTTPException(status_code=400, detail="Select an available Automation Vault credential")
+    if not credential_store.secret(credential.id):
+        raise HTTPException(status_code=400, detail="The selected credential has no stored secret")
+    snapshot = request.app.state.worker.cached_snapshot()
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="Inventory is not ready yet")
+    by_id = {vm.id: vm for vm in snapshot.vms}
+    seen = set()
+    jobs: List[Job] = []
+    failures: List[str] = []
+    for target in body.targets:
+        vm_id = target.vm_id.strip()
+        vm = by_id.get(vm_id)
+        if not vm or vm_id in seen:
+            failures.append(f"{vm_id or 'Unknown VM'}: not found or selected more than once")
+            continue
+        seen.add(vm_id)
+        address = target.address.strip()
+        if not address or any(character.isspace() for character in address):
+            failures.append(f"{vm.name}: enter a valid guest IP address or DNS name")
+            continue
+        if normalize_power_state(vm.power_state) != "POWERED_ON":
+            failures.append(f"{vm.name}: power on the guest before deploying Tools")
+            continue
+        family = target.os_family if target.os_family != "auto" else _guest_os_family(vm.guest_os)
+        if family not in {"windows", "linux"}:
+            failures.append(f"{vm.name}: choose Windows or Linux because the guest OS could not be identified")
+            continue
+        expected_kind = "windows" if family == "windows" else "ssh"
+        if credential.kind not in {expected_kind, "service"}:
+            failures.append(f"{vm.name}: the selected {credential.kind} credential cannot manage a {family} guest")
+            continue
+        host_key = target.ssh_host_key_sha256.strip()
+        if family == "linux" and not host_key.startswith("SHA256:"):
+            failures.append(f"{vm.name}: review and accept its SSH host-key fingerprint")
+            continue
+        payload = {
+            "vm_id": vm_id,
+            "vm_name": vm.name,
+            "address": address,
+            "os_family": family,
+            "credential_id": credential.id,
+            "windows_transport": body.windows_transport,
+            "windows_port": body.windows_port,
+            "validate_certificate": body.validate_certificate,
+            "linux_port": body.linux_port,
+            "sudo": body.sudo,
+            "ssh_host_key_sha256": host_key,
+        }
+        jobs.append(
+            _enqueue(
+                request,
+                "tools_deploy",
+                f"Deploy VMware Tools to {vm.name}",
+                payload,
+                idempotency_key=f"tools_deploy:{vm_id}:{family}",
+            )
+        )
+    return ToolsDeploymentResponse(jobs=jobs, failures=failures)
 
 
 @app.post("/api/vms", response_model=Job, dependencies=[Depends(require_token)])

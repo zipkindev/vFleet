@@ -1,6 +1,8 @@
 import type {
   ActionName,
   ActionResult,
+  AutomationCredential,
+  AutomationCredentialList,
   Catalog,
   ConnectionInfo,
   ConnectionProfileList,
@@ -14,6 +16,8 @@ import type {
   MetricsResponse,
   MigrationAccessStatus,
   StagingSession,
+  ToolsDeploymentResponse,
+  ToolsDeploymentTarget,
   VmFolder,
 } from "./types";
 
@@ -130,6 +134,52 @@ export async function runActions(vmIds: string[], action: ActionName): Promise<A
     body: JSON.stringify({ vm_ids: vmIds, action, confirm: true }),
   });
   return payload.results;
+}
+
+export async function fetchAutomationCredentials(): Promise<AutomationCredentialList> {
+  return request<AutomationCredentialList>("/api/automation-credentials");
+}
+
+export async function saveAutomationCredential(body: {
+  id?: string;
+  name: string;
+  kind: "windows" | "ssh" | "service";
+  username: string;
+  secret: string;
+  scope: "global" | "endpoint";
+}): Promise<AutomationCredential> {
+  return request<AutomationCredential>("/api/automation-credentials", {
+    method: "POST",
+    body: JSON.stringify({ ...body, confirm: true }),
+  });
+}
+
+export async function deleteAutomationCredential(id: string): Promise<void> {
+  await request<{ deleted: boolean }>(`/api/automation-credentials/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirm: true }),
+  });
+}
+
+export async function fetchSshHostKey(address: string, port = 22): Promise<string> {
+  const query = new URLSearchParams({ address, port: String(port) });
+  const result = await request<{ fingerprint: string }>(`/api/tools/ssh-host-key?${query}`);
+  return result.fingerprint;
+}
+
+export async function deployGuestTools(body: {
+  targets: ToolsDeploymentTarget[];
+  credential_id: string;
+  windows_transport: "http" | "https";
+  windows_port: number;
+  validate_certificate: boolean;
+  linux_port: number;
+  sudo: boolean;
+}): Promise<ToolsDeploymentResponse> {
+  return request<ToolsDeploymentResponse>("/api/tools/deploy", {
+    method: "POST",
+    body: JSON.stringify({ ...body, confirm: true }),
+  });
 }
 
 export async function fetchConsoleTicket(vmId: string, type: "vmrc" | "webmks" = "vmrc"): Promise<ConsoleTicket> {

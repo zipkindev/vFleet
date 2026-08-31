@@ -34,8 +34,10 @@ import { ThemePanel } from "./ThemePanel";
 import { ThemeProvider } from "./ThemeContext";
 import { TableFit } from "./TableFit";
 import { VmActionsMenu } from "./VmActionsMenu";
+import { CredentialVaultView } from "./CredentialVaultView";
+import { ToolsDeploymentModal } from "./ToolsDeploymentModal";
 
-type View = "overview" | "monitoring" | "hosts" | "machines" | "datastores" | "jobs" | "owners" | "reclaim";
+type View = "overview" | "monitoring" | "hosts" | "machines" | "datastores" | "jobs" | "vault" | "owners" | "reclaim";
 
 const ACTIONS: { id: ActionName; label: string; danger?: boolean; hint: string }[] = [
   { id: "shutdown", label: "Guest shutdown", hint: "Graceful stop via VMware Tools" },
@@ -128,8 +130,9 @@ export function App() {
   const [showMigrate, setShowMigrate] = useState(false);
   const [migrateTargets, setMigrateTargets] = useState<VirtualMachine[] | null>(null);
   const [diskTargets, setDiskTargets] = useState<VirtualMachine[] | null>(null);
+  const [toolsTargets, setToolsTargets] = useState<VirtualMachine[] | null>(null);
   const [actionTargets, setActionTargets] = useState<VirtualMachine[] | null>(null);
-  const [batchIntent, setBatchIntent] = useState<"migrate" | "disk_convert" | ActionName | null>(null);
+  const [batchIntent, setBatchIntent] = useState<"migrate" | "disk_convert" | "tools_deploy" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
   const [showChangelog, setShowChangelog] = useState(false);
   const [showTheme, setShowTheme] = useState(false);
@@ -339,6 +342,19 @@ export function App() {
     setDiskTargets(targets);
   }
 
+  function openToolsDeploy(rows?: VirtualMachine[]) {
+    const targets = rows ?? selectedFromData();
+    if (targets.length === 0) {
+      setNotice("Select one or more VMs first");
+      return;
+    }
+    if (targets.length > BATCH_LIMIT) {
+      setBatchIntent("tools_deploy");
+      return;
+    }
+    setToolsTargets(targets);
+  }
+
   function requestDrsOverride(rows?: VirtualMachine[]) {
     const targets = rows ?? selectedFromData();
     const eligible = targets.filter((vm) => !vm.drs_override && vm.cluster_id);
@@ -456,6 +472,10 @@ export function App() {
     }
     if (intent === "disk_convert") {
       setDiskTargets(included);
+      return;
+    }
+    if (intent === "tools_deploy") {
+      setToolsTargets(included);
       return;
     }
     setActionTargets(included);
@@ -614,6 +634,7 @@ export function App() {
               ["machines", "Machines"],
               ["datastores", "Datastores"],
               ["jobs", "Jobs"],
+              ["vault", "Vault"],
               ["owners", "Owners"],
               ["reclaim", "Reclaim"],
             ] as [View, string][]
@@ -807,6 +828,7 @@ export function App() {
               {view === "machines" && connection?.capabilities?.disk_convert ? (
                 <button onClick={() => openDiskConvert()}>Convert disks</button>
               ) : null}
+              {view === "machines" ? <button onClick={() => openToolsDeploy()}>Deploy VMware Tools</button> : null}
               {ACTIONS.map((action) => (
                 <button
                   key={action.id}
@@ -865,6 +887,7 @@ export function App() {
             onVmRename={openVmRename}
             onVmDrsOverride={openVmDrsOverride}
             onVmDiskConvert={(vm) => openDiskConvert([vm])}
+            onVmToolsDeploy={(vm) => openToolsDeploy([vm])}
             onDrsOverride={() => requestDrsOverride()}
             onDiskConvert={() => openDiskConvert()}
           />
@@ -882,6 +905,7 @@ export function App() {
           />
         ) : null}
         {view === "jobs" ? <JobsView data={jobs} onRefresh={onJobsRefresh} /> : null}
+        {view === "vault" ? <CredentialVaultView /> : null}
         {view === "owners" ? (
           <OwnerTable
             owners={owners}
@@ -987,10 +1011,26 @@ export function App() {
         />
       ) : null}
 
+      {toolsTargets && toolsTargets.length > 0 ? (
+        <ToolsDeploymentModal
+          vms={toolsTargets}
+          onClose={() => setToolsTargets(null)}
+          onQueued={(queuedJobs, failures, queuedVmIds) => {
+            setToolsTargets(null);
+            dropCompleted(queuedVmIds);
+            setNotice(failures.length
+              ? `${queuedJobs.length} Tools deployment(s) queued; ${failures.length} skipped: ${failures.join("; ")}`
+              : `${queuedJobs.length} VMware Tools deployment${queuedJobs.length === 1 ? "" : "s"} queued. Watch Jobs for independent progress.`);
+            setView("jobs");
+            void load();
+          }}
+        />
+      ) : null}
+
       {batchIntent ? (
         <BatchLimitDialog
           vms={selectedFromData()}
-          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : batchIntent === "disk_convert" ? "Convert disk provisioning" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
+          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : batchIntent === "disk_convert" ? "Convert disk provisioning" : batchIntent === "tools_deploy" ? "Deploy VMware Tools" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
           onCancel={() => setBatchIntent(null)}
           onAccept={acceptBatch}
         />
@@ -1347,6 +1387,7 @@ const VmTable = React.memo(function VmTable({
   onVmRename,
   onVmDrsOverride,
   onVmDiskConvert,
+  onVmToolsDeploy,
   onDiskConvert,
 }: {
   vms: VirtualMachine[];
@@ -1363,6 +1404,7 @@ const VmTable = React.memo(function VmTable({
   onVmRename: (vm: VirtualMachine) => void;
   onVmDrsOverride: (vm: VirtualMachine) => void;
   onVmDiskConvert: (vm: VirtualMachine) => void;
+  onVmToolsDeploy: (vm: VirtualMachine) => void;
   onDiskConvert: () => void;
 }) {
   const [sortKey, setSortKey] = useState<MachineSortKey>("name");
@@ -1554,6 +1596,7 @@ const VmTable = React.memo(function VmTable({
                       onRename={onVmRename}
                       onDrsOverride={onVmDrsOverride}
                       onDiskConvert={onVmDiskConvert}
+                      onToolsDeploy={onVmToolsDeploy}
                     />
                   </td>
                   <td>

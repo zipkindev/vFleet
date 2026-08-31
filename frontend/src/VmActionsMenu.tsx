@@ -27,6 +27,7 @@ type VmActionsMenuProps = {
   onRename: (vm: VirtualMachine) => void;
   onDrsOverride: (vm: VirtualMachine) => void;
   onDiskConvert: (vm: VirtualMachine) => void;
+  onToolsDeploy: (vm: VirtualMachine) => void;
 };
 
 function powerOn(vm: VirtualMachine) {
@@ -65,6 +66,7 @@ export function VmActionsMenu({
   onRename,
   onDrsOverride,
   onDiskConvert,
+  onToolsDeploy,
 }: VmActionsMenuProps) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<MenuPos | null>(null);
@@ -182,6 +184,13 @@ export function VmActionsMenu({
   ];
 
   const manageItems: MenuAction[] = [
+    {
+      id: "deploy_tools",
+      label: "Deploy VMware Tools automatically",
+      disabled: !live || !poweredOn(vm),
+      hint: !live ? demoHint : poweredOn(vm) ? "Windows via WinRM or Linux via SSH" : "Power on the VM first",
+      onClick: () => run(() => onToolsDeploy(vm)),
+    },
     {
       id: "mount_tools",
       label: "Mount VMware Tools installer",

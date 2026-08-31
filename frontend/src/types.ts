@@ -241,6 +241,35 @@ export type InventorySnapshot = {
 
 export type ActionName = "start" | "shutdown" | "power_off" | "reboot" | "reset" | "suspend" | "mount_tools" | "destroy";
 
+export type AutomationCredential = {
+  id: string;
+  name: string;
+  kind: "windows" | "ssh" | "service";
+  username: string;
+  scope: "global" | "endpoint";
+  endpoint_fingerprint: string;
+  has_secret: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AutomationCredentialList = {
+  credentials: AutomationCredential[];
+  storage: string;
+};
+
+export type ToolsDeploymentTarget = {
+  vm_id: string;
+  address: string;
+  os_family: "auto" | "windows" | "linux";
+  ssh_host_key_sha256?: string;
+};
+
+export type ToolsDeploymentResponse = {
+  jobs: Job[];
+  failures: string[];
+};
+
 export type ActionResult = {
   vm_id: string;
   name: string;

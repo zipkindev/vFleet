@@ -636,6 +636,101 @@ class VCenterAdapter(InventoryAdapter):
             message="Opened via pyVmomi AcquireTicket",
         )
 
+    def tools_install_context(self, vm_id: str) -> Dict[str, Any]:
+        from pyVmomi import vim
+
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        runtime = getattr(vm, "runtime", None)
+        guest = getattr(vm, "guest", None)
+        config = getattr(vm, "config", None)
+        devices = getattr(getattr(config, "hardware", None), "device", None) or []
+        cd = next((device for device in devices if isinstance(device, vim.vm.device.VirtualCdrom)), None)
+        media: Dict[str, Any] = {}
+        if cd is not None:
+            backing = getattr(cd, "backing", None)
+            datastore = getattr(backing, "datastore", None)
+            media = {
+                "device_key": int(getattr(cd, "key", 0) or 0),
+                "file_name": str(getattr(backing, "fileName", "") or ""),
+                "datastore_id": _moid(datastore) if datastore is not None else "",
+                "connected": bool(getattr(getattr(cd, "connectable", None), "connected", False)),
+                "start_connected": bool(getattr(getattr(cd, "connectable", None), "startConnected", False)),
+            }
+        return {
+            "vm_id": vm_id,
+            "name": str(getattr(vm, "name", "") or vm_id),
+            "power_state": str(getattr(runtime, "powerState", "") or ""),
+            "guest_id": str(getattr(config, "guestId", "") or ""),
+            "tools_installer_mounted": bool(getattr(runtime, "toolsInstallerMounted", False)),
+            "tools_version_status": str(getattr(guest, "toolsVersionStatus2", "") or ""),
+            "tools_running_status": str(getattr(guest, "toolsRunningStatus", "") or ""),
+            "media": media,
+        }
+
+    def mount_tools_installer(self, vm_id: str) -> Dict[str, Any]:
+        context = self.tools_install_context(vm_id)
+        if context["power_state"] != "poweredOn":
+            raise PermanentError("Power on the VM before installing VMware Tools")
+        if not context["tools_installer_mounted"]:
+            vm = self._find_vm(self._session().content, vm_id)
+            if vm is None:
+                raise PermanentError("Unknown VM")
+            vm.MountToolsInstaller()
+        return context
+
+    def tools_status(self, vm_id: str) -> Dict[str, Any]:
+        context = self.tools_install_context(vm_id)
+        return {
+            "version_status": context["tools_version_status"],
+            "running_status": context["tools_running_status"],
+            "running": context["tools_running_status"] == "guestToolsRunning",
+        }
+
+    def restore_tools_media(self, vm_id: str, media: Dict[str, Any]) -> None:
+        from pyVmomi import vim
+
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        if bool(getattr(getattr(vm, "runtime", None), "toolsInstallerMounted", False)):
+            vm.UnmountToolsInstaller()
+        original_file = str(media.get("file_name") or "")
+        if not original_file:
+            return
+        devices = getattr(getattr(getattr(vm, "config", None), "hardware", None), "device", None) or []
+        device_key = int(media.get("device_key") or 0)
+        cd = next(
+            (
+                device
+                for device in devices
+                if isinstance(device, vim.vm.device.VirtualCdrom)
+                and (not device_key or int(getattr(device, "key", 0) or 0) == device_key)
+            ),
+            None,
+        )
+        if cd is None:
+            raise PermanentError("The original virtual CD-ROM device is no longer available")
+        if str(getattr(getattr(cd, "backing", None), "fileName", "") or "") == original_file:
+            return
+        datastore = None
+        datastore_id = str(media.get("datastore_id") or "")
+        if datastore_id:
+            datastore = self._obj(vim.Datastore, datastore_id)
+        backing = vim.vm.device.VirtualCdrom.IsoBackingInfo()
+        backing.fileName = original_file
+        backing.datastore = datastore
+        cd.backing = backing
+        if getattr(cd, "connectable", None) is not None:
+            cd.connectable.connected = bool(media.get("connected", True))
+            cd.connectable.startConnected = bool(media.get("start_connected", True))
+        change = vim.vm.device.VirtualDeviceSpec()
+        change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+        change.device = cd
+        spec = vim.vm.ConfigSpec(deviceChange=[change])
+        self.wait_task(_moid(vm.ReconfigVM_Task(spec=spec)))
+
     def close(self) -> None:
         self._rest.close()
         self._drop_session()

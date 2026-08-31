@@ -41,6 +41,18 @@ class InventoryAdapter(ABC):
     def console_ticket(self, vm_id: str, ticket_type: str = "vmrc") -> ConsoleTicket:
         raise NotImplementedError(f"{type(self).__name__} cannot launch a VM console")
 
+    def tools_install_context(self, vm_id: str) -> Dict[str, Any]:
+        raise NotImplementedError(f"{type(self).__name__} cannot inspect VMware Tools installation media")
+
+    def mount_tools_installer(self, vm_id: str) -> Dict[str, Any]:
+        raise NotImplementedError(f"{type(self).__name__} cannot mount VMware Tools installation media")
+
+    def tools_status(self, vm_id: str) -> Dict[str, Any]:
+        raise NotImplementedError(f"{type(self).__name__} cannot inspect VMware Tools status")
+
+    def restore_tools_media(self, vm_id: str, media: Dict[str, Any]) -> None:
+        raise NotImplementedError(f"{type(self).__name__} cannot restore VMware Tools installation media")
+
     def list_datastores(self) -> List[DatastoreSummary]:
         return []
 

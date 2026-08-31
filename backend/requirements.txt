@@ -7,4 +7,6 @@ pyvmomi==8.0.3.0.1
 pytest==8.3.4
 httpx==0.28.1
 paramiko==5.0.0
+pywinrm==0.5.0
+urllib3==1.26.20
 cryptography==50.0.1

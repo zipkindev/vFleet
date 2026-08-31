@@ -12,6 +12,7 @@ This talks only to endpoints you configure. UI-saved credentials live in vFleet'
 | Clusters, hosts, VMs | PropertyCollector inventory | Names, power state, guest OS, Tools, IP, configured vCPU/RAM, current host/cluster. Cached locally so the UI keeps working if the VPN drops. |
 | CPU / memory utilization | `summary.quickStats` | Live usage (MHz / guest memory). This is the same family of numbers the vSphere UI uses, not guest-inside telemetry. |
 | Power on / off / reset / suspend | Local job queue → VIM power methods | **Guest shutdown/reboot** needs VMware Tools. Hard power-off does not. Queued on disk; retried after disconnects. |
+| Install VMware Tools | Windows WinRM + host Tools ISO; Linux SSH + `open-vm-tools` | Single or bulk action. Uses a selected encrypted Automation Vault credential, pins Linux SSH host keys, and gives every guest an independent endpoint-bound job. |
 | Migrate host / convert disks | Local job → vCenter `RelocateVM` or verified ESXi SSH | vCenter uses Storage vMotion. Direct ESXi uses an allowlisted `vmkfstools` clone because HostAgent can reject in-place relocation. **50 VMs per job** is a vFleet relay cap; extra VMs are deferred to a second batch. |
 | Create VM | Clone from a template already on the remote side | Small SOAP call. Prefer this over uploading an OVA across a WAN. Resumes by reattaching the vCenter task. |
 | Datastores | Inventory + datastore browser | Capacity, free space, browse folders, mkdir, delete file. Last listing is cached when vCenter is unreachable. |
@@ -35,9 +36,21 @@ Connect to an ESXi management address exactly as you would connect to vCenter. v
 
 Every job records the endpoint fingerprint it was created for. A queued task will fail closed rather than run after the operator switches to a different vCenter or ESXi host.
 
+## Guest automation and the Automation Vault
+
+The **Vault** page stores reusable Windows/WinRM, Linux/SSH, and general service credentials. Non-secret metadata is portable JSON; each password or token is a separate AES-256-GCM record protected by the same external master-key strategy used for vSphere connections. API responses and job payloads contain credential IDs only.
+
+Select one or more powered-on VMs and choose **Deploy VMware Tools**:
+
+- Windows Server and desktop guests use WinRM with encrypted NTLM messages (or HTTPS), verify local-administrator access, mount the ESXi/vCenter-provided Tools ISO, run the silent installer, verify Tools after the scheduled reboot, and restore prior CD media.
+- Linux guests use password-authenticated SSH with a reviewed SHA-256 host-key fingerprint. The relay installs the distribution-supported `open-vm-tools` package through apt, dnf/yum, zypper, tdnf, or apk and validates `vmtoolsd`.
+- Mixed and bulk selections remain independent jobs. One guest failure does not roll back or fail other guests.
+
+The guest must already be network reachable from the vFleet host. Windows requires WinRM and an administrator credential; Linux requires SSH and root or sudo. VMware Guest Operations cannot bootstrap a first Tools installation because that API itself depends on a running Tools agent.
+
 ## Honest limits
 
-- **Guest last login / “who is using this desktop”** needs VMware Tools guest operations plus guest credentials (or a guest agent). That is a later, opt-in step because it reaches into the OS.
+- **Guest last login / “who is using this desktop”** is not collected. The Automation Vault and Tools deployment are explicit opt-in guest access; vFleet does not scan guest accounts or retain command output containing secrets.
 - **vSphere Tags** are a separate tagging service. v1 reads **custom fields** and the **VM name prefix**. Tags can be added if you use them for owner.
 - Historical charts (p95 over 7 days) would use `PerformanceManager`; v1 uses live quickStats plus event recency, which is enough to triage labs.
 - Power actions are **dangerous**. The UI requires an explicit confirm. Default bind is `127.0.0.1`. Optional `UI_TOKEN` gates the API.
@@ -105,6 +118,9 @@ scripts/vfleet inventory --kind vms
 scripts/vfleet host
 scripts/vfleet disk-plan VM_ID --target thin
 scripts/vfleet disk-convert VM_ID --target thin --yes
+scripts/vfleet credentials
+scripts/vfleet credential-add "Linux admins" --kind ssh --user operator
+scripts/vfleet tools-deploy CREDENTIAL_ID VM_ID=10.20.1.8 --yes
 scripts/vfleet jobs
 scripts/vfleet job JOB_ID --wait
 ```
