@@ -183,6 +183,17 @@ export function VmActionsMenu({
 
   const manageItems: MenuAction[] = [
     {
+      id: "mount_tools",
+      label: "Mount VMware Tools installer",
+      disabled: !live || !poweredOn(vm),
+      hint: !live
+        ? demoHint
+        : poweredOn(vm)
+          ? "Connects the host-provided Tools ISO; start setup inside the guest"
+          : "Power on the VM first",
+      onClick: () => run(() => onAction(vm, "mount_tools")),
+    },
+    {
       id: "rename",
       label: "Rename",
       disabled: !live,

@@ -45,7 +45,7 @@ from ..transfer import VCenterRest, library_upload, put_file
 from ..vm_storage import disk_summaries, normalize_disk_transform, summarize_disks
 from .base import InventoryAdapter
 
-ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "destroy"}
+ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "mount_tools", "destroy"}
 
 
 def _utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -438,6 +438,7 @@ class VCenterAdapter(InventoryAdapter):
                 continue
             name = vm.name
             try:
+                message = "Accepted"
                 if action == "start":
                     if str(vm.runtime.powerState) == "poweredOn":
                         results.append(ActionResult(vm_id=vm_id, name=name, action=action, ok=True, message="Already powered on"))
@@ -459,6 +460,17 @@ class VCenterAdapter(InventoryAdapter):
                     vm.ShutdownGuest()
                 elif action == "reboot":
                     vm.RebootGuest()
+                elif action == "mount_tools":
+                    if str(vm.runtime.powerState) != "poweredOn":
+                        raise PermanentError("Power on the VM before mounting the VMware Tools installer")
+                    if bool(getattr(vm.runtime, "toolsInstallerMounted", False)):
+                        message = "VMware Tools installer is already mounted"
+                    else:
+                        vm.MountToolsInstaller()
+                        message = (
+                            "VMware Tools installer mounted. A first-time installation must still be started "
+                            "inside the guest operating system."
+                        )
                 elif action == "destroy":
                     if bool(getattr(getattr(vm, "config", None), "template", False)):
                         results.append(
@@ -474,7 +486,7 @@ class VCenterAdapter(InventoryAdapter):
                     if str(vm.runtime.powerState) != "poweredOff":
                         self.wait_task(_moid(vm.PowerOff()))
                     self.wait_task(_moid(vm.Destroy()))
-                results.append(ActionResult(vm_id=vm_id, name=name, action=action, ok=True, message="Accepted"))
+                results.append(ActionResult(vm_id=vm_id, name=name, action=action, ok=True, message=message))
             except vim.fault.ToolsUnavailable:
                 results.append(
                     ActionResult(

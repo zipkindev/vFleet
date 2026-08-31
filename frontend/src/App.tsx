@@ -45,6 +45,11 @@ const ACTIONS: { id: ActionName; label: string; danger?: boolean; hint: string }
   { id: "reset", label: "Reset", danger: true, hint: "Hard reset" },
   { id: "suspend", label: "Suspend", hint: "Pause the VM" },
   {
+    id: "mount_tools",
+    label: "Mount VMware Tools installer",
+    hint: "Connects the host-provided Tools ISO; a first-time install must then be started inside the guest",
+  },
+  {
     id: "destroy",
     label: "Delete from disk",
     danger: true,

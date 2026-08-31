@@ -78,7 +78,7 @@ from .vm_storage import normalize_disk_transform
 from .errors import PermanentError
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "destroy"}
+ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "mount_tools", "destroy"}
 
 
 def get_adapter(request: Request) -> InventoryAdapter:
@@ -291,7 +291,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(

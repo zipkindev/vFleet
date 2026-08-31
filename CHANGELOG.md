@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.3] — 2026-08-31
+
+feat: mount VMware Tools installers from VM actions
+
+- Adds a confirmed, relay-backed VM action for mounting the host-provided VMware Tools ISO.
+- Reports that first-time installation still requires an authenticated execution inside the guest operating system.
+- Keeps the operation idempotent when the Tools installer is already mounted.
+
 ## [1.1.2] — 2026-08-31
 
 fix: delete VMDKs through the safe virtual-disk manager

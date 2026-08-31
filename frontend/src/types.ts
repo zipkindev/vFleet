@@ -239,7 +239,7 @@ export type InventorySnapshot = {
   owners: OwnerReport[];
 };
 
-export type ActionName = "start" | "shutdown" | "power_off" | "reboot" | "reset" | "suspend" | "destroy";
+export type ActionName = "start" | "shutdown" | "power_off" | "reboot" | "reset" | "suspend" | "mount_tools" | "destroy";
 
 export type ActionResult = {
   vm_id: string;

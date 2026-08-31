@@ -195,6 +195,28 @@ class DemoAdapter(InventoryAdapter):
                     ActionResult(vm_id=vm_id, name=vm.name, action=action, ok=True, message="Deleted from disk in demo mode")
                 )
                 continue
+            if action == "mount_tools":
+                if vm.power_state != "POWERED_ON":
+                    results.append(
+                        ActionResult(
+                            vm_id=vm_id,
+                            name=vm.name,
+                            action=action,
+                            ok=False,
+                            message="Power on the VM before mounting the VMware Tools installer",
+                        )
+                    )
+                else:
+                    results.append(
+                        ActionResult(
+                            vm_id=vm_id,
+                            name=vm.name,
+                            action=action,
+                            ok=True,
+                            message="VMware Tools installer mounted in demo mode",
+                        )
+                    )
+                continue
             if next_state is None:
                 results.append(
                     ActionResult(vm_id=vm_id, name=vm.name, action=action, ok=False, message="Unsupported action")
