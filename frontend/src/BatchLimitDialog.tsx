@@ -65,11 +65,11 @@ export function BatchLimitDialog({ vms, actionLabel, onCancel, onAccept }: Props
       <div className="modal login-modal batch-modal" onClick={(event) => event.stopPropagation()}>
         <h2>Batch is over {BATCH_LIMIT}</h2>
         <p>
-          {actionLabel} is limited to {BATCH_LIMIT} VMs per job so the local relay stays responsive. Lowest-impact VMs
+          {actionLabel} is limited to {BATCH_LIMIT} VMs per reviewed batch so the local relay stays responsive. Lowest-impact VMs
           (powered off, idle, small) were deferred for a second batch. This is not a vSphere vMotion cap.
         </p>
         <p className="migrate-summary">
-          This job <BatchCount count={includedVms.length} /> · deferred {deferredVms.length} of {vms.length}
+          This batch <BatchCount count={includedVms.length} /> · deferred {deferredVms.length} of {vms.length}
         </p>
         <p className="batch-hint" title={BATCH_LIMIT_HINT}>
           Uncheck a kept VM to free a slot, then check a deferred VM to include it instead.
@@ -107,7 +107,7 @@ export function BatchLimitDialog({ vms, actionLabel, onCancel, onAccept }: Props
             disabled={includedVms.length === 0}
             onClick={() => onAccept(includedVms)}
           >
-            Use {includedVms.length} in this job
+            Review {includedVms.length} in this batch
           </button>
         </div>
       </div>

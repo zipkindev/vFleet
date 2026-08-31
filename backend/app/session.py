@@ -71,6 +71,20 @@ def resolve_login_password(provided: str, host: str, user: str, port: int, setti
     return ""
 
 
+def resolve_ssh_password(provided: str, host: str, user: str, port: int, settings: Settings) -> str:
+    """Reuse an existing SSH secret only for the same saved endpoint and SSH identity."""
+    if provided:
+        return provided
+    if (
+        settings.esxi_ssh_password
+        and host == settings.vcenter_host
+        and user == settings.esxi_ssh_user
+        and port == settings.esxi_ssh_port
+    ):
+        return settings.esxi_ssh_password
+    return ""
+
+
 def persist_vcenter(
     settings: Settings,
     host: str,

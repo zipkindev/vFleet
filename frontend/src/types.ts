@@ -31,6 +31,10 @@ export type ConnectionInfo = {
   endpoint_fingerprint: string;
   capabilities: Record<string, boolean>;
   ssh_configured: boolean;
+  ssh_user: string;
+  ssh_port: number;
+  ssh_host_key_sha256: string;
+  has_saved_ssh_password: boolean;
 };
 
 export type HostSummary = {

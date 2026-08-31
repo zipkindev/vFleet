@@ -1,10 +1,10 @@
 import type { VirtualMachine } from "./types";
 
-/** Local relay queue cap for power, migrate, and reclaim jobs. Not a vSphere vMotion limit. */
+/** Local UI cap for one reviewed batch. Not a vSphere or vMotion limit. */
 export const BATCH_LIMIT = 50;
 
 export const BATCH_LIMIT_HINT =
-  "vFleet queues at most 50 VMs per job (power, migrate, reclaim). That is a local relay limit so one request cannot stall the queue, not a vSphere vMotion cap. Extra VMs stay selected for a second batch.";
+  "vFleet reviews at most 50 VMs per batch so one request cannot stall the local relay. Disk conversions are still queued as independent persistent jobs. This is not a vSphere or vMotion cap; extra VMs stay selected for a second batch.";
 
 export function batchTone(count: number): "ok" | "full" | "over" {
   if (count > BATCH_LIMIT) return "over";

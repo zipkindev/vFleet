@@ -58,7 +58,14 @@ from .grouping import vm_matches_owner_query, vm_matches_search
 from .metrics import build_owner_utilization
 from .power import normalize_power_state
 from .relay import RelayWorker
-from .session import apply_runtime, forget_vcenter, parse_endpoint, persist_vcenter, resolve_login_password
+from .session import (
+    apply_runtime,
+    forget_vcenter,
+    parse_endpoint,
+    persist_vcenter,
+    resolve_login_password,
+    resolve_ssh_password,
+)
 from .store import LocalStore
 from .vm_storage import normalize_disk_transform
 from .errors import PermanentError
@@ -109,6 +116,10 @@ def decorate_connection(conn: ConnectionInfo, request: Request) -> ConnectionInf
             "saved_user": settings.vcenter_user,
             "saved_port": settings.vcenter_port,
             "insecure": settings.vcenter_insecure,
+            "ssh_user": settings.esxi_ssh_user,
+            "ssh_port": settings.esxi_ssh_port,
+            "ssh_host_key_sha256": settings.esxi_ssh_host_key_sha256,
+            "has_saved_ssh_password": bool(settings.esxi_ssh_password),
             "can_disconnect": conn.mode in {"vcenter", "esxi"},
         }
     )
@@ -202,7 +213,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -282,6 +293,12 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     password = resolve_login_password(body.password or "", endpoint, user, port, settings)
     if not password:
         raise HTTPException(status_code=400, detail="Host, username, and password are required")
+    ssh_user = body.ssh_user.strip()
+    ssh_password = (
+        resolve_ssh_password(body.ssh_password or "", endpoint, ssh_user, body.ssh_port, settings)
+        if body.ssh_enabled
+        else ""
+    )
 
     live = apply_runtime(
         settings,
@@ -291,8 +308,8 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         port,
         body.insecure,
         ssh_enabled=body.ssh_enabled,
-        ssh_user=body.ssh_user,
-        ssh_password=body.ssh_password,
+        ssh_user=ssh_user,
+        ssh_password=ssh_password,
         ssh_port=body.ssh_port,
         ssh_host_key_sha256=body.ssh_host_key_sha256,
     )
@@ -318,6 +335,10 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
                 "saved_user": settings.vcenter_user,
                 "saved_port": settings.vcenter_port,
                 "insecure": settings.vcenter_insecure,
+                "ssh_user": settings.esxi_ssh_user,
+                "ssh_port": settings.esxi_ssh_port,
+                "ssh_host_key_sha256": settings.esxi_ssh_host_key_sha256,
+                "has_saved_ssh_password": bool(settings.esxi_ssh_password),
                 "queued_jobs": counts["queued"],
                 "active_jobs": counts["active"],
             }
@@ -347,8 +368,8 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     settings.vcenter_port = port
     settings.vcenter_insecure = body.insecure
     settings.esxi_ssh_enabled = body.ssh_enabled
-    settings.esxi_ssh_user = body.ssh_user
-    settings.esxi_ssh_password = body.ssh_password
+    settings.esxi_ssh_user = ssh_user
+    settings.esxi_ssh_password = ssh_password
     settings.esxi_ssh_port = body.ssh_port
     settings.esxi_ssh_host_key_sha256 = body.ssh_host_key_sha256
     if body.remember:
@@ -361,8 +382,8 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
             body.insecure,
             endpoint_kind=info.endpoint_kind,
             ssh_enabled=body.ssh_enabled,
-            ssh_user=body.ssh_user,
-            ssh_password=body.ssh_password,
+            ssh_user=ssh_user,
+            ssh_password=ssh_password,
             ssh_port=body.ssh_port,
             ssh_host_key_sha256=body.ssh_host_key_sha256,
         )

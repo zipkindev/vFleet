@@ -1,57 +1,102 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { convertVmDisks, planDiskConversion } from "./api";
 import { bytes, powerLabel } from "./format";
 import type { ConnectionInfo, DiskConversionPlan, Job, VirtualMachine } from "./types";
 
-type Props = {
+type PlanRow = {
   vm: VirtualMachine;
-  connection: ConnectionInfo;
-  onClose: () => void;
-  onQueued: (job: Job) => void;
+  plan: DiskConversionPlan | null;
+  error: string;
 };
 
-export function DiskConversionModal({ vm, connection, onClose, onQueued }: Props) {
+export type DiskConversionQueueResult = {
+  jobs: Job[];
+  failures: string[];
+  queuedVmIds: string[];
+};
+
+type Props = {
+  vms: VirtualMachine[];
+  connection: ConnectionInfo;
+  onClose: () => void;
+  onQueued: (result: DiskConversionQueueResult) => void;
+};
+
+export function DiskConversionModal({ vms, connection, onClose, onQueued }: Props) {
   const [target, setTarget] = useState("thin");
   const [method, setMethod] = useState("auto");
-  const [plan, setPlan] = useState<DiskConversionPlan | null>(null);
+  const [rows, setRows] = useState<PlanRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [confirmation, setConfirmation] = useState("");
 
-  useEffect(() => setPlan(null), [target, method]);
+  useEffect(() => {
+    setRows(null);
+    setConfirmation("");
+  }, [target, method]);
+
+  const executable = useMemo(
+    () => (rows ?? []).filter((row): row is PlanRow & { plan: DiskConversionPlan } => Boolean(row.plan?.can_execute)),
+    [rows],
+  );
+  const scratchBytes = executable.reduce((sum, row) => sum + row.plan.estimated_scratch_bytes, 0);
+  const largestScratchBytes = executable.reduce((largest, row) => Math.max(largest, row.plan.estimated_scratch_bytes), 0);
+  const preservesSources = executable.some((row) => row.plan.method === "ssh");
+  const expectedConfirmation = vms.length === 1
+    ? vms[0]?.name ?? ""
+    : `CONVERT ${executable.length} ${executable.length === 1 ? "VM" : "VMS"}`;
 
   async function review() {
     setBusy(true);
     setError("");
-    try {
-      setPlan(await planDiskConversion({ vm_id: vm.id, target, method }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not plan disk conversion");
-    } finally {
-      setBusy(false);
+    setConfirmation("");
+    setRows([]);
+    const next: PlanRow[] = [];
+    for (const vm of vms) {
+      try {
+        const plan = await planDiskConversion({ vm_id: vm.id, target, method });
+        next.push({ vm, plan, error: "" });
+      } catch (err) {
+        next.push({ vm, plan: null, error: err instanceof Error ? err.message : "Could not plan disk conversion" });
+      }
+      setRows([...next]);
     }
+    setBusy(false);
   }
 
   async function execute() {
-    if (!plan || confirmation !== vm.name) return;
+    if (executable.length === 0 || confirmation !== expectedConfirmation) return;
     setBusy(true);
     setError("");
-    try {
-      onQueued(await convertVmDisks(plan));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not queue disk conversion");
-    } finally {
-      setBusy(false);
+    const jobs: Job[] = [];
+    const failures: string[] = [];
+    const queuedVmIds: string[] = [];
+    for (const row of executable) {
+      try {
+        jobs.push(await convertVmDisks(row.plan));
+        queuedVmIds.push(row.vm.id);
+      } catch (err) {
+        failures.push(`${row.vm.name}: ${err instanceof Error ? err.message : "Could not queue conversion"}`);
+      }
     }
+    setBusy(false);
+    if (jobs.length === 0) {
+      setError(failures.join("; ") || "No conversions were queued");
+      return;
+    }
+    onQueued({ jobs, failures, queuedVmIds });
   }
+
+  const batch = vms.length > 1;
+  const planned = rows !== null && rows.length === vms.length;
 
   return (
     <div className="modal-back" onClick={() => !busy && onClose()}>
       <div className="modal disk-convert-modal" onClick={(event) => event.stopPropagation()}>
-        <h2>Convert disks · {vm.name}</h2>
+        <h2>{batch ? `Convert disks · ${vms.length} selected VMs` : `Convert disks · ${vms[0]?.name ?? "VM"}`}</h2>
         <p>
-          Review the exact disks and safety checks before queueing. The vSphere API method uses a storage relocation;
-          SSH clones to new VMDKs and preserves the original source files.
+          Each VM is safety-checked and queued as an independent persistent job. The vSphere API uses storage relocation;
+          SSH clones new VMDKs and preserves the original source files.
         </p>
         {error ? <div className="banner bad">{error}</div> : null}
         <div className="disk-convert-settings">
@@ -71,40 +116,78 @@ export function DiskConversionModal({ vm, connection, onClose, onQueued }: Props
             </select>
           </label>
         </div>
-        {!plan ? (
+
+        {rows === null ? (
           <div className="modal-actions">
             <button className="ghost" onClick={onClose}>Cancel</button>
-            <button className="accent" disabled={busy} onClick={() => void review()}>{busy ? "Checking…" : "Review plan"}</button>
+            <button className="accent" disabled={busy} onClick={() => void review()}>{busy ? "Checking…" : `Review ${vms.length} plan${batch ? "s" : ""}`}</button>
           </div>
         ) : (
           <>
             <div className="plan-summary">
-              <span className="chip">{plan.method.toUpperCase()}</span>
-              <span>{powerLabel(plan.power_state)}</span>
-              <span>{plan.disks.length} disk(s)</span>
-              <span>Up to {bytes(plan.estimated_scratch_bytes)} temporary capacity</span>
+              <span className={`chip ${executable.length ? "ok" : "warm"}`}>{executable.length} ready</span>
+              <span>{Math.max(0, rows.length - executable.length)} skipped or blocked</span>
+              <span>
+                {preservesSources
+                  ? `Up to ${bytes(scratchBytes)} additional capacity while source disks are preserved`
+                  : `Up to ${bytes(largestScratchBytes)} temporary per job · jobs run one at a time`}
+              </span>
+              {busy && !planned ? <span>Checking {rows.length + 1} of {vms.length}…</span> : null}
             </div>
-            <div className="disk-plan-list">
-              {plan.disks.map((disk) => (
-                <div key={disk.key}>
-                  <strong>{disk.label}</strong>
-                  <span>{bytes(disk.capacity_bytes)} · {disk.provisioning.split("_").join(" ")} · {disk.datastore_name || "datastore"}</span>
-                </div>
+
+            <div className="disk-batch-list">
+              {rows.map((row) => (
+                <section className="disk-batch-card" key={row.vm.id}>
+                  <header>
+                    <div>
+                      <strong>{row.vm.name}</strong>
+                      <small>{powerLabel(row.vm.power_state)} · {row.vm.host_name || "no host"}</small>
+                    </div>
+                    <span className={`chip ${row.plan?.can_execute ? "ok" : "warm"}`}>
+                      {row.plan?.can_execute ? "Ready" : row.plan?.noop ? "Already matches" : "Blocked"}
+                    </span>
+                  </header>
+                  {row.error ? <div className="banner bad">{row.error}</div> : null}
+                  {row.plan ? (
+                    <>
+                      <div className="disk-card-meta">
+                        <span>{row.plan.method.toUpperCase()}</span>
+                        <span>{row.plan.disks.length} disk(s)</span>
+                        <span>Up to {bytes(row.plan.estimated_scratch_bytes)} temporary</span>
+                      </div>
+                      <div className="disk-plan-list">
+                        {row.plan.disks.map((disk) => (
+                          <div key={disk.key}>
+                            <strong>{disk.label}</strong>
+                            <span>{bytes(disk.capacity_bytes)} · {disk.provisioning.split("_").join(" ")} · {disk.datastore_name || "datastore"}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {row.plan.blockers.map((item) => <div className="banner bad" key={item}>{item}</div>)}
+                      {row.plan.warnings.map((item) => <div className="banner" key={item}>{item}</div>)}
+                      {row.plan.noop ? <div className="banner">No conversion is needed; every disk already matches.</div> : null}
+                    </>
+                  ) : null}
+                </section>
               ))}
             </div>
-            {plan.blockers.map((item) => <div className="banner bad" key={item}>{item}</div>)}
-            {plan.warnings.map((item) => <div className="banner" key={item}>{item}</div>)}
-            {plan.noop ? <div className="banner">No conversion is needed; every disk already matches.</div> : null}
-            {plan.can_execute ? (
+
+            {planned && executable.length > 0 ? (
               <label className="disk-convert-confirm">
-                <span>Type <strong>{vm.name}</strong> to confirm</span>
+                <span>
+                  Type <strong>{expectedConfirmation}</strong> to queue {executable.length} conversion{executable.length === 1 ? "" : "s"}
+                </span>
                 <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" />
               </label>
             ) : null}
             <div className="modal-actions">
-              <button className="ghost" disabled={busy} onClick={() => setPlan(null)}>Back</button>
-              <button className="accent" disabled={busy || !plan.can_execute || confirmation !== vm.name} onClick={() => void execute()}>
-                {busy ? "Queueing…" : "Queue conversion"}
+              <button className="ghost" disabled={busy} onClick={() => setRows(null)}>Back</button>
+              <button
+                className="accent"
+                disabled={busy || !planned || executable.length === 0 || confirmation !== expectedConfirmation}
+                onClick={() => void execute()}
+              >
+                {busy ? "Queueing…" : `Queue ${executable.length} conversion${executable.length === 1 ? "" : "s"}`}
               </button>
             </div>
           </>

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.13] — 2026-08-31
+
+fix: refine disk conversion workflow
+
+- 11 files changed, 334 insertions(+), 72 deletions(-) · backend/app/main.py, backend/app/models.py, backend/app/session.py, backend/tests/test_session.py, frontend/src/App.tsx, frontend/src/BatchLimitDialog.tsx, …
+
 ## [1.0.12] — 2026-08-31
 
 fix: improve ESXi host control contrast

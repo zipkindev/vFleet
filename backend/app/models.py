@@ -37,6 +37,10 @@ class ConnectionInfo(BaseModel):
     endpoint_fingerprint: str = ""
     capabilities: Dict[str, bool] = Field(default_factory=dict)
     ssh_configured: bool = False
+    ssh_user: str = ""
+    ssh_port: int = 22
+    ssh_host_key_sha256: str = ""
+    has_saved_ssh_password: bool = False
 
 
 class LoginRequest(BaseModel):

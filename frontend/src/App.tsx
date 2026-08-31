@@ -116,9 +116,9 @@ export function App() {
   const [renameName, setRenameName] = useState("");
   const [showMigrate, setShowMigrate] = useState(false);
   const [migrateTargets, setMigrateTargets] = useState<VirtualMachine[] | null>(null);
-  const [diskTarget, setDiskTarget] = useState<VirtualMachine | null>(null);
+  const [diskTargets, setDiskTargets] = useState<VirtualMachine[] | null>(null);
   const [actionTargets, setActionTargets] = useState<VirtualMachine[] | null>(null);
-  const [batchIntent, setBatchIntent] = useState<"migrate" | ActionName | null>(null);
+  const [batchIntent, setBatchIntent] = useState<"migrate" | "disk_convert" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
   const [showChangelog, setShowChangelog] = useState(false);
   const [showTheme, setShowTheme] = useState(false);
@@ -256,6 +256,19 @@ export function App() {
     setShowMigrate(true);
   }
 
+  function openDiskConvert(rows?: VirtualMachine[]) {
+    const targets = rows ?? selectedFromData();
+    if (targets.length === 0) {
+      setNotice("Select one or more VMs first");
+      return;
+    }
+    if (targets.length > BATCH_LIMIT) {
+      setBatchIntent("disk_convert");
+      return;
+    }
+    setDiskTargets(targets);
+  }
+
   function requestDrsOverride(rows?: VirtualMachine[]) {
     const targets = rows ?? selectedFromData();
     const eligible = targets.filter((vm) => !vm.drs_override && vm.cluster_id);
@@ -369,6 +382,10 @@ export function App() {
     if (intent === "migrate") {
       setMigrateTargets(included);
       setShowMigrate(true);
+      return;
+    }
+    if (intent === "disk_convert") {
+      setDiskTargets(included);
       return;
     }
     setActionTargets(included);
@@ -705,6 +722,9 @@ export function App() {
             </span>
             <div className="action-buttons">
               {connection?.capabilities?.migrate ? <button onClick={() => openMigrate()}>Migrate / Clone</button> : null}
+              {view === "machines" && connection?.capabilities?.disk_convert ? (
+                <button onClick={() => openDiskConvert()}>Convert disks</button>
+              ) : null}
               {ACTIONS.map((action) => (
                 <button
                   key={action.id}
@@ -762,8 +782,9 @@ export function App() {
             onVmMigrate={openVmMigrate}
             onVmRename={openVmRename}
             onVmDrsOverride={openVmDrsOverride}
-            onVmDiskConvert={setDiskTarget}
+            onVmDiskConvert={(vm) => openDiskConvert([vm])}
             onDrsOverride={() => requestDrsOverride()}
+            onDiskConvert={() => openDiskConvert()}
           />
         ) : null}
         {view === "datastores" ? (
@@ -861,14 +882,19 @@ export function App() {
         />
       ) : null}
 
-      {diskTarget && connection ? (
+      {diskTargets && diskTargets.length > 0 && connection ? (
         <DiskConversionModal
-          vm={diskTarget}
+          vms={diskTargets}
           connection={connection}
-          onClose={() => setDiskTarget(null)}
-          onQueued={(job) => {
-            setDiskTarget(null);
-            setNotice(`${job.title} queued. Watch Jobs for progress.`);
+          onClose={() => setDiskTargets(null)}
+          onQueued={({ jobs: queuedJobs, failures, queuedVmIds }) => {
+            setDiskTargets(null);
+            dropCompleted(queuedVmIds);
+            setNotice(
+              failures.length
+                ? `${queuedJobs.length} conversion(s) queued; ${failures.length} failed to queue: ${failures.join("; ")}`
+                : `${queuedJobs.length} disk conversion${queuedJobs.length === 1 ? "" : "s"} queued. Watch Jobs for independent progress.`,
+            );
             setView("jobs");
             void load();
           }}
@@ -878,7 +904,7 @@ export function App() {
       {batchIntent ? (
         <BatchLimitDialog
           vms={selectedFromData()}
-          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
+          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : batchIntent === "disk_convert" ? "Convert disk provisioning" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
           onCancel={() => setBatchIntent(null)}
           onAccept={acceptBatch}
         />
@@ -1268,6 +1294,7 @@ const VmTable = React.memo(function VmTable({
   onVmRename,
   onVmDrsOverride,
   onVmDiskConvert,
+  onDiskConvert,
 }: {
   vms: VirtualMachine[];
   selected: Record<string, boolean>;
@@ -1283,6 +1310,7 @@ const VmTable = React.memo(function VmTable({
   onVmRename: (vm: VirtualMachine) => void;
   onVmDrsOverride: (vm: VirtualMachine) => void;
   onVmDiskConvert: (vm: VirtualMachine) => void;
+  onDiskConvert: () => void;
 }) {
   const [sortKey, setSortKey] = useState<MachineSortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -1339,6 +1367,11 @@ const VmTable = React.memo(function VmTable({
             {connection?.capabilities?.drs ? <button className="ghost compact" disabled={selectedCount === 0} onClick={onDrsOverride}>
               Pin host (DRS)
             </button> : null}
+            {connection?.capabilities?.disk_convert ? (
+              <button className="ghost compact" disabled={selectedCount === 0} onClick={onDiskConvert}>
+                Convert disks
+              </button>
+            ) : null}
           </div>
         </div>
       </header>

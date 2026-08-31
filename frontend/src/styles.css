@@ -2116,7 +2116,7 @@ tr.clickable:hover td {
 .advanced-box p { margin: 0.65rem 0; }
 
 .disk-convert-modal {
-  width: min(760px, calc(100vw - 2rem));
+  width: min(920px, calc(100vw - 2rem));
   max-height: calc(100vh - 2rem);
   overflow-y: auto;
 }
@@ -2146,9 +2146,28 @@ tr.clickable:hover td {
   padding: 0.55rem 0.7rem;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--bg-2);
+  background-color: var(--bg-2);
   color: var(--ink);
   color-scheme: dark;
+}
+
+.disk-convert-modal select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 2.25rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) calc(50% + 1px),
+    calc(100% - 11px) calc(50% + 1px);
+  background-repeat: no-repeat;
+  background-size: 5px 5px;
+}
+
+.disk-convert-modal option {
+  background: var(--bg-2);
+  color: var(--ink);
 }
 
 .disk-convert-modal select:focus-visible,
@@ -2159,6 +2178,54 @@ tr.clickable:hover td {
 }
 
 .disk-convert-confirm { margin-top: 1rem; }
+.disk-batch-list {
+  display: grid;
+  gap: 0.75rem;
+  max-height: min(40vh, 460px);
+  overflow-y: auto;
+  padding-right: 0.25rem;
+  scrollbar-gutter: stable;
+}
+
+.disk-batch-card {
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-2) 70%, var(--panel));
+}
+
+.disk-batch-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.65rem;
+}
+
+.disk-batch-card > header div,
+.disk-batch-card > header small {
+  display: block;
+}
+
+.disk-batch-card > header small { margin-top: 0.2rem; color: var(--muted); }
+.disk-card-meta { display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; margin-bottom: 0.65rem; color: var(--muted); font-size: 0.85rem; }
+.disk-batch-card .disk-plan-list { margin-bottom: 0.65rem; }
+.disk-convert-modal > .modal-actions,
+.disk-convert-modal > div + .modal-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  padding: 0.75rem 0 0.15rem;
+  background: linear-gradient(to bottom, transparent, var(--panel) 22%);
+}
+
+.disk-convert-modal .modal-actions button:disabled {
+  border: 1px solid color-mix(in srgb, var(--muted) 38%, var(--line));
+  background: color-mix(in srgb, var(--muted) 18%, var(--panel));
+  color: color-mix(in srgb, var(--muted) 72%, var(--ink));
+  cursor: not-allowed;
+  opacity: 1;
+}
 .plan-summary, .host-facts, .button-grid, .inline-actions {
   display: flex;
   flex-wrap: wrap;
@@ -2177,8 +2244,10 @@ tr.clickable:hover td {
 }
 
 @media (max-width: 620px) {
+  .disk-convert-modal { width: min(100%, calc(100vw - 1rem)); padding: 16px; }
   .disk-convert-settings { grid-template-columns: minmax(0, 1fr); }
   .disk-plan-list > div { align-items: flex-start; flex-direction: column; gap: 0.35rem; }
+  .disk-batch-card > header { align-items: flex-start; }
 }
 .host-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); }
 .host-facts > div { display: grid; gap: 0.25rem; padding: 0.75rem; border: 1px solid var(--line); border-radius: 8px; }

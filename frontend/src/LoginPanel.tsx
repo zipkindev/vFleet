@@ -14,11 +14,11 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
   const [password, setPassword] = useState("");
   const [port, setPort] = useState(String(connection?.saved_port || 443));
   const [insecure, setInsecure] = useState(connection?.insecure ?? true);
-  const [sshEnabled, setSshEnabled] = useState(false);
-  const [sshUser, setSshUser] = useState("root");
+  const [sshEnabled, setSshEnabled] = useState(connection?.ssh_configured ?? false);
+  const [sshUser, setSshUser] = useState(connection?.ssh_user || "root");
   const [sshPassword, setSshPassword] = useState("");
-  const [sshPort, setSshPort] = useState("22");
-  const [sshFingerprint, setSshFingerprint] = useState("");
+  const [sshPort, setSshPort] = useState(String(connection?.ssh_port || 22));
+  const [sshFingerprint, setSshFingerprint] = useState(connection?.ssh_host_key_sha256 || "");
   const [busy, setBusy] = useState<"test" | "save" | null>(null);
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
@@ -28,6 +28,12 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
       user.trim() === (connection?.saved_user || "") &&
       (Number(port) || 443) === (connection?.saved_port || 443)
   );
+  const savedSshPassword = Boolean(
+    connection?.has_saved_ssh_password &&
+      host.trim() === (connection?.saved_host || "") &&
+      sshUser.trim() === (connection?.ssh_user || "") &&
+      (Number(sshPort) || 22) === (connection?.ssh_port || 22)
+  );
 
   async function submit(kind: "test" | "save") {
     if (!host.trim() || !user.trim()) {
@@ -36,6 +42,10 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
     }
     if (!password && !savedPassword) {
       setError("Host, username, and password are required");
+      return;
+    }
+    if (sshEnabled && (!sshUser.trim() || !sshFingerprint.trim())) {
+      setError("SSH user and host key fingerprint are required when SSH fallback is enabled");
       return;
     }
     setBusy(kind);
@@ -144,7 +154,16 @@ export function LoginPanel({ connection, onClose, onConnected }: Props) {
                 <label>SSH user<input value={sshUser} onChange={(event) => setSshUser(event.target.value)} /></label>
                 <label>SSH port<input value={sshPort} onChange={(event) => setSshPort(event.target.value)} inputMode="numeric" /></label>
               </div>
-              <label>SSH password<input type="password" value={sshPassword} onChange={(event) => setSshPassword(event.target.value)} autoComplete="off" /></label>
+              <label>
+                SSH password
+                <input
+                  type="password"
+                  value={sshPassword}
+                  onChange={(event) => setSshPassword(event.target.value)}
+                  autoComplete="off"
+                  placeholder={savedSshPassword && !sshPassword ? "Saved on this machine" : ""}
+                />
+              </label>
               <label>Host key fingerprint<input value={sshFingerprint} onChange={(event) => setSshFingerprint(event.target.value)} placeholder="SHA256:…" /></label>
             </>
           ) : null}
