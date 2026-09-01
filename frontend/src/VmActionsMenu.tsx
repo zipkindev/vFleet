@@ -28,6 +28,8 @@ type VmActionsMenuProps = {
   onDrsOverride: (vm: VirtualMachine) => void;
   onDiskConvert: (vm: VirtualMachine) => void;
   onToolsDeploy: (vm: VirtualMachine) => void;
+  onHardware: (vm: VirtualMachine) => void;
+  onStorageReconcile: (vm: VirtualMachine) => void;
 };
 
 function powerOn(vm: VirtualMachine) {
@@ -67,6 +69,8 @@ export function VmActionsMenu({
   onDrsOverride,
   onDiskConvert,
   onToolsDeploy,
+  onHardware,
+  onStorageReconcile,
 }: VmActionsMenuProps) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<MenuPos | null>(null);
@@ -185,6 +189,13 @@ export function VmActionsMenu({
 
   const manageItems: MenuAction[] = [
     {
+      id: "hardware",
+      label: "Configure hardware",
+      disabled: !live || !connection?.capabilities?.vm_hardware,
+      hint: !live ? demoHint : "Set CPU, memory, disk capacity, or mounted ISO",
+      onClick: () => run(() => onHardware(vm)),
+    },
+    {
       id: "deploy_tools",
       label: "Deploy VMware Tools automatically",
       disabled: !live || !poweredOn(vm),
@@ -215,6 +226,13 @@ export function VmActionsMenu({
       disabled: !live || !connection?.capabilities?.disk_convert,
       hint: !live ? demoHint : "Review disks and queue a thick/thin conversion",
       onClick: () => run(() => onDiskConvert(vm)),
+    },
+    {
+      id: "storage_reconcile",
+      label: "Reconcile storage and inventory",
+      disabled: !live || !connection?.capabilities?.datastores,
+      hint: !live ? demoHint : "Find preserved conversion sources and unattached datastore artifacts",
+      onClick: () => run(() => onStorageReconcile(vm)),
     },
     {
       id: "migrate",

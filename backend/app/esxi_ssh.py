@@ -61,7 +61,26 @@ class EsxiSshExecutor:
             password = self.settings.vcenter_password
         key_path = self.settings.esxi_ssh_key_path
         key_filename = str(key_path) if str(key_path) not in {"", "."} and key_path.is_file() else None
+        jump_client = None
+        sock = None
         try:
+            if self.settings.access_jump_enabled:
+                if not self.settings.access_jump_password:
+                    raise PermanentError("The saved jump-host credential is unavailable")
+                from .guest_tools import _open_jump_channel
+
+                jump_client, sock = _open_jump_channel(
+                    self.settings.vcenter_host,
+                    self.settings.esxi_ssh_port,
+                    {
+                        "address": self.settings.access_jump_address,
+                        "port": self.settings.access_jump_port,
+                        "username": self.settings.access_jump_user,
+                        "password": self.settings.access_jump_password,
+                        "host_key_sha256": self.settings.access_jump_host_key_sha256,
+                    },
+                    self.settings.esxi_ssh_timeout_seconds,
+                )
             client.connect(
                 hostname=self.settings.vcenter_host,
                 port=self.settings.esxi_ssh_port,
@@ -73,12 +92,27 @@ class EsxiSshExecutor:
                 auth_timeout=self.settings.esxi_ssh_timeout_seconds,
                 allow_agent=True,
                 look_for_keys=True,
+                sock=sock,
             )
-        except PermanentError:
-            raise
+        except PermanentError as exc:
+            client.close()
+            if jump_client is not None:
+                jump_client.close()
+            message = str(exc)
+            for secret in (password, self.settings.access_jump_password):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            raise PermanentError(message) from exc
         except Exception as exc:
-            raise TransientError(f"Could not establish verified SSH connection to ESXi: {exc}") from exc
-        return client
+            client.close()
+            if jump_client is not None:
+                jump_client.close()
+            message = str(exc)
+            for secret in (password, self.settings.access_jump_password):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            raise TransientError(f"Could not establish verified SSH connection to ESXi: {message}") from exc
+        return client, jump_client
 
     @staticmethod
     def _run(client, argv: list[str], timeout: int) -> str:
@@ -99,7 +133,7 @@ class EsxiSshExecutor:
         }
         if target not in formats:
             raise PermanentError("Unsupported vmkfstools target")
-        client = self._connect()
+        client, jump_client = self._connect()
         try:
             try:
                 self._run(client, ["test", "-s", destination], timeout=30)
@@ -110,3 +144,5 @@ class EsxiSshExecutor:
             self._run(client, ["test", "-s", destination], timeout=30)
         finally:
             client.close()
+            if jump_client is not None:
+                jump_client.close()

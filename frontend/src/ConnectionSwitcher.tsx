@@ -38,7 +38,7 @@ export function ConnectionSwitcher({
     const all = profiles?.profiles ?? [];
     if (!needle) return all;
     return all.filter((profile) =>
-      [profile.name, profile.host, profile.user, endpointLabel(profile.endpoint_kind)]
+      [profile.name, profile.host, profile.user, profile.jump_address, endpointLabel(profile.endpoint_kind)]
         .join(" ")
         .toLowerCase()
         .includes(needle),
@@ -128,6 +128,7 @@ export function ConnectionSwitcher({
                     </span>
                     <small>{profile.host}{profile.port !== 443 ? `:${profile.port}` : ""}</small>
                     <small>{profile.user}</small>
+                    {profile.jump_enabled ? <small>via {profile.jump_address}:{profile.jump_port} · {profile.jump_host_type === "auto" ? "auto type" : profile.jump_host_type}</small> : null}
                     {profile.last_used_at ? <small>used {relTime(profile.last_used_at)}</small> : null}
                     <b>{profile.active ? "Connected" : workingId === profile.id ? "Connecting…" : "Connect"}</b>
                   </button>

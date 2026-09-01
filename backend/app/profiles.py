@@ -6,7 +6,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,12 @@ class ConnectionProfile(BaseModel):
     ssh_password: str = ""
     ssh_port: int = 22
     ssh_host_key_sha256: str = ""
+    jump_enabled: bool = False
+    jump_address: str = ""
+    jump_port: int = 22
+    jump_host_type: Literal["auto", "windows", "unix"] = "auto"
+    jump_credential_id: str = ""
+    jump_host_key_sha256: str = ""
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)
     last_used_at: str = ""
@@ -55,6 +61,12 @@ class ConnectionProfile(BaseModel):
             ssh_host_key_sha256=self.ssh_host_key_sha256,
             has_saved_password=bool(self.password),
             has_saved_ssh_password=bool(self.ssh_password),
+            jump_enabled=self.jump_enabled,
+            jump_address=self.jump_address,
+            jump_port=self.jump_port,
+            jump_host_type=self.jump_host_type,
+            jump_credential_id=self.jump_credential_id,
+            jump_host_key_sha256=self.jump_host_key_sha256,
             active=self.id == active_profile_id,
             last_used_at=self.last_used_at or None,
         )

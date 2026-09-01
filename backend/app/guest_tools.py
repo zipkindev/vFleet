@@ -7,7 +7,7 @@ import shlex
 import socket
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from .errors import PermanentError, TransientError
 
@@ -112,11 +112,90 @@ def windows_install(address: str, username: str, password: str, **options) -> Di
         return {"message": result.stdout or "Installer completed and reboot was scheduled"}
 
 
-def ssh_host_key_sha256(address: str, port: int = 22, timeout_seconds: int = 10) -> str:
+def _connect_pinned_ssh(
+    address: str,
+    username: str,
+    password: str,
+    *,
+    port: int,
+    host_key_sha256: str,
+    timeout_seconds: int,
+    sock=None,
+):
+    if not host_key_sha256.startswith("SHA256:"):
+        raise PermanentError(f"A verified SSH host-key fingerprint is required for {address}")
+    import paramiko
+
+    client = paramiko.SSHClient()
+    try:
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(_PinnedHostKeyPolicy(host_key_sha256))
+        client.connect(
+            hostname=address,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout_seconds,
+            auth_timeout=timeout_seconds,
+            banner_timeout=timeout_seconds,
+            look_for_keys=False,
+            allow_agent=False,
+            sock=sock,
+        )
+        transport = client.get_transport()
+        actual_key = _key_sha256(transport.get_remote_server_key()) if transport is not None else ""
+        if actual_key != host_key_sha256:
+            raise PermanentError(
+                f"SSH host key mismatch for {address}; expected {host_key_sha256}, received {actual_key or 'unavailable'}"
+            )
+    except Exception:
+        client.close()
+        raise
+    return client
+
+
+def _open_jump_channel(address: str, port: int, jump: Dict[str, object], timeout_seconds: int):
+    jump_client = _connect_pinned_ssh(
+        str(jump.get("address") or ""),
+        str(jump.get("username") or ""),
+        str(jump.get("password") or ""),
+        port=int(jump.get("port") or 22),
+        host_key_sha256=str(jump.get("host_key_sha256") or ""),
+        timeout_seconds=timeout_seconds,
+    )
+    transport = jump_client.get_transport()
+    if transport is None:
+        jump_client.close()
+        raise PermanentError("The SSH jump-host transport is unavailable")
+    try:
+        channel = transport.open_channel(
+            "direct-tcpip",
+            (address, port),
+            ("127.0.0.1", 0),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        jump_client.close()
+        raise
+    return jump_client, channel
+
+
+def ssh_host_key_sha256(
+    address: str,
+    port: int = 22,
+    timeout_seconds: int = 10,
+    *,
+    jump: Optional[Dict[str, object]] = None,
+) -> str:
+    jump_client = None
+    sock = None
     try:
         import paramiko
 
-        sock = socket.create_connection((address, port), timeout=timeout_seconds)
+        if jump:
+            jump_client, sock = _open_jump_channel(address, port, jump, timeout_seconds)
+        else:
+            sock = socket.create_connection((address, port), timeout=timeout_seconds)
         transport = paramiko.Transport(sock)
         try:
             transport.start_client(timeout=timeout_seconds)
@@ -125,10 +204,68 @@ def ssh_host_key_sha256(address: str, port: int = 22, timeout_seconds: int = 10)
         finally:
             transport.close()
             sock.close()
+            if jump_client is not None:
+                jump_client.close()
+    except PermanentError:
+        raise
     except (socket.timeout, OSError) as exc:
         raise TransientError(f"SSH could not reach {address}:{port}: {exc}") from exc
     except Exception as exc:
-        raise PermanentError(f"Could not read the SSH host key from {address}:{port}: {exc}") from exc
+        message = str(exc)
+        if jump:
+            jump_password = str(jump.get("password") or "")
+            if jump_password:
+                message = message.replace(jump_password, "[redacted]")
+        raise PermanentError(f"Could not read the SSH host key from {address}:{port}: {message}") from exc
+
+
+def ssh_connection_test(
+    address: str,
+    username: str,
+    password: str,
+    *,
+    port: int = 22,
+    host_key_sha256: str,
+    host_type: Literal["auto", "windows", "unix"] = "auto",
+    timeout_seconds: int = 10,
+) -> Literal["auto", "windows", "unix"]:
+    """Authenticate and verify the pinned host key without assuming a remote shell OS."""
+    client = None
+    try:
+        client = _connect_pinned_ssh(
+            address,
+            username,
+            password,
+            port=port,
+            host_key_sha256=host_key_sha256,
+            timeout_seconds=timeout_seconds,
+        )
+        if host_type != "auto":
+            return host_type
+        for detected, command, marker in (
+            ("windows", "cmd.exe /d /c echo VFLEET_WINDOWS", "VFLEET_WINDOWS"),
+            ("unix", "sh -c 'printf VFLEET_UNIX'", "VFLEET_UNIX"),
+        ):
+            try:
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout_seconds)
+                stdin.close()
+                output = _safe_text(stdout.read())
+                status = stdout.channel.recv_exit_status()
+                if status == 0 and marker in output:
+                    return detected
+            except Exception:
+                continue
+        return "auto"
+    except PermanentError:
+        raise
+    except (socket.timeout, OSError) as exc:
+        raise TransientError(f"SSH could not reach {address}:{port}: {exc}") from exc
+    except Exception as exc:
+        message = str(exc).replace(password, "[redacted]") if password else str(exc)
+        raise PermanentError(f"Could not authenticate to SSH jump host {address}:{port}: {message}") from exc
+    finally:
+        if client is not None:
+            client.close()
 
 
 def _key_sha256(key) -> str:
@@ -156,33 +293,30 @@ def _linux_command(
     host_key_sha256: str,
     sudo: bool,
     timeout_seconds: int,
+    jump: Optional[Dict[str, object]] = None,
 ) -> RemoteResult:
     if not host_key_sha256.startswith("SHA256:"):
         raise PermanentError(f"A verified SSH host-key fingerprint is required for {address}")
     try:
-        import paramiko
-
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(_PinnedHostKeyPolicy(host_key_sha256))
-        client.connect(
-            hostname=address,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout_seconds,
-            auth_timeout=timeout_seconds,
-            banner_timeout=timeout_seconds,
-            look_for_keys=False,
-            allow_agent=False,
-        )
+        jump_client = None
+        sock = None
+        if jump:
+            jump_client, sock = _open_jump_channel(address, port, jump, timeout_seconds)
         try:
-            transport = client.get_transport()
-            actual_key = _key_sha256(transport.get_remote_server_key()) if transport is not None else ""
-            if actual_key != host_key_sha256:
-                raise PermanentError(
-                    f"SSH host key mismatch for {address}; expected {host_key_sha256}, received {actual_key or 'unavailable'}"
-                )
+            client = _connect_pinned_ssh(
+                address,
+                username,
+                password,
+                port=port,
+                host_key_sha256=host_key_sha256,
+                timeout_seconds=timeout_seconds,
+                sock=sock,
+            )
+        except Exception:
+            if jump_client is not None:
+                jump_client.close()
+            raise
+        try:
             remote = command
             if sudo and username != "root":
                 remote = "sudo -S -p '' sh -c " + shlex.quote(command)
@@ -209,12 +343,18 @@ def _linux_command(
             result = RemoteResult(status, _safe_text(bytes(output)), _safe_text(bytes(errors)))
         finally:
             client.close()
+            if jump_client is not None:
+                jump_client.close()
     except PermanentError:
         raise
     except (socket.timeout, OSError) as exc:
         raise TransientError(f"SSH could not reach {address}:{port}: {exc}") from exc
     except Exception as exc:
         message = str(exc).replace(password, "[redacted]")
+        if jump:
+            jump_password = str(jump.get("password") or "")
+            if jump_password:
+                message = message.replace(jump_password, "[redacted]")
         raise PermanentError(f"SSH authentication or command failed for {address}: {message}") from exc
     if result.status_code != 0:
         raise PermanentError(result.stderr or f"Remote Linux command exited with code {result.status_code}")
@@ -266,3 +406,67 @@ def linux_preflight(address: str, username: str, password: str, **options) -> Di
 def linux_install(address: str, username: str, password: str, **options) -> Dict[str, object]:
     result = _linux_command(address, username, password, LINUX_INSTALL, timeout_seconds=900, **options)
     return {"message": result.stdout.splitlines()[-1] if result.stdout else "open-vm-tools installed and vmtoolsd is running"}
+
+
+PFSENSE_PREFLIGHT = r"""
+set -eu
+[ "$(uname -s)" = "FreeBSD" ] || { echo 'The target is not FreeBSD' >&2; exit 44; }
+[ -r /etc/platform ] && [ "$(cat /etc/platform)" = "pfSense" ] || { echo 'The target is not pfSense software' >&2; exit 45; }
+[ "$(id -u)" = "0" ] || { echo 'The pfSense package deployment requires the root account' >&2; exit 46; }
+version="$(cat /etc/version 2>/dev/null || echo unknown)"
+installed=false
+/usr/local/sbin/pkg-static info -e pfSense-pkg-Open-VM-Tools >/dev/null 2>&1 && installed=true
+printf '{"platform":"pfSense","version":"%s","uid":0,"installed":%s}\n' "$version" "$installed"
+""".strip()
+
+PFSENSE_INSTALL = r"""
+set -eu
+[ "$(uname -s)" = "FreeBSD" ] || { echo 'The target is not FreeBSD' >&2; exit 44; }
+[ -r /etc/platform ] && [ "$(cat /etc/platform)" = "pfSense" ] || { echo 'The target is not pfSense software' >&2; exit 45; }
+[ "$(id -u)" = "0" ] || { echo 'The pfSense package deployment requires the root account' >&2; exit 46; }
+/usr/local/sbin/pkg-static install -y pfSense-pkg-Open-VM-Tools
+if ! pgrep -x vmtoolsd >/dev/null 2>&1; then
+  [ -x /usr/local/etc/rc.d/vmware-kmod.sh ] && /usr/local/etc/rc.d/vmware-kmod.sh start || true
+  [ -x /usr/local/etc/rc.d/vmware-guestd.sh ] && /usr/local/etc/rc.d/vmware-guestd.sh start || true
+fi
+attempt=0
+while ! pgrep -x vmtoolsd >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 10 ] || { echo 'vmtoolsd is not running after installation' >&2; exit 47; }
+  sleep 1
+done
+/usr/local/bin/vmtoolsd -v 2>/dev/null || true
+""".strip()
+
+
+def pfsense_preflight(address: str, username: str, password: str, **options) -> Dict[str, object]:
+    result = _linux_command(
+        address,
+        username,
+        password,
+        PFSENSE_PREFLIGHT,
+        timeout_seconds=30,
+        sudo=False,
+        **options,
+    )
+    try:
+        return json.loads(result.stdout.splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise PermanentError("pfSense preflight did not return valid system information") from exc
+
+
+def pfsense_install(address: str, username: str, password: str, **options) -> Dict[str, object]:
+    result = _linux_command(
+        address,
+        username,
+        password,
+        PFSENSE_INSTALL,
+        timeout_seconds=900,
+        sudo=False,
+        **options,
+    )
+    return {
+        "message": result.stdout.splitlines()[-1]
+        if result.stdout
+        else "pfSense Open-VM-Tools installed and vmtoolsd is running"
+    }

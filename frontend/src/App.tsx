@@ -36,6 +36,8 @@ import { TableFit } from "./TableFit";
 import { VmActionsMenu } from "./VmActionsMenu";
 import { CredentialVaultView } from "./CredentialVaultView";
 import { ToolsDeploymentModal } from "./ToolsDeploymentModal";
+import { StorageReconciliationModal } from "./StorageReconciliationModal";
+import { VmHardwareModal } from "./VmHardwareModal";
 
 type View = "overview" | "monitoring" | "hosts" | "machines" | "datastores" | "jobs" | "vault" | "owners" | "reclaim";
 
@@ -131,8 +133,10 @@ export function App() {
   const [migrateTargets, setMigrateTargets] = useState<VirtualMachine[] | null>(null);
   const [diskTargets, setDiskTargets] = useState<VirtualMachine[] | null>(null);
   const [toolsTargets, setToolsTargets] = useState<VirtualMachine[] | null>(null);
+  const [hardwareTargets, setHardwareTargets] = useState<VirtualMachine[] | null>(null);
+  const [reconcileTargets, setReconcileTargets] = useState<VirtualMachine[] | null>(null);
   const [actionTargets, setActionTargets] = useState<VirtualMachine[] | null>(null);
-  const [batchIntent, setBatchIntent] = useState<"migrate" | "disk_convert" | "tools_deploy" | ActionName | null>(null);
+  const [batchIntent, setBatchIntent] = useState<"migrate" | "disk_convert" | "tools_deploy" | "hardware" | "storage_reconcile" | ActionName | null>(null);
   const [monitorOwner, setMonitorOwner] = useState("");
   const [showChangelog, setShowChangelog] = useState(false);
   const [showTheme, setShowTheme] = useState(false);
@@ -355,6 +359,32 @@ export function App() {
     setToolsTargets(targets);
   }
 
+  function openHardware(rows?: VirtualMachine[]) {
+    const targets = rows ?? selectedFromData();
+    if (targets.length === 0) {
+      setNotice("Select one or more VMs first");
+      return;
+    }
+    if (targets.length > BATCH_LIMIT) {
+      setBatchIntent("hardware");
+      return;
+    }
+    setHardwareTargets(targets);
+  }
+
+  function openStorageReconciliation(rows?: VirtualMachine[]) {
+    const targets = rows ?? selectedFromData();
+    if (rows === undefined && targets.length === 0) {
+      setNotice("Select one or more VMs first, or run a full scan from Datastores");
+      return;
+    }
+    if (targets.length > BATCH_LIMIT) {
+      setBatchIntent("storage_reconcile");
+      return;
+    }
+    setReconcileTargets(targets);
+  }
+
   function requestDrsOverride(rows?: VirtualMachine[]) {
     const targets = rows ?? selectedFromData();
     const eligible = targets.filter((vm) => !vm.drs_override && vm.cluster_id);
@@ -476,6 +506,14 @@ export function App() {
     }
     if (intent === "tools_deploy") {
       setToolsTargets(included);
+      return;
+    }
+    if (intent === "hardware") {
+      setHardwareTargets(included);
+      return;
+    }
+    if (intent === "storage_reconcile") {
+      setReconcileTargets(included);
       return;
     }
     setActionTargets(included);
@@ -824,11 +862,17 @@ export function App() {
               </button>
             </span>
             <div className="action-buttons">
+              {view === "machines" && connection?.capabilities?.vm_hardware ? (
+                <button onClick={() => openHardware()}>Configure hardware</button>
+              ) : null}
               {connection?.capabilities?.migrate ? <button onClick={() => openMigrate()}>Migrate / Clone</button> : null}
               {view === "machines" && connection?.capabilities?.disk_convert ? (
                 <button onClick={() => openDiskConvert()}>Convert disks</button>
               ) : null}
               {view === "machines" ? <button onClick={() => openToolsDeploy()}>Deploy VMware Tools</button> : null}
+              {view === "machines" && connection?.capabilities?.datastores ? (
+                <button onClick={() => openStorageReconciliation()}>Reconcile storage</button>
+              ) : null}
               {ACTIONS.map((action) => (
                 <button
                   key={action.id}
@@ -888,8 +932,11 @@ export function App() {
             onVmDrsOverride={openVmDrsOverride}
             onVmDiskConvert={(vm) => openDiskConvert([vm])}
             onVmToolsDeploy={(vm) => openToolsDeploy([vm])}
+            onVmHardware={(vm) => openHardware([vm])}
+            onVmStorageReconcile={(vm) => openStorageReconciliation([vm])}
             onDrsOverride={() => requestDrsOverride()}
             onDiskConvert={() => openDiskConvert()}
+            onHardware={() => openHardware()}
           />
         ) : null}
         {view === "datastores" ? (
@@ -902,9 +949,27 @@ export function App() {
               setNewVmTemplateId(templateId);
               setShowNewVm(true);
             }}
+            onReconcile={() => setReconcileTargets([])}
           />
         ) : null}
-        {view === "jobs" ? <JobsView data={jobs} onRefresh={onJobsRefresh} /> : null}
+        {view === "jobs" ? (
+          <JobsView
+            data={jobs}
+            onRefresh={onJobsRefresh}
+            onReconcile={(job) => {
+              const plan = job.payload.plan;
+              const vmId = plan && typeof plan === "object" && "vm_id" in plan
+                ? String((plan as Record<string, unknown>).vm_id || "")
+                : "";
+              const vm = data?.vms.find((item) => item.id === vmId);
+              if (!vm) {
+                setNotice("The converted VM is no longer in current inventory; run a full reconciliation from Datastores.");
+                return;
+              }
+              setReconcileTargets([vm]);
+            }}
+          />
+        ) : null}
         {view === "vault" ? <CredentialVaultView /> : null}
         {view === "owners" ? (
           <OwnerTable
@@ -992,6 +1057,26 @@ export function App() {
         />
       ) : null}
 
+      {hardwareTargets && hardwareTargets.length > 0 ? (
+        <VmHardwareModal
+          vms={hardwareTargets}
+          allVms={vms}
+          catalog={catalog}
+          onClose={() => setHardwareTargets(null)}
+          onQueued={(job, queuedVmIds, skipped) => {
+            setHardwareTargets(null);
+            dropCompleted(queuedVmIds);
+            setNotice(
+              skipped
+                ? `${job.title} queued; ${skipped} blocked or already matching VM(s) were skipped after review.`
+                : `${job.title} queued locally. Watch Jobs for per-VM progress.`,
+            );
+            setView("jobs");
+            void load();
+          }}
+        />
+      ) : null}
+
       {diskTargets && diskTargets.length > 0 && connection ? (
         <DiskConversionModal
           vms={diskTargets}
@@ -1014,6 +1099,7 @@ export function App() {
       {toolsTargets && toolsTargets.length > 0 ? (
         <ToolsDeploymentModal
           vms={toolsTargets}
+          accessProfile={profiles?.profiles.find((profile) => profile.id === profiles.active_profile_id) ?? null}
           onClose={() => setToolsTargets(null)}
           onQueued={(queuedJobs, failures, queuedVmIds) => {
             setToolsTargets(null);
@@ -1027,10 +1113,32 @@ export function App() {
         />
       ) : null}
 
+      {reconcileTargets !== null ? (
+        <StorageReconciliationModal
+          vms={reconcileTargets}
+          inventoryVms={data?.vms ?? []}
+          onClose={() => setReconcileTargets(null)}
+          onDeployTools={(targets) => {
+            setReconcileTargets(null);
+            setToolsTargets(targets);
+          }}
+          onQueued={(queuedJobs, failures) => {
+            setReconcileTargets(null);
+            setNotice(
+              failures.length
+                ? `${queuedJobs.length} cleanup job(s) queued; ${failures.length} skipped: ${failures.join("; ")}`
+                : `${queuedJobs.length} reconciled storage cleanup job${queuedJobs.length === 1 ? "" : "s"} queued.`,
+            );
+            setView("jobs");
+            void load();
+          }}
+        />
+      ) : null}
+
       {batchIntent ? (
         <BatchLimitDialog
           vms={selectedFromData()}
-          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : batchIntent === "disk_convert" ? "Convert disk provisioning" : batchIntent === "tools_deploy" ? "Deploy VMware Tools" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
+          actionLabel={batchIntent === "migrate" ? "Migrate / Clone" : batchIntent === "disk_convert" ? "Convert disk provisioning" : batchIntent === "tools_deploy" ? "Deploy VMware Tools" : batchIntent === "hardware" ? "Configure hardware" : batchIntent === "storage_reconcile" ? "Reconcile storage" : ACTIONS.find((item) => item.id === batchIntent)?.label || "This action"}
           onCancel={() => setBatchIntent(null)}
           onAccept={acceptBatch}
         />
@@ -1388,7 +1496,10 @@ const VmTable = React.memo(function VmTable({
   onVmDrsOverride,
   onVmDiskConvert,
   onVmToolsDeploy,
+  onVmHardware,
+  onVmStorageReconcile,
   onDiskConvert,
+  onHardware,
 }: {
   vms: VirtualMachine[];
   selected: Record<string, boolean>;
@@ -1405,7 +1516,10 @@ const VmTable = React.memo(function VmTable({
   onVmDrsOverride: (vm: VirtualMachine) => void;
   onVmDiskConvert: (vm: VirtualMachine) => void;
   onVmToolsDeploy: (vm: VirtualMachine) => void;
+  onVmHardware: (vm: VirtualMachine) => void;
+  onVmStorageReconcile: (vm: VirtualMachine) => void;
   onDiskConvert: () => void;
+  onHardware: () => void;
 }) {
   const [sortKey, setSortKey] = useState<MachineSortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -1456,6 +1570,11 @@ const VmTable = React.memo(function VmTable({
             <button className="text" onClick={() => onSelectVisible(sorted)} disabled={sorted.length === 0}>
               Select page
             </button>
+            {connection?.capabilities?.vm_hardware ? (
+              <button className="accent compact" disabled={selectedCount === 0} onClick={onHardware}>
+                Configure hardware
+              </button>
+            ) : null}
             {connection?.capabilities?.migrate ? <button className="accent compact" disabled={selectedCount === 0} onClick={onMigrate}>
               Migrate / Clone
             </button> : null}
@@ -1583,7 +1702,7 @@ const VmTable = React.memo(function VmTable({
                   </td>
                   <td>
                     {vm.name}
-                    <small className="sub">{vm.ip_address || vm.guest_os || "—"}</small>
+                    <small className="sub">{vm.ip_address || vm.guest_os || "—"} · {vm.tools_status === "guestToolsRunning" ? "Tools running" : "Tools not running"}</small>
                   </td>
                   <td className="row-actions-cell">
                     <VmActionsMenu
@@ -1597,6 +1716,8 @@ const VmTable = React.memo(function VmTable({
                       onDrsOverride={onVmDrsOverride}
                       onDiskConvert={onVmDiskConvert}
                       onToolsDeploy={onVmToolsDeploy}
+                      onHardware={onVmHardware}
+                      onStorageReconcile={onVmStorageReconcile}
                     />
                   </td>
                   <td>
@@ -1621,7 +1742,8 @@ const VmTable = React.memo(function VmTable({
                   </td>
                   <td>
                     {gib(vm.memory_mib)}
-                    <small className="sub">{vm.memory_usage_pct.toFixed(0)}% used</small>
+                    <small className="sub">{gib(vm.memory_usage_mib)} active · {gib(vm.host_memory_usage_mib)} host</small>
+                    {vm.ballooned_memory_mib || vm.swapped_memory_mib || vm.compressed_memory_mib ? <small className="sub">{gib(vm.ballooned_memory_mib)} balloon · {gib(vm.swapped_memory_mib)} swap · {gib(vm.compressed_memory_mib)} compressed</small> : null}
                   </td>
                   <td>
                     {bytes(vm.storage_provisioned_bytes)}

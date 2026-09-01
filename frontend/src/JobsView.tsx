@@ -26,6 +26,24 @@ function progressLabel(job: Job): string {
     const index = Number(job.progress.index ?? 0);
     if (total > 0) return `${Math.min(index + (job.status === "succeeded" ? 0 : 1), total)} / ${total}`;
   }
+  if (job.kind === "vm_hardware") {
+    const total = Array.isArray(job.payload.vm_ids) ? job.payload.vm_ids.length : Number(job.progress.total ?? 0);
+    const index = Number(job.progress.index ?? 0);
+    const phase = String(job.progress.phase || "");
+    const phaseLabels: Record<string, string> = {
+      shutdown_request: "Requesting guest shutdown",
+      shutdown_wait: "Waiting for guest shutdown",
+      force_power_off_start: "Starting forced power-off",
+      force_power_off_wait: "Waiting for forced power-off",
+      reconfigure_start: "Starting hardware change",
+      reconfigure_wait: "Hardware change running",
+      reconfigure_complete: "Hardware change complete",
+      power_on_start: "Starting VM",
+      power_on_wait: "Waiting for VM startup",
+    };
+    if (phaseLabels[phase]) return phaseLabels[phase];
+    if (total > 0) return `${Math.min(index + (job.status === "running" && index < total ? 1 : 0), total)} / ${total}`;
+  }
   if (job.kind === "disk_convert") {
     if (job.status !== "running" && job.status !== "queued" && job.status !== "retrying") return job.status;
     const phase = String(job.progress.phase || "");
@@ -56,7 +74,35 @@ function diskFallbackHint(job: Job): string {
   return "";
 }
 
-export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data: JobList | null; onRefresh: () => void }) {
+function reconciliationHint(job: Job): string {
+  if (job.kind !== "disk_convert" || job.status !== "succeeded") return "";
+  const value = job.result.reconciliation;
+  if (!value || typeof value !== "object") return "";
+  const message = (value as Record<string, unknown>).message;
+  return typeof message === "string" ? message : "";
+}
+
+function hardwareResultHint(job: Job): string {
+  if (job.kind !== "vm_hardware" || !["succeeded", "failed"].includes(job.status)) return "";
+  const value = Array.isArray(job.result.results) ? job.result.results : job.progress.results;
+  if (!Array.isArray(value)) return "";
+  const rows = value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+  const failed = rows.filter((row) => !row.ok);
+  const summary = `${rows.length - failed.length} succeeded${failed.length ? ` · ${failed.length} failed` : ""}`;
+  if (!failed.length) return summary;
+  const details = failed.slice(0, 3).map((row) => `${String(row.vm_id || "VM")}: ${String(row.error || "failed")}`).join("; ");
+  return `${summary}: ${details}${failed.length > 3 ? "; …" : ""}`;
+}
+
+export const JobsView = React.memo(function JobsView({
+  data,
+  onRefresh,
+  onReconcile,
+}: {
+  data: JobList | null;
+  onRefresh: () => void;
+  onReconcile?: (job: Job) => void;
+}) {
   const jobs = data?.jobs ?? [];
   const terminalCount = jobs.filter((job) => ["succeeded", "failed", "cancelled"].includes(job.status)).length;
   return (
@@ -118,6 +164,8 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
             <tbody>
               {jobs.map((job) => {
                 const fallbackHint = diskFallbackHint(job);
+                const reconcileHint = reconciliationHint(job);
+                const hardwareHint = hardwareResultHint(job);
                 return (
                 <tr key={job.id}>
                   <td>
@@ -128,6 +176,8 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                     <span className={`chip job ${job.status}`}>{job.status}</span>
                     {job.error ? <small className="sub">{job.error}</small> : null}
                     {fallbackHint ? <small className="sub">{fallbackHint}</small> : null}
+                    {reconcileHint ? <small className="sub">{reconcileHint}</small> : null}
+                    {hardwareHint ? <small className="sub">{hardwareHint}</small> : null}
                     {job.status === "retrying" && job.next_run_at ? (
                       <small className="sub">retry {relTime(job.next_run_at)}</small>
                     ) : null}
@@ -170,6 +220,15 @@ export const JobsView = React.memo(function JobsView({ data, onRefresh }: { data
                         }}
                       >
                         Cancel
+                      </button>
+                    ) : null}
+                    {job.kind === "disk_convert"
+                    && job.status === "succeeded"
+                    && job.result.reconciliation
+                    && typeof job.result.reconciliation === "object"
+                    && (job.result.reconciliation as Record<string, unknown>).status === "action_required" ? (
+                      <button className="text" onClick={() => onReconcile?.(job)}>
+                        Reconcile
                       </button>
                     ) : null}
                     {["succeeded", "failed", "cancelled"].includes(job.status) ? (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,6 +23,7 @@ from .models import (
     Job,
     MigrateVmRequest,
     RenameVmRequest,
+    VmHardwareRequest,
 )
 from .store import LocalStore
 from .reclaim import build_owner_reports
@@ -464,6 +466,227 @@ class RelayWorker(threading.Thread):
                 adapter.wait_task(task_id)
             return {"vm_id": vm_id, "name": name}
 
+        if kind == "vm_hardware":
+            spec = VmHardwareRequest.model_validate(payload)
+            vm_ids = list(spec.vm_ids)
+            index = int(progress.get("index") or 0)
+            results = list(progress.get("results") or [])
+            while index < len(vm_ids):
+                vm_id = vm_ids[index]
+                if str(progress.get("vm_id") or "") not in {"", vm_id}:
+                    progress = {}
+                progress.update({"index": index, "total": len(vm_ids), "vm_id": vm_id, "results": results})
+
+                while True:
+                    phase = str(progress.get("phase") or "start")
+                    try:
+                        if phase == "start":
+                            original_power_state = adapter.vm_power_state(vm_id) if spec.shutdown_before else ""
+                            should_shutdown = spec.shutdown_before and original_power_state != "POWERED_OFF"
+                            should_restart = bool(
+                                should_shutdown
+                                and spec.power_on_after
+                                and original_power_state == "POWERED_ON"
+                            )
+                            if should_shutdown and original_power_state != "POWERED_ON" and not spec.force_power_off_on_timeout:
+                                raise PermanentError(
+                                    f"{original_power_state} cannot perform guest shutdown; enable forced power-off fallback"
+                                )
+                            progress.update(
+                                {
+                                    "original_power_state": original_power_state,
+                                    "should_restart": should_restart,
+                                    "phase": (
+                                        "shutdown_request"
+                                        if should_shutdown and original_power_state == "POWERED_ON"
+                                        else "force_power_off_start"
+                                        if should_shutdown
+                                        else "reconfigure_start"
+                                    ),
+                                    "task_id": "",
+                                }
+                            )
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "shutdown_request":
+                            try:
+                                adapter.request_guest_shutdown(vm_id)
+                            except Exception as exc:
+                                if is_transient(exc):
+                                    raise
+                                if not spec.force_power_off_on_timeout:
+                                    detail = str(exc) if isinstance(exc, PermanentError) else humanize_vcenter_error(
+                                        exc, host=self.settings.vcenter_host
+                                    )
+                                    raise PermanentError(f"Guest shutdown failed: {detail}") from exc
+                                progress["shutdown_error"] = (
+                                    str(exc)
+                                    if isinstance(exc, PermanentError)
+                                    else humanize_vcenter_error(exc, host=self.settings.vcenter_host)
+                                )
+                                progress["phase"] = "force_power_off_start"
+                                self.store.save_progress(job.id, progress)
+                                continue
+                            progress.update(
+                                {
+                                    "shutdown_requested": True,
+                                    "shutdown_deadline": time.time() + spec.shutdown_timeout_seconds,
+                                    "phase": "shutdown_wait",
+                                }
+                            )
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "shutdown_wait":
+                            deadline = float(progress.get("shutdown_deadline") or time.time())
+                            remaining = max(0, int(deadline - time.time()))
+                            if adapter.wait_vm_power_state(vm_id, "POWERED_OFF", remaining):
+                                progress.update(
+                                    {"stopped_by_workflow": True, "phase": "reconfigure_start", "task_id": ""}
+                                )
+                                self.store.save_progress(job.id, progress)
+                                continue
+                            if not spec.force_power_off_on_timeout:
+                                raise PermanentError(
+                                    f"Guest shutdown did not finish within {spec.shutdown_timeout_seconds} seconds"
+                                )
+                            progress["phase"] = "force_power_off_start"
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "force_power_off_start":
+                            if not spec.force_power_off_on_timeout:
+                                raise PermanentError("Forced power-off fallback was not confirmed")
+                            task_id = adapter.start_vm_power(vm_id, power_on=False) or ""
+                            progress.update(
+                                {
+                                    "task_id": task_id,
+                                    "forced_power_off": True,
+                                    "phase": "force_power_off_wait" if task_id else "reconfigure_start",
+                                }
+                            )
+                            if not task_id:
+                                progress["stopped_by_workflow"] = True
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "force_power_off_wait":
+                            adapter.wait_task(str(progress.get("task_id") or ""))
+                            progress.update(
+                                {"task_id": "", "stopped_by_workflow": True, "phase": "reconfigure_start"}
+                            )
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "reconfigure_start":
+                            task_id = adapter.start_vm_reconfigure(vm_id, spec) or ""
+                            progress.update(
+                                {
+                                    "task_id": task_id,
+                                    "hardware_task_id": task_id,
+                                    "phase": "reconfigure_wait" if task_id else "reconfigure_complete",
+                                }
+                            )
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "reconfigure_wait":
+                            adapter.wait_task(str(progress.get("task_id") or ""))
+                            progress.update({"task_id": "", "phase": "reconfigure_complete"})
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "reconfigure_complete":
+                            progress["reconfigured"] = True
+                            progress["phase"] = (
+                                "power_on_start"
+                                if progress.get("should_restart") and progress.get("stopped_by_workflow")
+                                else "complete"
+                            )
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "power_on_start":
+                            task_id = adapter.start_vm_power(vm_id, power_on=True) or ""
+                            progress.update(
+                                {
+                                    "task_id": task_id,
+                                    "phase": "power_on_wait" if task_id else "complete",
+                                }
+                            )
+                            if not task_id:
+                                progress["powered_on_after"] = True
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase == "power_on_wait":
+                            adapter.wait_task(str(progress.get("task_id") or ""))
+                            progress.update({"task_id": "", "powered_on_after": True, "phase": "complete"})
+                            self.store.save_progress(job.id, progress)
+                            continue
+
+                        if phase != "complete":
+                            raise PermanentError(f"Unknown VM hardware workflow phase: {phase}")
+
+                        workflow_error = str(progress.get("workflow_error") or "")
+                        result = {
+                            "vm_id": vm_id,
+                            "ok": not workflow_error,
+                            "task_id": str(progress.get("hardware_task_id") or ""),
+                        }
+                        if spec.shutdown_before:
+                            result.update(
+                                {
+                                    "original_power_state": str(progress.get("original_power_state") or ""),
+                                    "shutdown_requested": bool(progress.get("shutdown_requested")),
+                                    "forced_power_off": bool(progress.get("forced_power_off")),
+                                    "powered_on_after": bool(progress.get("powered_on_after")),
+                                }
+                            )
+                        if workflow_error:
+                            result["error"] = workflow_error
+                        results.append(result)
+                        break
+                    except Exception as exc:
+                        if is_transient(exc):
+                            raise
+                        detail = str(exc) if isinstance(exc, PermanentError) else humanize_vcenter_error(
+                            exc, host=self.settings.vcenter_host
+                        )
+                        if phase.startswith("power_on"):
+                            prior = str(progress.get("workflow_error") or "")
+                            progress["workflow_error"] = (
+                                f"{prior}; automatic power-on failed: {detail}"
+                                if prior
+                                else f"Hardware reconfiguration completed, but automatic power-on failed: {detail}"
+                            )
+                            progress["phase"] = "complete"
+                            self.store.save_progress(job.id, progress)
+                            continue
+                        if progress.get("should_restart") and progress.get("stopped_by_workflow"):
+                            progress["workflow_error"] = detail
+                            progress["task_id"] = ""
+                            progress["phase"] = "power_on_start"
+                            self.store.save_progress(job.id, progress)
+                            continue
+                        results.append({"vm_id": vm_id, "ok": False, "error": detail})
+                        break
+                index += 1
+                progress = {
+                    "index": index,
+                    "total": len(vm_ids),
+                    "vm_id": "",
+                    "phase": "start",
+                    "task_id": "",
+                    "results": results,
+                }
+                self.store.save_progress(job.id, progress)
+            if results and not any(bool(row.get("ok")) for row in results):
+                errors = "; ".join(str(row.get("error") or row.get("vm_id")) for row in results[:5])
+                raise PermanentError(f"Hardware reconfiguration failed for every VM: {errors}")
+            return {"results": results, "requested": len(vm_ids), "succeeded": sum(1 for row in results if row.get("ok"))}
+
         if kind == "migrate":
             spec = MigrateVmRequest.model_validate(payload)
             vm_ids = list(spec.vm_ids)
@@ -534,7 +757,12 @@ class RelayWorker(threading.Thread):
                 def disk_progress(index: int, extra: dict) -> None:
                     self.store.save_progress(job.id, dict(extra))
 
-                return adapter.execute_ssh_disk_conversion(fresh, on_progress=disk_progress)
+                result = adapter.execute_ssh_disk_conversion(fresh, on_progress=disk_progress)
+                if payload.get("reconcile_after", True):
+                    from .storage_reconciliation import conversion_reconciliation
+
+                    result["reconciliation"] = conversion_reconciliation(adapter, plan.vm_id, result)
+                return result
             task_id = str(progress.get("task_id") or "")
             if not task_id:
                 task_id = adapter.start_migrate(
@@ -549,7 +777,12 @@ class RelayWorker(threading.Thread):
                 progress.update({"task_id": task_id, "phase": "relocate"})
                 self.store.save_progress(job.id, progress)
             adapter.wait_task(task_id)
-            return {"vm_id": plan.vm_id, "target": plan.target, "method": "soap", "task_id": task_id}
+            result = {"vm_id": plan.vm_id, "target": plan.target, "method": "soap", "task_id": task_id}
+            if payload.get("reconcile_after", True):
+                from .storage_reconciliation import conversion_reconciliation
+
+                result["reconciliation"] = conversion_reconciliation(adapter, plan.vm_id, result)
+            return result
 
         if kind == "tools_deploy":
             return self._deploy_guest_tools(job, adapter, progress)
@@ -637,8 +870,32 @@ class RelayWorker(threading.Thread):
         username = credential.username
         if family == "windows" and credential.kind not in {"windows", "service"}:
             raise PermanentError("A Windows or service credential is required for this guest")
-        if family == "linux" and credential.kind not in {"ssh", "service"}:
+        if family in {"linux", "pfsense"} and credential.kind not in {"ssh", "service"}:
             raise PermanentError("An SSH or service credential is required for this guest")
+        if family == "pfsense" and username != "root":
+            raise PermanentError("pfSense package deployment requires a root SSH credential")
+
+        jump = None
+        jump_address = str(payload.get("jump_address") or "")
+        if jump_address and family in {"linux", "pfsense"}:
+            jump_credential_id = str(payload.get("jump_credential_id") or "")
+            jump_credential = self.automation_credentials.get(jump_credential_id)
+            if jump_credential is None:
+                raise PermanentError("The selected SSH jump-host credential no longer exists")
+            if jump_credential.scope == "endpoint" and jump_credential.endpoint_fingerprint != bound:
+                raise PermanentError("The selected jump-host credential belongs to a different vSphere endpoint")
+            if jump_credential.kind not in {"ssh", "service"}:
+                raise PermanentError("An SSH or service credential is required for the jump host")
+            jump_secret = self.automation_credentials.secret(jump_credential_id)
+            if not jump_secret:
+                raise PermanentError("The selected SSH jump-host credential has no stored secret")
+            jump = {
+                "address": jump_address,
+                "port": int(payload.get("jump_port") or 22),
+                "username": jump_credential.username,
+                "password": jump_secret,
+                "host_key_sha256": str(payload.get("jump_host_key_sha256") or ""),
+            }
 
         status = adapter.tools_status(vm_id)
         if status.get("running"):
@@ -670,19 +927,37 @@ class RelayWorker(threading.Thread):
                     raise
                 progress["phase"] = "verify"
                 self.store.save_progress(job.id, progress)
-        elif family == "linux":
+        elif family in {"linux", "pfsense"}:
             options = {
                 "port": int(payload.get("linux_port") or 22),
                 "host_key_sha256": str(payload.get("ssh_host_key_sha256") or ""),
-                "sudo": bool(payload.get("sudo", True)),
+                "jump": jump,
             }
             if phase == "preflight":
-                progress["preflight"] = guest_tools.linux_preflight(address, username, secret, **options)
+                if family == "pfsense":
+                    progress["preflight"] = guest_tools.pfsense_preflight(address, username, secret, **options)
+                else:
+                    progress["preflight"] = guest_tools.linux_preflight(
+                        address,
+                        username,
+                        secret,
+                        sudo=bool(payload.get("sudo", True)),
+                        **options,
+                    )
                 progress["phase"] = "install"
                 self.store.save_progress(job.id, progress)
                 phase = "install"
             if phase == "install":
-                progress["install"] = guest_tools.linux_install(address, username, secret, **options)
+                if family == "pfsense":
+                    progress["install"] = guest_tools.pfsense_install(address, username, secret, **options)
+                else:
+                    progress["install"] = guest_tools.linux_install(
+                        address,
+                        username,
+                        secret,
+                        sudo=bool(payload.get("sudo", True)),
+                        **options,
+                    )
                 progress["phase"] = "verify"
                 self.store.save_progress(job.id, progress)
         else:

@@ -4,7 +4,8 @@ from fastapi.testclient import TestClient
 
 from app.cli import parser
 from app.errors import PermanentError
-from app.esxi_ssh import datastore_path
+from app.esxi_ssh import EsxiSshExecutor, datastore_path
+from app.config import Settings
 from app.main import app
 
 
@@ -72,6 +73,9 @@ def test_cli_exposes_direct_esxi_workflows():
     parsed = root.parse_args(["disk-convert", "vm-1", "--target", "thin", "--yes"])
     assert parsed.command == "disk-convert"
     assert parsed.yes is True
+    tools = root.parse_args(["tools-deploy", "credential", "vm-1=10.0.0.1", "--jump-host-type", "windows", "--no-jump", "--yes"])
+    assert tools.no_jump is True
+    assert tools.jump_host_type == "windows"
 
 
 def test_ssh_datastore_paths_are_canonical_and_reject_traversal():
@@ -85,3 +89,56 @@ def test_ssh_datastore_paths_are_canonical_and_reject_traversal():
         pass
     else:
         raise AssertionError("path traversal must be rejected")
+
+
+def test_esxi_ssh_uses_saved_jump_access_path(monkeypatch):
+    import paramiko
+    from app import guest_tools
+
+    class FakeClient:
+        def __init__(self):
+            self.connect_args = None
+
+        def load_system_host_keys(self):
+            pass
+
+        def set_missing_host_key_policy(self, _policy):
+            pass
+
+        def connect(self, **kwargs):
+            self.connect_args = kwargs
+
+        def close(self):
+            pass
+
+    target_client = FakeClient()
+    jump_client = FakeClient()
+    channel = object()
+    captured = {}
+
+    def open_jump(address, port, jump, timeout):
+        captured.update({"address": address, "port": port, "jump": jump, "timeout": timeout})
+        return jump_client, channel
+
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: target_client)
+    monkeypatch.setattr(guest_tools, "_open_jump_channel", open_jump)
+    settings = Settings(
+        vcenter_host="esxi.internal",
+        vcenter_user="root",
+        esxi_ssh_user="root",
+        esxi_ssh_password="esxi-secret",
+        esxi_ssh_host_key_sha256="SHA256:target",
+        access_jump_enabled=True,
+        access_jump_address="access.example",
+        access_jump_user="jump-user",
+        access_jump_password="jump-secret",
+        access_jump_host_key_sha256="SHA256:jump",
+    )
+
+    connected, opened_jump = EsxiSshExecutor(settings)._connect()
+
+    assert connected is target_client
+    assert opened_jump is jump_client
+    assert captured["address"] == "esxi.internal"
+    assert captured["jump"]["username"] == "jump-user"
+    assert target_client.connect_args["sock"] is channel

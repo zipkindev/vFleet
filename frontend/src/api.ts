@@ -16,9 +16,13 @@ import type {
   MetricsResponse,
   MigrationAccessStatus,
   StagingSession,
+  StorageCleanupResponse,
+  StorageReconciliationReport,
   ToolsDeploymentResponse,
   ToolsDeploymentTarget,
   VmFolder,
+  VmHardwarePlan,
+  VmHardwareSpec,
 } from "./types";
 
 export class ApiError extends Error {
@@ -118,6 +122,12 @@ export async function login(body: {
   ssh_password?: string;
   ssh_port?: number;
   ssh_host_key_sha256?: string;
+  jump_enabled?: boolean;
+  jump_address?: string;
+  jump_port?: number;
+  jump_host_type?: "auto" | "windows" | "unix";
+  jump_credential_id?: string;
+  jump_host_key_sha256?: string;
   profile_id?: string;
   profile_name?: string;
 }): Promise<ConnectionInfo> {
@@ -136,8 +146,12 @@ export async function runActions(vmIds: string[], action: ActionName): Promise<A
   return payload.results;
 }
 
-export async function fetchAutomationCredentials(): Promise<AutomationCredentialList> {
-  return request<AutomationCredentialList>("/api/automation-credentials");
+export async function fetchAutomationCredentials(options: { profileId?: string; globalOnly?: boolean } = {}): Promise<AutomationCredentialList> {
+  const query = new URLSearchParams();
+  if (options.profileId) query.set("profile_id", options.profileId);
+  if (options.globalOnly) query.set("global_only", "true");
+  const suffix = query.toString() ? `?${query}` : "";
+  return request<AutomationCredentialList>(`/api/automation-credentials${suffix}`);
 }
 
 export async function saveAutomationCredential(body: {
@@ -161,10 +175,35 @@ export async function deleteAutomationCredential(id: string): Promise<void> {
   });
 }
 
-export async function fetchSshHostKey(address: string, port = 22): Promise<string> {
+export async function fetchSshHostKey(address: string, port = 22, jump?: {
+  address: string;
+  port: number;
+  credential_id: string;
+  host_key_sha256: string;
+}): Promise<string> {
   const query = new URLSearchParams({ address, port: String(port) });
+  if (jump) {
+    query.set("jump_address", jump.address);
+    query.set("jump_port", String(jump.port));
+    query.set("jump_credential_id", jump.credential_id);
+    query.set("jump_host_key_sha256", jump.host_key_sha256);
+  }
   const result = await request<{ fingerprint: string }>(`/api/tools/ssh-host-key?${query}`);
   return result.fingerprint;
+}
+
+export async function testSshConnection(body: {
+  address: string;
+  port: number;
+  credential_id: string;
+  host_key_sha256: string;
+  host_type?: "auto" | "windows" | "unix";
+  profile_id?: string;
+}): Promise<{ host_type: "auto" | "windows" | "unix"; detected_host_type: "auto" | "windows" | "unix" }> {
+  return request<{ ok: boolean; host_type: "auto" | "windows" | "unix"; detected_host_type: "auto" | "windows" | "unix" }>("/api/tools/ssh-connection-test", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 export async function deployGuestTools(body: {
@@ -175,10 +214,35 @@ export async function deployGuestTools(body: {
   validate_certificate: boolean;
   linux_port: number;
   sudo: boolean;
+  jump_address: string;
+  jump_port: number;
+  jump_host_type: "auto" | "windows" | "unix";
+  jump_credential_id: string;
+  jump_host_key_sha256: string;
 }): Promise<ToolsDeploymentResponse> {
   return request<ToolsDeploymentResponse>("/api/tools/deploy", {
     method: "POST",
     body: JSON.stringify({ ...body, confirm: true }),
+  });
+}
+
+export async function preflightGuestTools(body: {
+  targets: ToolsDeploymentTarget[];
+  credential_id: string;
+  windows_transport: "http" | "https";
+  windows_port: number;
+  validate_certificate: boolean;
+  linux_port: number;
+  sudo: boolean;
+  jump_address: string;
+  jump_port: number;
+  jump_host_type: "auto" | "windows" | "unix";
+  jump_credential_id: string;
+  jump_host_key_sha256: string;
+}): Promise<void> {
+  await request<{ ok: boolean }>("/api/tools/preflight", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 
@@ -324,6 +388,20 @@ export async function applyDrsOverride(vmIds: string[]): Promise<Job> {
   });
 }
 
+export async function planVmHardware(body: VmHardwareSpec): Promise<VmHardwarePlan> {
+  return request<VmHardwarePlan>("/api/vms/hardware/plan", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function configureVmHardware(body: VmHardwareSpec, planToken: string): Promise<Job> {
+  return request<Job>("/api/vms/hardware", {
+    method: "POST",
+    body: JSON.stringify({ ...body, plan_token: planToken, confirm: true }),
+  });
+}
+
 export async function migrateVms(body: {
   vm_ids: string[];
   host_id?: string;
@@ -347,7 +425,7 @@ export async function planDiskConversion(body: {
   });
 }
 
-export async function convertVmDisks(plan: DiskConversionPlan): Promise<Job> {
+export async function convertVmDisks(plan: DiskConversionPlan, reconcileAfter = true): Promise<Job> {
   return request<Job>("/api/vms/disk-conversion", {
     method: "POST",
     body: JSON.stringify({
@@ -355,8 +433,32 @@ export async function convertVmDisks(plan: DiskConversionPlan): Promise<Job> {
       target: plan.target,
       method: plan.method,
       plan_token: plan.plan_token,
+      reconcile_after: reconcileAfter,
       confirm: true,
     }),
+  });
+}
+
+export async function planStorageReconciliation(body: {
+  vm_ids: string[];
+  include_unregistered_directories: boolean;
+}): Promise<StorageReconciliationReport> {
+  return request<StorageReconciliationReport>("/api/storage/reconciliation", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function cleanupStorageReconciliation(body: {
+  vm_ids: string[];
+  include_unregistered_directories: boolean;
+  candidate_ids: string[];
+  manual_validated_candidate_ids: string[];
+  plan_token: string;
+}): Promise<StorageCleanupResponse> {
+  return request<StorageCleanupResponse>("/api/storage/reconciliation/cleanup", {
+    method: "POST",
+    body: JSON.stringify({ ...body, confirm: true }),
   });
 }
 

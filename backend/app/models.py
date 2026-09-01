@@ -59,6 +59,12 @@ class ConnectionProfileSummary(BaseModel):
     ssh_host_key_sha256: str = ""
     has_saved_password: bool = False
     has_saved_ssh_password: bool = False
+    jump_enabled: bool = False
+    jump_address: str = ""
+    jump_port: int = 22
+    jump_host_type: Literal["auto", "windows", "unix"] = "auto"
+    jump_credential_id: str = ""
+    jump_host_key_sha256: str = ""
     active: bool = False
     last_used_at: Optional[datetime] = None
 
@@ -87,6 +93,12 @@ class LoginRequest(BaseModel):
     ssh_password: str = ""
     ssh_port: int = 22
     ssh_host_key_sha256: str = ""
+    jump_enabled: bool = False
+    jump_address: str = ""
+    jump_port: int = Field(default=22, ge=1, le=65535)
+    jump_host_type: Literal["auto", "windows", "unix"] = "auto"
+    jump_credential_id: str = ""
+    jump_host_key_sha256: str = ""
     profile_id: str = ""
     profile_name: str = ""
 
@@ -136,16 +148,24 @@ class VirtualMachine(BaseModel):
     power_state: str
     cpu_count: int
     memory_mib: int
+    cores_per_socket: int = 1
+    cpu_hot_add_enabled: bool = False
+    memory_hot_add_enabled: bool = False
     cpu_usage_mhz: int = 0
     cpu_usage_pct: float = 0.0
     memory_usage_mib: int = 0
     memory_usage_pct: float = 0.0
+    host_memory_usage_mib: int = 0
+    ballooned_memory_mib: int = 0
+    swapped_memory_mib: int = 0
+    compressed_memory_mib: int = 0
     host_id: str = ""
     host_name: str = ""
     cluster_id: str = ""
     cluster_name: str = ""
     guest_os: str = ""
     tools_status: str = ""
+    tools_installer_mounted: bool = False
     ip_address: Optional[str] = None
     boot_time: Optional[datetime] = None
     last_activity: Optional[datetime] = None
@@ -165,6 +185,10 @@ class VirtualMachine(BaseModel):
     folder_id: str = ""
     folder_path: str = ""
     disks: List["VirtualDiskSummary"] = Field(default_factory=list)
+    cdrom_count: int = 0
+    mounted_iso_path: str = ""
+    iso_connected: bool = False
+    iso_start_connected: bool = False
 
 
 class VirtualDiskSummary(BaseModel):
@@ -341,6 +365,63 @@ class MigrateVmRequest(BaseModel):
     confirm: bool = False
 
 
+class VmHardwarePlanRequest(BaseModel):
+    vm_ids: List[str]
+    cpu_count: Optional[int] = Field(default=None, ge=1, le=128)
+    memory_mib: Optional[int] = Field(default=None, ge=128, le=1_048_576)
+    disk_index: Optional[int] = Field(default=None, ge=0, le=63)
+    disk_capacity_bytes: Optional[int] = Field(default=None, ge=1)
+    iso_action: Literal["keep", "mount", "eject"] = "keep"
+    iso_datastore_id: str = ""
+    iso_path: str = ""
+    iso_connect_at_power_on: bool = True
+    shutdown_before: bool = False
+    force_power_off_on_timeout: bool = False
+    power_on_after: bool = False
+    shutdown_timeout_seconds: int = Field(default=120, ge=30, le=900)
+
+
+class VmHardwareRequest(VmHardwarePlanRequest):
+    plan_token: str
+    confirm: bool = False
+
+
+class VmHardwareTargetPlan(BaseModel):
+    vm_id: str
+    name: str
+    cluster_id: str = ""
+    cluster_name: str = ""
+    host_id: str = ""
+    host_name: str = ""
+    power_state: str = ""
+    current_cpu_count: int = 0
+    target_cpu_count: Optional[int] = None
+    current_memory_mib: int = 0
+    target_memory_mib: Optional[int] = None
+    disk_index: Optional[int] = None
+    disk_label: str = ""
+    current_disk_capacity_bytes: int = 0
+    target_disk_capacity_bytes: Optional[int] = None
+    current_iso_path: str = ""
+    target_iso_path: str = ""
+    changes: List[str] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    will_shutdown_before: bool = False
+    may_force_power_off: bool = False
+    will_power_on_after: bool = False
+    noop: bool = False
+    can_execute: bool = False
+
+
+class VmHardwarePlan(BaseModel):
+    plan_token: str
+    targets: List[VmHardwareTargetPlan] = Field(default_factory=list)
+    can_execute_count: int = 0
+    blocked_count: int = 0
+    noop_count: int = 0
+
+
 class DiskConversionPlanRequest(BaseModel):
     vm_id: str
     target: str = "thin"
@@ -349,6 +430,7 @@ class DiskConversionPlanRequest(BaseModel):
 
 class DiskConversionRequest(DiskConversionPlanRequest):
     plan_token: str
+    reconcile_after: bool = True
     confirm: bool = False
 
 
@@ -366,6 +448,64 @@ class DiskConversionPlan(BaseModel):
     estimated_scratch_bytes: int = 0
     noop: bool = False
     can_execute: bool = False
+
+
+class StorageReconciliationRequest(BaseModel):
+    vm_ids: List[str] = Field(default_factory=list)
+    include_unregistered_directories: bool = True
+
+
+class StorageReconciliationCandidate(BaseModel):
+    id: str
+    kind: Literal["preserved_source_disk", "unattached_virtual_disk", "unregistered_vm_directory"]
+    datastore_id: str
+    datastore_name: str
+    path: str
+    size: int = 0
+    vm_id: str = ""
+    vm_name: str = ""
+    job_id: str = ""
+    confidence: Literal["high", "review"] = "review"
+    validation_status: Literal["automated", "manual_required", "blocked"] = "manual_required"
+    can_delete: bool = False
+    reason: str = ""
+    warning: str = ""
+
+
+class StorageReconciliationVmStatus(BaseModel):
+    vm_id: str
+    vm_name: str
+    power_state: str
+    tools_status: str = ""
+    tools_running: bool = False
+    boot_validated: bool = False
+    manual_validation_required: bool = False
+    message: str = ""
+
+
+class StorageReconciliationReport(BaseModel):
+    plan_token: str
+    scanned_at: datetime
+    inventory_stale: bool = False
+    vm_ids: List[str] = Field(default_factory=list)
+    scanned_directories: int = 0
+    candidates: List[StorageReconciliationCandidate] = Field(default_factory=list)
+    vm_statuses: List[StorageReconciliationVmStatus] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class StorageCleanupRequest(BaseModel):
+    vm_ids: List[str] = Field(default_factory=list)
+    include_unregistered_directories: bool = True
+    candidate_ids: List[str] = Field(default_factory=list)
+    manual_validated_candidate_ids: List[str] = Field(default_factory=list)
+    plan_token: str
+    confirm: bool = False
+
+
+class StorageCleanupResponse(BaseModel):
+    jobs: List["Job"] = Field(default_factory=list)
+    failures: List[str] = Field(default_factory=list)
 
 
 class HostServiceSummary(BaseModel):
@@ -614,7 +754,7 @@ class AutomationCredentialDeleteRequest(BaseModel):
 class ToolsDeploymentTarget(BaseModel):
     vm_id: str
     address: str
-    os_family: Literal["auto", "windows", "linux"] = "auto"
+    os_family: Literal["auto", "windows", "linux", "pfsense"] = "auto"
     ssh_host_key_sha256: str = ""
 
 
@@ -626,6 +766,11 @@ class ToolsDeploymentRequest(BaseModel):
     validate_certificate: bool = True
     linux_port: int = Field(default=22, ge=1, le=65535)
     sudo: bool = True
+    jump_address: str = ""
+    jump_port: int = Field(default=22, ge=1, le=65535)
+    jump_host_type: Literal["auto", "windows", "unix"] = "auto"
+    jump_credential_id: str = ""
+    jump_host_key_sha256: str = ""
     confirm: bool = False
 
 
@@ -638,3 +783,12 @@ class SshHostKeyInfo(BaseModel):
     address: str
     port: int
     fingerprint: str
+
+
+class SshConnectionTestRequest(BaseModel):
+    address: str
+    port: int = Field(default=22, ge=1, le=65535)
+    credential_id: str
+    host_key_sha256: str
+    host_type: Literal["auto", "windows", "unix"] = "auto"
+    profile_id: str = ""

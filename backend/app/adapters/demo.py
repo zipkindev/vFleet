@@ -31,6 +31,7 @@ from ..models import (
     VirtualMachine,
     VirtualDiskSummary,
     VmFolder,
+    VmHardwareRequest,
     VmTemplate,
 )
 from ..reclaim import annotate_idle, build_owner_reports
@@ -99,6 +100,7 @@ class DemoAdapter(InventoryAdapter):
             "disk_convert": True,
             "disk_convert_soap": True,
             "disk_convert_ssh": False,
+            "vm_hardware": True,
             "drs": True,
             "permissions": True,
             "migration_roles": True,
@@ -509,6 +511,7 @@ class DemoAdapter(InventoryAdapter):
             storage_used_bytes=used,
             storage_provisioned_bytes=provisioned,
             disk_provisioning=provisioning,
+            cdrom_count=1,
             folder_id=folder.id if folder else "",
             folder_path=folder.path if folder else "",
         )
@@ -563,6 +566,7 @@ class DemoAdapter(InventoryAdapter):
             storage_used_bytes=used,
             storage_provisioned_bytes=provisioned,
             disk_provisioning=provisioning,
+            cdrom_count=1,
             folder_id=folder.id if folder else source.folder_id,
             folder_path=folder.path if folder else source.folder_path,
         )
@@ -581,6 +585,115 @@ class DemoAdapter(InventoryAdapter):
             raise PermanentError(f"VM name already exists: {clean}")
         vm.name = clean
         return ""
+
+    def start_vm_reconfigure(self, vm_id: str, spec: VmHardwareRequest) -> str:
+        vm = self._vms.get(vm_id)
+        if vm is None or vm_id in self._templates:
+            raise PermanentError("Unknown VM")
+        running = vm.power_state != "POWERED_OFF"
+        changed = False
+        if spec.cpu_count is not None and spec.cpu_count != vm.cpu_count:
+            if running and spec.cpu_count < vm.cpu_count:
+                raise PermanentError("Power off the VM before reducing vCPU")
+            if running and not vm.cpu_hot_add_enabled:
+                raise PermanentError("Power off the VM or enable CPU hot-add before increasing vCPU")
+            vm.cpu_count = spec.cpu_count
+            if vm.cores_per_socket > 1 and vm.cpu_count % vm.cores_per_socket:
+                vm.cores_per_socket = 1
+            changed = True
+        if spec.memory_mib is not None and spec.memory_mib != vm.memory_mib:
+            if running and spec.memory_mib < vm.memory_mib:
+                raise PermanentError("Power off the VM before reducing memory")
+            if running and not vm.memory_hot_add_enabled:
+                raise PermanentError("Power off the VM or enable memory hot-add before increasing memory")
+            vm.memory_mib = spec.memory_mib
+            changed = True
+        if spec.disk_index is not None and spec.disk_capacity_bytes is not None:
+            if not vm.disks:
+                vm.disks = [
+                    VirtualDiskSummary(
+                        key=2000,
+                        label="Hard disk 1",
+                        capacity_bytes=vm.storage_provisioned_bytes,
+                        file_name=f"[vsan-lab] {vm.name}/{vm.name}.vmdk",
+                        datastore_id="ds-vsan",
+                        datastore_name="vsan-lab",
+                        provisioning="thin" if vm.disk_provisioning == "thin" else "lazy_zeroed_thick",
+                        backing_type="VirtualDiskFlatVer2BackingInfo",
+                    )
+                ]
+            if spec.disk_index >= len(vm.disks):
+                raise PermanentError(f"VM does not have disk {spec.disk_index + 1}")
+            disk = vm.disks[spec.disk_index]
+            if spec.disk_capacity_bytes < disk.capacity_bytes:
+                raise PermanentError(f"{disk.label} cannot be shrunk")
+            if spec.disk_capacity_bytes > disk.capacity_bytes:
+                if disk.rdm or disk.encrypted or disk.parent_depth or (
+                    disk.sharing and disk.sharing.lower() not in {"", "sharingnone"}
+                ):
+                    raise PermanentError(f"{disk.label} is not safe to expand")
+                growth = spec.disk_capacity_bytes - disk.capacity_bytes
+                disk.capacity_bytes = spec.disk_capacity_bytes
+                vm.storage_provisioned_bytes += growth
+                changed = True
+        if spec.iso_action == "mount":
+            datastore = self._datastores.get(spec.iso_datastore_id)
+            if datastore is None:
+                raise PermanentError("Unknown ISO datastore")
+            if vm.cdrom_count < 1:
+                raise PermanentError("VM has no virtual CD/DVD drive")
+            vm.mounted_iso_path = f"[{datastore.name}] {spec.iso_path}"
+            vm.iso_connected = True
+            vm.iso_start_connected = spec.iso_connect_at_power_on
+            changed = True
+        elif spec.iso_action == "eject" and (vm.iso_connected or vm.iso_start_connected):
+            vm.iso_connected = False
+            vm.iso_start_connected = False
+            changed = True
+        return f"demo-reconfigure-{vm_id}" if changed else ""
+
+    def vm_power_state(self, vm_id: str) -> str:
+        vm = self._vms.get(vm_id)
+        if vm is None or vm_id in self._templates:
+            raise PermanentError("Unknown VM")
+        return vm.power_state
+
+    def request_guest_shutdown(self, vm_id: str) -> None:
+        vm = self._vms.get(vm_id)
+        if vm is None or vm_id in self._templates:
+            raise PermanentError("Unknown VM")
+        if vm.power_state == "POWERED_OFF":
+            return
+        if vm.power_state != "POWERED_ON":
+            raise PermanentError("Guest shutdown requires a powered-on VM")
+        if vm.tools_status not in {"toolsOk", "guestToolsRunning"}:
+            raise PermanentError("VMware Tools is not running")
+        vm.power_state = "POWERED_OFF"
+        vm.cpu_usage_mhz = 0
+        vm.cpu_usage_pct = 0
+        vm.memory_usage_mib = 0
+        vm.memory_usage_pct = 0
+        vm.last_activity = NOW
+        vm.last_activity_source = "power_event"
+
+    def start_vm_power(self, vm_id: str, *, power_on: bool) -> str:
+        vm = self._vms.get(vm_id)
+        if vm is None or vm_id in self._templates:
+            raise PermanentError("Unknown VM")
+        target = "POWERED_ON" if power_on else "POWERED_OFF"
+        if vm.power_state == target:
+            return ""
+        vm.power_state = target
+        vm.last_activity = NOW
+        vm.last_activity_source = "power_event"
+        if power_on:
+            vm.boot_time = NOW
+        else:
+            vm.cpu_usage_mhz = 0
+            vm.cpu_usage_pct = 0
+            vm.memory_usage_mib = 0
+            vm.memory_usage_pct = 0
+        return f"demo-power-{'on' if power_on else 'off'}-{vm_id}"
 
     def disable_vm_drs(self, vm: Any, cluster_id: str = "", vm_name: str = "", vm_id: str = "") -> str:
         target_id = (vm_id or "").strip()
@@ -988,6 +1101,7 @@ class DemoAdapter(InventoryAdapter):
                 storage_used_bytes=used,
                 storage_provisioned_bytes=provisioned,
                 disk_provisioning=provisioning,
+                cdrom_count=1,
                 folder_id=folder.id,
                 folder_path=folder.path,
             )
@@ -1130,6 +1244,7 @@ class DemoAdapter(InventoryAdapter):
                 storage_used_bytes=used,
                 storage_provisioned_bytes=provisioned,
                 disk_provisioning=provisioning,
+                cdrom_count=1,
                 folder_id=template_folder.id,
                 folder_path=template_folder.path,
             )

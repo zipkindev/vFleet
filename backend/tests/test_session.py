@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import app
 from app.session import (
+    apply_runtime,
     clear_legacy_env_secrets,
     parse_endpoint,
     quote_env_value,
@@ -72,6 +73,22 @@ def test_resolve_login_password_reuses_saved_secret():
     assert resolve_login_password("", "vc.example", "user@vsphere.local", 443, settings) == "saved-secret"
     assert resolve_login_password("typed", "vc.example", "user@vsphere.local", 443, settings) == "typed"
     assert resolve_login_password("", "other.example", "user@vsphere.local", 443, settings) == ""
+
+
+def test_runtime_connection_does_not_inherit_a_previous_profile_jump_secret():
+    settings = Settings(
+        access_jump_enabled=True,
+        access_jump_address="old-access.example",
+        access_jump_user="old-user",
+        access_jump_password="old-secret",
+        access_jump_host_key_sha256="SHA256:old",
+    )
+
+    runtime = apply_runtime(settings, "new-vc.example", "admin", "new-secret", 443, True)
+
+    assert runtime.access_jump_enabled is False
+    assert runtime.access_jump_address == ""
+    assert runtime.access_jump_password == ""
 
 
 def test_resolve_ssh_password_reuses_only_matching_saved_secret():

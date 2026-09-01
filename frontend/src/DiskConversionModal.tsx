@@ -29,6 +29,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [showConfirmation, setShowConfirmation] = useState(false);
+  const [reconcileAfter, setReconcileAfter] = useState(true);
   const directEsxi = connection.endpoint_kind === "esxi";
 
   useEffect(() => {
@@ -81,7 +82,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
     const queuedVmIds: string[] = [];
     for (const row of executable) {
       try {
-        jobs.push(await convertVmDisks(row.plan));
+        jobs.push(await convertVmDisks(row.plan, reconcileAfter));
         queuedVmIds.push(row.vm.id);
       } catch (err) {
         failures.push(`${row.vm.name}: ${err instanceof Error ? err.message : "Could not queue conversion"}`);
@@ -136,7 +137,23 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
               {directEsxi ? <option value="soap">vSphere API relocation (advanced)</option> : null}
             </select>
           </label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={reconcileAfter}
+              onChange={(event) => setReconcileAfter(event.target.checked)}
+            />
+            Reconcile preserved source storage after conversion
+          </label>
         </div>
+        {reconcileAfter ? (
+          <div className="banner">
+            The job will refresh disk inventory and record any preserved SSH source disks. Cleanup remains blocked until a
+            post-conversion boot is validated through VMware Tools or acknowledged manually.
+          </div>
+        ) : (
+          <div className="banner warm">Automatic reconciliation is disabled; preserved SSH source disks must be reviewed later.</div>
+        )}
 
         {rows === null ? (
           <div className="modal-actions">
@@ -228,6 +245,7 @@ export function DiskConversionModal({ vms, connection, onClose, onQueued }: Prop
               <div><span>Target</span><strong>{targetLabel}</strong></div>
               <div><span>Method</span><strong>{methodLabel}</strong></div>
               <div><span>Capacity impact</span><strong>{capacityLabel}</strong></div>
+              <div><span>Reconciliation</span><strong>{reconcileAfter ? "Automatic review" : "Deferred"}</strong></div>
             </div>
 
             <div className="disk-confirm-vms">

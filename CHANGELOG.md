@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.1] — 2026-08-31
+
+feat: automate VMware Tools deployment
+
+- 37 files changed, 4727 insertions(+), 99 deletions(-) · CHANGELOG.md, README.md, backend/app/adapters/base.py, backend/app/adapters/demo.py, backend/app/adapters/vcenter.py, backend/app/cli.py, …
+
 ## [1.2.0] — 2026-08-31
 
 feat: automate bulk VMware Tools deployment with an encrypted Automation Vault
@@ -7,9 +13,23 @@ feat: automate bulk VMware Tools deployment with an encrypted Automation Vault
 - Adds single-VM and bulk Tools deployment from the Machines UI with an explicit review and final confirmation.
 - Automates Windows installation through WinRM, the host-provided VMware Tools ISO, reboot-aware verification, and restoration of the prior virtual CD media.
 - Supports Linux guests through pinned-host-key SSH and distribution packages for `open-vm-tools` across apt, dnf/yum, zypper, tdnf, and apk systems.
+- Supports pfSense through root SSH and the signed `pfSense-pkg-Open-VM-Tools` package, with pfSense platform preflight and post-install `vmtoolsd` verification.
+- Keeps guest and jump-host credential selectors independent; pfSense guest selection exposes only root credentials and avoids auto-selecting the inherited jump credential.
+- Adds a default-on remote dry-run checkbox to the Tools review, with explicit passed, skipped, and new-credential messaging.
+- Makes VM memory reporting explicit about active versus host-consumed RAM and exposes Tools, balloon, swap, and compression state in Machines.
+- Adds optional SSH jump-host routing with separate vaulted credentials and pinned keys for both the jump host and guest.
+- Associates a tested one-hop jump host with each saved vCenter/ESXi profile, supports auto-discovery or explicit Windows OpenSSH/PowerShell and Linux/Unix host types, inherits it in Tools deployments, and allows per-deployment disable/override.
+- Routes standalone ESXi's allowlisted SSH disk-conversion fallback through the saved access host while keeping vCenter HTTPS/SOAP direct.
+- Prevents deletion of vaulted jump credentials that are still referenced by saved connection profiles.
 - Adds reusable Windows, Linux/SSH, and service credentials to the portable AES-256-GCM JSON vault; secrets never enter API responses or persistent job payloads.
 - Adds CLI commands for vault metadata, credential creation/deletion, and bulk Windows/Linux Tools deployment.
 - Keeps every guest as an endpoint-bound independent relay job so bulk failures and retries remain isolated.
+- Adds default-on post-conversion storage reconciliation for single and bulk disk jobs, including explicit VMware Tools/manual post-boot validation guidance before preserved-source cleanup.
+- Adds guarded storage reconciliation from Machines and Datastores to inventory preserved conversion sources, unattached VMDKs, and first-level unregistered VM directories; every deletion is replanned and explicitly confirmed.
+- Adds a unified single/bulk VM hardware planner for shared vCPU, RAM, disk growth, and datastore ISO mount/eject changes, including automatic selected-cluster expansion and per-VM blockers/results.
+- Executes reviewed hardware changes through endpoint-bound persistent `ReconfigVM_Task` jobs; powered-on hot-add rules, disk shrink/snapshot/RDM/encryption/sharing hazards, CD/DVD availability, and ISO datastore placement are rechecked before execution.
+- Adds a persisted power workflow for hardware changes: graceful guest shutdown, an explicit two-minute forced-power-off fallback, and best-effort restoration only for VMs that were originally powered on—even when reconfiguration fails.
+- Adds matching bulk `hardware-plan` and `hardware-config` CLI commands.
 
 ## [1.1.3] — 2026-08-31
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     esxi_ssh_host_key_sha256: str = ""
     esxi_ssh_timeout_seconds: int = Field(default=30, ge=5, le=300)
     esxi_ssh_use_login_password: bool = False
+
+    # Runtime-only access path loaded from a connection profile. The jump
+    # password is resolved from the Automation Vault and is never profile metadata.
+    access_jump_enabled: bool = False
+    access_jump_address: str = ""
+    access_jump_port: int = Field(default=22, ge=1, le=65535)
+    access_jump_host_type: Literal["auto", "windows", "unix"] = "auto"
+    access_jump_user: str = ""
+    access_jump_password: str = ""
+    access_jump_host_key_sha256: str = ""
 
     name_group_pattern: str = r"^([A-Za-z][A-Za-z0-9]+)"
     owner_field_names: str = "Owner,owner,User,user,CreatedBy,createdBy"

@@ -37,6 +37,7 @@ from ..models import (
     NetworkSummary,
     VirtualMachine,
     VmFolder,
+    VmHardwareRequest,
     VmTemplate,
 )
 from ..reclaim import annotate_idle, build_owner_reports
@@ -159,6 +160,7 @@ class VCenterAdapter(InventoryAdapter):
             "support_bundle": endpoint_kind == "esxi",
             "disk_convert": True,
             "disk_convert_ssh": endpoint_kind == "esxi" and self.settings.esxi_ssh_enabled,
+            "vm_hardware": True,
             "clone": endpoint_kind == "vcenter",
             "migrate": endpoint_kind == "vcenter",
             "drs": endpoint_kind == "vcenter",
@@ -822,8 +824,12 @@ class VCenterAdapter(InventoryAdapter):
                 "runtime.powerState",
                 "runtime.bootTime",
                 "runtime.host",
+                "runtime.toolsInstallerMounted",
                 "config.hardware.numCPU",
+                "config.hardware.numCoresPerSocket",
                 "config.hardware.memoryMB",
+                "config.cpuHotAddEnabled",
+                "config.memoryHotAddEnabled",
                 "config.guestId",
                 "config.annotation",
                 "guest.toolsStatus",
@@ -831,6 +837,10 @@ class VCenterAdapter(InventoryAdapter):
                 "guest.ipAddress",
                 "summary.quickStats.overallCpuUsage",
                 "summary.quickStats.guestMemoryUsage",
+                "summary.quickStats.hostMemoryUsage",
+                "summary.quickStats.balloonedMemory",
+                "summary.quickStats.swappedMemory",
+                "summary.quickStats.compressedMemory",
                 "summary.runtime.maxCpuUsage",
                 "summary.storage.committed",
                 "summary.storage.uncommitted",
@@ -909,8 +919,19 @@ class VCenterAdapter(InventoryAdapter):
             deployed_by = resolve_deployed_by(custom, self.settings.owner_fields, deployers.get(row["id"], ""))
             cpus = int(row.get("config.hardware.numCPU") or 0)
             memory_mib = int(row.get("config.hardware.memoryMB") or 0)
+            devices = row.get("config.hardware.device") or []
+            cdroms = [device for device in devices if type(device).__name__.rsplit(".", 1)[-1] == "VirtualCdrom"]
+            cdrom = cdroms[0] if cdroms else None
+            cdrom_backing = getattr(cdrom, "backing", None) if cdrom is not None else None
+            cdrom_connectable = getattr(cdrom, "connectable", None) if cdrom is not None else None
             cpu_usage = int(row.get("summary.quickStats.overallCpuUsage") or 0)
             mem_usage = int(row.get("summary.quickStats.guestMemoryUsage") or 0)
+            host_mem_usage = int(row.get("summary.quickStats.hostMemoryUsage") or 0)
+            ballooned_memory = int(row.get("summary.quickStats.balloonedMemory") or 0)
+            swapped_memory = int(row.get("summary.quickStats.swappedMemory") or 0)
+            # VirtualMachineQuickStats.compressedMemory is reported in KiB;
+            # the other quickStats memory values collected here are MiB.
+            compressed_memory = int(int(row.get("summary.quickStats.compressedMemory") or 0) / 1024)
             max_cpu = int(row.get("summary.runtime.maxCpuUsage") or 0)
             if not max_cpu and host is not None:
                 max_cpu = cpus * host.cpu_mhz
@@ -930,16 +951,24 @@ class VCenterAdapter(InventoryAdapter):
                 power_state=normalize_power_state(row.get("runtime.powerState") or "UNKNOWN"),
                 cpu_count=cpus,
                 memory_mib=memory_mib,
+                cores_per_socket=int(row.get("config.hardware.numCoresPerSocket") or 1),
+                cpu_hot_add_enabled=bool(row.get("config.cpuHotAddEnabled") or False),
+                memory_hot_add_enabled=bool(row.get("config.memoryHotAddEnabled") or False),
                 cpu_usage_mhz=cpu_usage,
                 cpu_usage_pct=_pct(cpu_usage, max_cpu),
                 memory_usage_mib=mem_usage,
                 memory_usage_pct=_pct(mem_usage, memory_mib),
+                host_memory_usage_mib=host_mem_usage,
+                ballooned_memory_mib=ballooned_memory,
+                swapped_memory_mib=swapped_memory,
+                compressed_memory_mib=compressed_memory,
                 host_id=host.id if host else "",
                 host_name=host.name if host else "",
                 cluster_id=host.cluster_id if host else "",
                 cluster_name=host.cluster_name if host else "",
                 guest_os=str(row.get("config.guestId") or ""),
                 tools_status=tools,
+                tools_installer_mounted=bool(row.get("runtime.toolsInstallerMounted") or False),
                 ip_address=row.get("guest.ipAddress") or None,
                 boot_time=boot,
                 last_activity=_utc(last_ts),
@@ -953,7 +982,11 @@ class VCenterAdapter(InventoryAdapter):
                 storage_provisioned_bytes=storage_provisioned,
                 disk_provisioning=disk_provisioning,
                 drs_override=drs_overridden.get(row["id"], False),
-                disks=disk_summaries(row.get("config.hardware.device") or []),
+                disks=disk_summaries(devices),
+                cdrom_count=len(cdroms),
+                mounted_iso_path=str(getattr(cdrom_backing, "fileName", "") or ""),
+                iso_connected=bool(getattr(cdrom_connectable, "connected", False)),
+                iso_start_connected=bool(getattr(cdrom_connectable, "startConnected", False)),
             )
             vms.append(annotate_idle(vm, self.settings))
 
@@ -1639,6 +1672,150 @@ class VCenterAdapter(InventoryAdapter):
             return ""
 
         task = vm.Relocate(relocate)
+        return _moid(task)
+
+    def start_vm_reconfigure(self, vm_id: str, spec: VmHardwareRequest) -> str:
+        from pyVmomi import vim
+
+        from ..vm_hardware import validate_hardware_request
+
+        clean = validate_hardware_request(spec)
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        config = getattr(vm, "config", None)
+        if bool(getattr(config, "template", False)):
+            raise PermanentError("Refusing to reconfigure a template")
+        hardware = getattr(config, "hardware", None)
+        devices = list(getattr(hardware, "device", None) or [])
+        power_state = normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", ""))
+        running = power_state != "POWERED_OFF"
+        config_spec = vim.vm.ConfigSpec()
+        device_changes: List[Any] = []
+        changed = False
+
+        current_cpu = int(getattr(hardware, "numCPU", 0) or 0)
+        if clean.cpu_count is not None and clean.cpu_count != current_cpu:
+            if running and clean.cpu_count < current_cpu:
+                raise PermanentError("Power off the VM before reducing vCPU")
+            if running and not bool(getattr(config, "cpuHotAddEnabled", False)):
+                raise PermanentError("Power off the VM or enable CPU hot-add before increasing vCPU")
+            config_spec.numCPUs = int(clean.cpu_count)
+            cores_per_socket = int(getattr(hardware, "numCoresPerSocket", 1) or 1)
+            if cores_per_socket > 1 and clean.cpu_count % cores_per_socket:
+                config_spec.numCoresPerSocket = 1
+            changed = True
+
+        current_memory = int(getattr(hardware, "memoryMB", 0) or 0)
+        if clean.memory_mib is not None and clean.memory_mib != current_memory:
+            if running and clean.memory_mib < current_memory:
+                raise PermanentError("Power off the VM before reducing memory")
+            if running and not bool(getattr(config, "memoryHotAddEnabled", False)):
+                raise PermanentError("Power off the VM or enable memory hot-add before increasing memory")
+            config_spec.memoryMB = int(clean.memory_mib)
+            changed = True
+
+        if clean.disk_index is not None and clean.disk_capacity_bytes is not None:
+            disks = [device for device in devices if isinstance(device, vim.vm.device.VirtualDisk)]
+            if clean.disk_index >= len(disks):
+                raise PermanentError(f"VM does not have disk {clean.disk_index + 1}")
+            disk = disks[clean.disk_index]
+            summary = disk_summaries([disk])[0]
+            if clean.disk_capacity_bytes < summary.capacity_bytes:
+                raise PermanentError(f"{summary.label} cannot be shrunk")
+            if clean.disk_capacity_bytes > summary.capacity_bytes:
+                if summary.rdm:
+                    raise PermanentError(f"{summary.label} is an RDM or device mapping")
+                if summary.encrypted:
+                    raise PermanentError(f"{summary.label} is encrypted")
+                if summary.parent_depth:
+                    raise PermanentError(f"{summary.label} has a snapshot/backing chain")
+                if summary.sharing and summary.sharing.lower() not in {"", "sharingnone"}:
+                    raise PermanentError(f"{summary.label} uses shared-disk mode {summary.sharing}")
+                disk.capacityInKB = int(clean.disk_capacity_bytes // 1024)
+                disk.capacityInBytes = int(clean.disk_capacity_bytes)
+                change = vim.vm.device.VirtualDeviceSpec()
+                change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+                change.device = disk
+                device_changes.append(change)
+                changed = True
+
+        if clean.iso_action in {"mount", "eject"}:
+            if bool(getattr(getattr(vm, "runtime", None), "toolsInstallerMounted", False)):
+                raise PermanentError("VMware Tools installer media is mounted; restore it before changing the CD/DVD ISO")
+            cdroms = [device for device in devices if isinstance(device, vim.vm.device.VirtualCdrom)]
+            if not cdroms:
+                raise PermanentError("VM has no virtual CD/DVD drive")
+            cdrom = cdroms[0]
+            connectable = getattr(cdrom, "connectable", None)
+            if connectable is None:
+                connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+                connectable.allowGuestControl = True
+                cdrom.connectable = connectable
+            if clean.iso_action == "mount":
+                datastore = self._obj(vim.Datastore, clean.iso_datastore_id)
+                datastore_name = str(datastore.name or clean.iso_datastore_id)
+                host = getattr(getattr(vm, "runtime", None), "host", None)
+                host_ids = _as_host_ids(getattr(datastore, "host", None) or [])
+                if host is not None and host_ids and _moid(host) not in host_ids:
+                    raise PermanentError(f"Datastore {datastore_name} is not mounted on {getattr(host, 'name', 'the VM host')}")
+                backing = vim.vm.device.VirtualCdrom.IsoBackingInfo()
+                backing.datastore = datastore
+                backing.fileName = f"[{datastore_name}] {clean.iso_path}"
+                cdrom.backing = backing
+                connectable.connected = power_state == "POWERED_ON"
+                connectable.startConnected = bool(clean.iso_connect_at_power_on)
+            else:
+                connectable.connected = False
+                connectable.startConnected = False
+            change = vim.vm.device.VirtualDeviceSpec()
+            change.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+            change.device = cdrom
+            device_changes.append(change)
+            changed = True
+
+        if device_changes:
+            config_spec.deviceChange = device_changes
+        if not changed:
+            return ""
+        task = vm.ReconfigVM_Task(spec=config_spec)
+        with self._lock:
+            self._cache = None
+        return _moid(task)
+
+    def vm_power_state(self, vm_id: str) -> str:
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        return normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", ""))
+
+    def request_guest_shutdown(self, vm_id: str) -> None:
+        from pyVmomi import vim
+
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        state = normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", ""))
+        if state == "POWERED_OFF":
+            return
+        if state != "POWERED_ON":
+            raise PermanentError("Guest shutdown requires a powered-on VM")
+        try:
+            vm.ShutdownGuest()
+        except vim.fault.ToolsUnavailable as exc:
+            raise PermanentError("VMware Tools is not running") from exc
+        except vim.fault.InvalidPowerState as exc:
+            raise PermanentError(str(getattr(exc, "msg", "Invalid VM power state"))) from exc
+
+    def start_vm_power(self, vm_id: str, *, power_on: bool) -> str:
+        vm = self._find_vm(self._session().content, vm_id)
+        if vm is None:
+            raise PermanentError("Unknown VM")
+        state = normalize_power_state(getattr(getattr(vm, "runtime", None), "powerState", ""))
+        target = "POWERED_ON" if power_on else "POWERED_OFF"
+        if state == target:
+            return ""
+        task = vm.PowerOn() if power_on else vm.PowerOff()
         return _moid(task)
 
     def start_move_into_folder(self, vm_id: str, folder_id: str) -> str:

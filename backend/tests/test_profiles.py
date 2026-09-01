@@ -30,6 +30,11 @@ def test_connection_profiles_encrypt_secrets_and_never_return_them_in_summary(tm
             ssh_user="root",
             ssh_password="ssh-secret",
             ssh_host_key_sha256="SHA256:public-key-fingerprint",
+            jump_enabled=True,
+            jump_address="access.lab.local",
+            jump_host_type="windows",
+            jump_credential_id="jump-credential",
+            jump_host_key_sha256="SHA256:jump-key",
         )
     )
 
@@ -42,6 +47,10 @@ def test_connection_profiles_encrypt_secrets_and_never_return_them_in_summary(tm
     assert "ssh_password" not in summary
     assert summary["has_saved_password"] is True
     assert summary["has_saved_ssh_password"] is True
+    assert summary["jump_address"] == "access.lab.local"
+    assert summary["jump_host_type"] == "windows"
+    assert summary["jump_credential_id"] == "jump-credential"
+    assert summary["jump_host_key_sha256"] == "SHA256:jump-key"
     assert summary["active"] is True
     assert path.stat().st_mode & 0o777 == 0o600
     assert (tmp_path / "credentials.enc.json").stat().st_mode & 0o777 == 0o600

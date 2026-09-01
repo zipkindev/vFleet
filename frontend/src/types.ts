@@ -1,4 +1,5 @@
 export type PowerState = "POWERED_ON" | "POWERED_OFF" | "SUSPENDED" | string;
+export type JumpHostType = "auto" | "windows" | "unix";
 
 export type ConnectionInfo = {
   mode: string;
@@ -53,6 +54,12 @@ export type ConnectionProfile = {
   ssh_host_key_sha256: string;
   has_saved_password: boolean;
   has_saved_ssh_password: boolean;
+  jump_enabled: boolean;
+  jump_address: string;
+  jump_port: number;
+  jump_host_type: JumpHostType;
+  jump_credential_id: string;
+  jump_host_key_sha256: string;
   active: boolean;
   last_used_at: string | null;
 };
@@ -75,6 +82,9 @@ export type HostSummary = {
   cpu_usage_mhz: number;
   cpu_usage_pct: number;
   memory_mib: number;
+  cores_per_socket: number;
+  cpu_hot_add_enabled: boolean;
+  memory_hot_add_enabled: boolean;
   memory_usage_mib: number;
   memory_usage_pct: number;
   vm_count: number;
@@ -108,12 +118,17 @@ export type VirtualMachine = {
   cpu_usage_pct: number;
   memory_usage_mib: number;
   memory_usage_pct: number;
+  host_memory_usage_mib: number;
+  ballooned_memory_mib: number;
+  swapped_memory_mib: number;
+  compressed_memory_mib: number;
   host_id: string;
   host_name: string;
   cluster_id: string;
   cluster_name: string;
   guest_os: string;
   tools_status: string;
+  tools_installer_mounted: boolean;
   ip_address: string | null;
   boot_time: string | null;
   last_activity: string | null;
@@ -133,6 +148,10 @@ export type VirtualMachine = {
   folder_id?: string;
   folder_path?: string;
   disks: VirtualDiskSummary[];
+  cdrom_count: number;
+  mounted_iso_path: string;
+  iso_connected: boolean;
+  iso_start_connected: boolean;
 };
 
 export type VirtualDiskSummary = {
@@ -165,6 +184,102 @@ export type DiskConversionPlan = {
   estimated_scratch_bytes: number;
   noop: boolean;
   can_execute: boolean;
+};
+
+export type VmHardwareSpec = {
+  vm_ids: string[];
+  cpu_count?: number;
+  memory_mib?: number;
+  disk_index?: number;
+  disk_capacity_bytes?: number;
+  iso_action: "keep" | "mount" | "eject";
+  iso_datastore_id?: string;
+  iso_path?: string;
+  iso_connect_at_power_on?: boolean;
+  shutdown_before?: boolean;
+  force_power_off_on_timeout?: boolean;
+  power_on_after?: boolean;
+  shutdown_timeout_seconds?: number;
+};
+
+export type VmHardwareTargetPlan = {
+  vm_id: string;
+  name: string;
+  cluster_id: string;
+  cluster_name: string;
+  host_id: string;
+  host_name: string;
+  power_state: string;
+  current_cpu_count: number;
+  target_cpu_count: number | null;
+  current_memory_mib: number;
+  target_memory_mib: number | null;
+  disk_index: number | null;
+  disk_label: string;
+  current_disk_capacity_bytes: number;
+  target_disk_capacity_bytes: number | null;
+  current_iso_path: string;
+  target_iso_path: string;
+  changes: string[];
+  blockers: string[];
+  warnings: string[];
+  will_shutdown_before: boolean;
+  may_force_power_off: boolean;
+  will_power_on_after: boolean;
+  noop: boolean;
+  can_execute: boolean;
+};
+
+export type VmHardwarePlan = {
+  plan_token: string;
+  targets: VmHardwareTargetPlan[];
+  can_execute_count: number;
+  blocked_count: number;
+  noop_count: number;
+};
+
+export type StorageReconciliationCandidate = {
+  id: string;
+  kind: "preserved_source_disk" | "unattached_virtual_disk" | "unregistered_vm_directory";
+  datastore_id: string;
+  datastore_name: string;
+  path: string;
+  size: number;
+  vm_id: string;
+  vm_name: string;
+  job_id: string;
+  confidence: "high" | "review";
+  validation_status: "automated" | "manual_required" | "blocked";
+  can_delete: boolean;
+  reason: string;
+  warning: string;
+};
+
+export type StorageReconciliationVmStatus = {
+  vm_id: string;
+  vm_name: string;
+  power_state: string;
+  tools_status: string;
+  tools_running: boolean;
+  boot_validated: boolean;
+  manual_validation_required: boolean;
+  message: string;
+};
+
+export type StorageReconciliationReport = {
+  plan_token: string;
+  scanned_at: string;
+  inventory_stale: boolean;
+  vm_ids: string[];
+  scanned_directories: number;
+  candidates: StorageReconciliationCandidate[];
+  vm_statuses: StorageReconciliationVmStatus[];
+  warnings: string[];
+};
+
+export type StorageCleanupResponse = {
+  jobs: Job[];
+  failures: string[];
 };
 
 export type HostServiceSummary = {
@@ -261,7 +376,7 @@ export type AutomationCredentialList = {
 export type ToolsDeploymentTarget = {
   vm_id: string;
   address: string;
-  os_family: "auto" | "windows" | "linux";
+  os_family: "auto" | "windows" | "linux" | "pfsense";
   ssh_host_key_sha256?: string;
 };
 

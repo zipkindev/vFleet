@@ -12,8 +12,10 @@ This talks only to endpoints you configure. UI-saved credentials live in vFleet'
 | Clusters, hosts, VMs | PropertyCollector inventory | Names, power state, guest OS, Tools, IP, configured vCPU/RAM, current host/cluster. Cached locally so the UI keeps working if the VPN drops. |
 | CPU / memory utilization | `summary.quickStats` | Live usage (MHz / guest memory). This is the same family of numbers the vSphere UI uses, not guest-inside telemetry. |
 | Power on / off / reset / suspend | Local job queue → VIM power methods | **Guest shutdown/reboot** needs VMware Tools. Hard power-off does not. Queued on disk; retried after disconnects. |
-| Install VMware Tools | Windows WinRM + host Tools ISO; Linux SSH + `open-vm-tools` | Single or bulk action. Uses a selected encrypted Automation Vault credential, pins Linux SSH host keys, and gives every guest an independent endpoint-bound job. |
+| Install VMware Tools | Windows WinRM + host Tools ISO; Linux SSH + `open-vm-tools`; pfSense SSH + `pfSense-pkg-Open-VM-Tools` | Single or bulk action. Uses encrypted Automation Vault credentials, pins target and optional jump-host SSH keys, and gives every guest an independent endpoint-bound job. |
+| Configure VM hardware | Reviewed local job → power workflow → `ReconfigVM_Task` | Single or bulk shared desired state for vCPU, RAM, one disk target size, and datastore ISO mount/eject. Powered-on VMs can use an explicit guest-shutdown workflow, an optional forced-power-off fallback, and restoration of VMs that were originally running. Disk shrink is never allowed. |
 | Migrate host / convert disks | Local job → vCenter `RelocateVM` or verified ESXi SSH | vCenter uses Storage vMotion. Direct ESXi uses an allowlisted `vmkfstools` clone because HostAgent can reject in-place relocation. **50 VMs per job** is a vFleet relay cap; extra VMs are deferred to a second batch. |
+| Reconcile storage | Live inventory + conversion history + guarded datastore scan | Single VM, bulk selection, or full datastore scan. Finds preserved conversion sources, unattached VMDKs, and unregistered VM folders without deleting anything until a fresh plan and explicit confirmation. |
 | Create VM | Clone from a template already on the remote side | Small SOAP call. Prefer this over uploading an OVA across a WAN. Resumes by reattaching the vCenter task. |
 | Datastores | Inventory + datastore browser | Capacity, free space, browse folders, mkdir, delete file. Last listing is cached when vCenter is unreachable. |
 | Upload ISO / OVA | Local staging, then resumable push | File lands on this machine first. The relay then uploads via Content Library (byte resume) or datastore PUT with retry. |
@@ -31,8 +33,10 @@ Connect to an ESXi management address exactly as you would connect to vCenter. v
 - Inventory, VM console/power/rename/delete, datastore access, and host administration use the vSphere SOAP API directly on the host.
 - The **Hosts** view becomes a direct-host console for maintenance mode, guarded reboot/shutdown, ESXi Shell/SSH/NTP service state, NTP configuration, storage rescan, and support-bundle generation.
 - VM **Actions → Convert disk provisioning** first builds a disk-by-disk plan. RDM, encrypted, shared, snapshot-dependent SSH, stale-plan, and endpoint-switch hazards are blocked before a job is queued.
+- **Machines → Configure hardware** applies one reviewed configuration to up to 50 VMs. It can automatically expand the target scope to every VM in the selected cluster(s), while retaining per-VM blockers and results. Disk selection is ordinal (`Disk 1`, `Disk 2`, …) so different vSphere device keys do not break a bulk change. The optional power workflow requests guest shutdown through VMware Tools, forces power off after two minutes only when explicitly enabled, and powers back on only VMs that were running when execution began.
 - vCenter-only DRS, roles, templates, Content Library, and cross-host migration remain available only when a vCenter endpoint reports those capabilities.
 - Standalone HostAgent can advertise relocation capabilities but reject an in-place disk format change with `NotSupported`, even on a licensed host. Automatic disk conversion therefore uses verified SSH on direct ESXi. vFleet temporarily starts the SSH service for the job, restores its prior stopped state afterward, limits execution to `vmkfstools` cloning, and preserves source VMDKs. The API relocation path remains an explicitly labeled advanced option.
+- Disk conversions reconcile storage by default. A preserved source is cleanup-eligible only when the replacement is attached and a post-conversion boot is validated with VMware Tools. If Tools is absent, the UI offers the existing automated Tools deployment or a manual post-boot validation acknowledgement. Powered-off VMs remain blocked.
 
 Every job records the endpoint fingerprint it was created for. A queued task will fail closed rather than run after the operator switches to a different vCenter or ESXi host.
 
@@ -44,9 +48,23 @@ Select one or more powered-on VMs and choose **Deploy VMware Tools**:
 
 - Windows Server and desktop guests use WinRM with encrypted NTLM messages (or HTTPS), verify local-administrator access, mount the ESXi/vCenter-provided Tools ISO, run the silent installer, verify Tools after the scheduled reboot, and restore prior CD media.
 - Linux guests use password-authenticated SSH with a reviewed SHA-256 host-key fingerprint. The relay installs the distribution-supported `open-vm-tools` package through apt, dnf/yum, zypper, tdnf, or apk and validates `vmtoolsd`.
+- pfSense guests use a root SSH credential and the signed `pfSense-pkg-Open-VM-Tools` package from the firewall's configured pfSense repository. Preflight fails closed unless the target identifies itself as pfSense, and the job verifies `vmtoolsd` without requesting a reboot.
+- Saved vCenter and standalone ESXi profiles can define a default one-hop SSH access path using a separately vaulted credential and pinned jump-host key. The jump-host type can be auto-discovered or set to Windows OpenSSH/PowerShell or Linux/Unix. VMware Tools deployments inherit it automatically, while operators can disable or override it for one deployment.
+- SSH guests can optionally connect through that inherited or one-off jump host. Both host keys are reviewed and pinned, and neither password enters the job payload. Standalone ESXi's allowlisted SSH disk-conversion fallback uses the saved access path too; vCenter HTTPS/SOAP remains direct.
 - Mixed and bulk selections remain independent jobs. One guest failure does not roll back or fail other guests.
+- **Run a remote dry run before queueing** is enabled by default. It authenticates, verifies platform/root access and pinned keys, and checks package state without installing; operators can explicitly skip it for restricted environments, and the review banner records that choice.
+- The Machines memory cell distinguishes guest-active memory from ESXi host-consumed memory and displays balloon, swap, and compression counters when non-zero; the VM identity line also shows whether VMware Tools is running.
 
-The guest must already be network reachable from the vFleet host. Windows requires WinRM and an administrator credential; Linux requires SSH and root or sudo. VMware Guest Operations cannot bootstrap a first Tools installation because that API itself depends on a running Tools agent.
+The guest must be directly reachable from the vFleet host or reachable through the configured SSH jump host. Windows requires WinRM and an administrator credential; Linux requires SSH and root or sudo; pfSense requires root SSH. VMware Guest Operations cannot bootstrap a first Tools installation because that API itself depends on a running Tools agent.
+
+## Storage reconciliation
+
+Use **Machines → Reconcile storage** for one or more selected VMs, or **Datastores → Reconcile inventory** for an endpoint-wide review. The scan compares live disk attachments with successful conversion results and first-level datastore folders.
+
+- Preserved source disks from vFleet conversions are high-confidence candidates only when the replacement disk remains attached.
+- VMware Tools plus a recorded post-conversion boot provides automated validation. Without Tools, power on the VM and manually validate guest operation before acknowledging cleanup.
+- Unattached VMDKs and directories containing VM files but no current attachment are review-only candidates. They may represent an intentionally unregistered VM, backup, or recovery copy.
+- Cleanup rebuilds the plan server-side, refuses stale inventory or changed datastore state, and queues each explicitly confirmed item as an independent endpoint-bound delete job.
 
 ## Honest limits
 
@@ -82,6 +100,8 @@ The connection card in the left rail opens a searchable drawer of saved vCenter 
 - **Test** detects and reports the endpoint without saving credentials or switching away from the current session.
 - **Connect & save** tests first, stores non-secret profile metadata in `data/connections.json`, encrypts passwords in `data/credentials.enc.json`, and switches to live inventory.
 - Profile API responses never include passwords. A blank password while editing reuses the retained secret only when the saved endpoint, user, and port still match.
+- **Network access** on Add/Edit connection assigns an optional jump-host address, host type, Automation Vault credential, and pinned host key to that profile. **Auto detect** probes the authenticated SSH shell without changing the host; an explicit Windows OpenSSH/PowerShell or Linux/Unix choice is available for restricted shells. **Test jump host & pin key** verifies authentication and host identity before the association can be saved.
+- A referenced jump credential cannot be deleted until it is removed from the connection profile. Connection profiles store only its credential ID; the secret stays in the encrypted Automation Vault.
 - Switching is refused while queued or running work is bound to the current endpoint.
 - **Stay in demo** closes the dialog. **Disconnect** / **Forget saved credentials** are in the rail after you connect.
 
@@ -118,12 +138,19 @@ scripts/vfleet inventory --kind vms
 scripts/vfleet host
 scripts/vfleet disk-plan VM_ID --target thin
 scripts/vfleet disk-convert VM_ID --target thin --yes
+scripts/vfleet hardware-plan VM_ID_A VM_ID_B --cpu 4 --memory-gib 8
+scripts/vfleet hardware-config VM_ID_A VM_ID_B --disk 1 --disk-gib 120 --iso-datastore DATASTORE_ID --iso-path isos/rhel9.iso --yes
+scripts/vfleet hardware-config VM_ID_A VM_ID_B --cpu 2 --shutdown-before --force-power-off --power-on-after --yes
 scripts/vfleet credentials
 scripts/vfleet credential-add "Linux admins" --kind ssh --user operator
+scripts/vfleet connect vcenter.example.com --user administrator@vsphere.local --jump-address access.example.com --jump-host-type auto --jump-credential-id JUMP_CREDENTIAL_ID
 scripts/vfleet tools-deploy CREDENTIAL_ID VM_ID=10.20.1.8 --yes
+scripts/vfleet tools-deploy PFSENSE_CREDENTIAL_ID VM_ID=10.0.0.1 --os pfsense --jump-address 192.168.1.60 --jump-host-type windows --jump-credential-id JUMP_CREDENTIAL_ID --yes
 scripts/vfleet jobs
 scripts/vfleet job JOB_ID --wait
 ```
+
+`tools-deploy` inherits the active connection profile's jump host by default. Pass `--no-jump` to use direct guest SSH for one invocation, or pass explicit `--jump-*` options to override the profile.
 
 Host lifecycle, service, NTP, storage-rescan, and support-bundle commands are listed by `scripts/vfleet --help`. Mutating commands require an interactive `yes` or `--yes`. Override the local endpoint with `VFLEET_API_URL`; use `VFLEET_UI_TOKEN` when the API is protected.
 

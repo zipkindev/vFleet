@@ -60,11 +60,19 @@ from .models import (
     RenameVmRequest,
     StagingCreateRequest,
     StagingSession,
+    StorageCleanupRequest,
+    StorageCleanupResponse,
+    StorageReconciliationReport,
+    StorageReconciliationRequest,
+    SshConnectionTestRequest,
     SshHostKeyInfo,
     ToolsDeploymentRequest,
     ToolsDeploymentResponse,
     UploadRequest,
     VmFolder,
+    VmHardwarePlan,
+    VmHardwarePlanRequest,
+    VmHardwareRequest,
 )
 from .reclaim import build_owner_reports
 from .grouping import vm_matches_owner_query, vm_matches_search
@@ -83,7 +91,9 @@ from .session import (
 from .store import LocalStore
 from .profiles import ConnectionProfile, ConnectionProfileStore
 from .vm_storage import normalize_disk_transform
+from .storage_reconciliation import build_storage_reconciliation
 from .errors import PermanentError
+from .vm_hardware import build_vm_hardware_plan, validate_hardware_request
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "mount_tools", "destroy"}
@@ -113,6 +123,28 @@ def _automation_summary(credential: AutomationCredential, store: AutomationCrede
         created_at=datetime.fromisoformat(credential.created_at),
         updated_at=datetime.fromisoformat(credential.updated_at),
     )
+
+
+def _automation_credential_for_fingerprint(
+    request: Request,
+    credential_id: str,
+    endpoint_fingerprint: str,
+    *,
+    kinds: set[str],
+    detail: str,
+) -> tuple[AutomationCredential, str]:
+    store: AutomationCredentialStore = request.app.state.automation_credentials
+    credential = store.get(credential_id.strip())
+    if credential is None or (
+        credential.scope == "endpoint" and credential.endpoint_fingerprint != endpoint_fingerprint
+    ):
+        raise HTTPException(status_code=400, detail=detail)
+    if credential.kind not in kinds:
+        raise HTTPException(status_code=400, detail="The jump host requires an SSH or service credential")
+    secret = store.secret(credential.id)
+    if not secret:
+        raise HTTPException(status_code=400, detail="The selected jump-host credential has no stored secret")
+    return credential, secret
 
 
 def require_token(x_ui_token: Optional[str] = Header(default=None, alias="X-UI-Token")) -> None:
@@ -295,6 +327,31 @@ async def lifespan(app: FastAPI):
         elif active_profile_id:
             profile_store.set_active("")
             active_profile_id = ""
+    active_profile = profile_store.get(active_profile_id) if active_profile_id else None
+    if active_profile is not None and active_profile.jump_enabled:
+        credential = automation_store.get(active_profile.jump_credential_id)
+        credential_allowed = bool(
+            credential
+            and credential.kind in {"ssh", "service"}
+            and (
+                credential.scope == "global"
+                or credential.endpoint_fingerprint == active_profile.endpoint_fingerprint
+            )
+        )
+        settings.access_jump_enabled = True
+        settings.access_jump_address = active_profile.jump_address
+        settings.access_jump_port = active_profile.jump_port
+        settings.access_jump_host_type = active_profile.jump_host_type
+        settings.access_jump_user = credential.username if credential_allowed and credential else ""
+        settings.access_jump_password = automation_store.secret(credential.id) if credential_allowed and credential else ""
+        settings.access_jump_host_key_sha256 = active_profile.jump_host_key_sha256
+    else:
+        settings.access_jump_enabled = False
+        settings.access_jump_address = ""
+        settings.access_jump_host_type = "auto"
+        settings.access_jump_user = ""
+        settings.access_jump_password = ""
+        settings.access_jump_host_key_sha256 = ""
     adapter = build_adapter(settings)
     app.state.store = store
     app.state.profile_store = profile_store
@@ -315,7 +372,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -400,13 +457,23 @@ def connection_profiles(request: Request) -> ConnectionProfileList:
     response_model=AutomationCredentialList,
     dependencies=[Depends(require_token)],
 )
-def automation_credentials(request: Request) -> AutomationCredentialList:
+def automation_credentials(
+    request: Request,
+    profile_id: str = Query(default=""),
+    global_only: bool = Query(default=False),
+) -> AutomationCredentialList:
     credential_store: AutomationCredentialStore = request.app.state.automation_credentials
     fingerprint = _current_endpoint_fingerprint(request)
+    if profile_id.strip():
+        profile = request.app.state.profile_store.get(profile_id.strip())
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Unknown connection profile")
+        fingerprint = profile.endpoint_fingerprint
     visible = [
         credential
         for credential in credential_store.list()
-        if credential.scope == "global" or credential.endpoint_fingerprint == fingerprint
+        if credential.scope == "global"
+        or (not global_only and credential.endpoint_fingerprint == fingerprint)
     ]
     visible.sort(key=lambda item: (item.kind, item.name.lower(), item.username.lower()))
     return AutomationCredentialList(
@@ -461,27 +528,111 @@ def delete_automation_credential(
     fingerprint = _current_endpoint_fingerprint(request)
     if credential is None or (credential.scope == "endpoint" and credential.endpoint_fingerprint != fingerprint):
         raise HTTPException(status_code=404, detail="Unknown credential")
-    in_use = [job for job in request.app.state.store.open_jobs() if job.payload.get("credential_id") == credential_id]
+    in_use = [
+        job
+        for job in request.app.state.store.open_jobs()
+        if credential_id in {job.payload.get("credential_id"), job.payload.get("jump_credential_id")}
+    ]
     if in_use:
         raise HTTPException(status_code=409, detail="This credential is referenced by queued or running jobs")
+    profile_refs = [
+        profile for profile in request.app.state.profile_store.list()
+        if profile.jump_enabled and profile.jump_credential_id == credential_id
+    ]
+    if profile_refs:
+        raise HTTPException(status_code=409, detail="This credential is assigned to a saved connection profile")
     credential_store.delete(credential_id)
     return {"deleted": True, "credential_id": credential_id}
 
 
 @app.get("/api/tools/ssh-host-key", response_model=SshHostKeyInfo, dependencies=[Depends(require_token)])
-def tools_ssh_host_key(address: str = Query(...), port: int = Query(default=22, ge=1, le=65535)) -> SshHostKeyInfo:
+def tools_ssh_host_key(
+    request: Request,
+    address: str = Query(...),
+    port: int = Query(default=22, ge=1, le=65535),
+    jump_address: str = Query(default=""),
+    jump_port: int = Query(default=22, ge=1, le=65535),
+    jump_credential_id: str = Query(default=""),
+    jump_host_key_sha256: str = Query(default=""),
+) -> SshHostKeyInfo:
     target = address.strip()
     if not target:
         raise HTTPException(status_code=400, detail="Address is required")
+    jump = None
+    jump_target = jump_address.strip()
+    if jump_target:
+        if any(character.isspace() for character in jump_target):
+            raise HTTPException(status_code=400, detail="Enter a valid SSH jump-host address")
+        if not jump_host_key_sha256.startswith("SHA256:"):
+            raise HTTPException(status_code=400, detail="Review and accept the SSH jump-host key first")
+        fingerprint = _current_endpoint_fingerprint(request)
+        credential, secret = _automation_credential_for_fingerprint(
+            request,
+            jump_credential_id,
+            fingerprint,
+            kinds={"ssh", "service"},
+            detail="Select an available SSH jump-host credential",
+        )
+        jump = {
+            "address": jump_target,
+            "port": jump_port,
+            "username": credential.username,
+            "password": secret,
+            "host_key_sha256": jump_host_key_sha256,
+        }
     from .guest_tools import ssh_host_key_sha256
 
     try:
-        fingerprint = ssh_host_key_sha256(target, port)
+        fingerprint = ssh_host_key_sha256(target, port, jump=jump)
     except PermanentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return SshHostKeyInfo(address=target, port=port, fingerprint=fingerprint)
+
+
+@app.post("/api/tools/ssh-connection-test", dependencies=[Depends(require_token)])
+def tools_ssh_connection_test(body: SshConnectionTestRequest, request: Request) -> dict:
+    target = body.address.strip()
+    if not target or any(character.isspace() for character in target):
+        raise HTTPException(status_code=400, detail="Enter a valid SSH jump-host address")
+    if not body.host_key_sha256.startswith("SHA256:"):
+        raise HTTPException(status_code=400, detail="Review and accept the SSH jump-host key first")
+    fingerprint = _current_endpoint_fingerprint(request)
+    if body.profile_id.strip():
+        profile = request.app.state.profile_store.get(body.profile_id.strip())
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Unknown connection profile")
+        fingerprint = profile.endpoint_fingerprint
+    credential, secret = _automation_credential_for_fingerprint(
+        request,
+        body.credential_id,
+        fingerprint,
+        kinds={"ssh", "service"},
+        detail="Select an available SSH jump-host credential",
+    )
+    from .guest_tools import ssh_connection_test
+
+    try:
+        detected_host_type = ssh_connection_test(
+            target,
+            credential.username,
+            secret,
+            port=body.port,
+            host_key_sha256=body.host_key_sha256,
+            host_type=body.host_type,
+        )
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "address": target,
+        "port": body.port,
+        "host_type": body.host_type,
+        "detected_host_type": detected_host_type,
+    }
 
 
 @app.post(
@@ -508,6 +659,12 @@ def connect_profile(profile_id: str, request: Request) -> ConnectionInfo:
             ssh_password=profile.ssh_password,
             ssh_port=profile.ssh_port,
             ssh_host_key_sha256=profile.ssh_host_key_sha256,
+            jump_enabled=profile.jump_enabled,
+            jump_address=profile.jump_address,
+            jump_port=profile.jump_port,
+            jump_host_type=profile.jump_host_type,
+            jump_credential_id=profile.jump_credential_id,
+            jump_host_key_sha256=profile.jump_host_key_sha256,
             profile_id=profile.id,
             profile_name=profile.name,
         ),
@@ -550,6 +707,16 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     password = resolve_login_password(password, endpoint, user, port, settings)
     if not password:
         raise HTTPException(status_code=400, detail="Host, username, and password are required")
+    jump_address = body.jump_address.strip() if body.jump_enabled else ""
+    jump_credential_id = body.jump_credential_id.strip() if body.jump_enabled else ""
+    jump_host_key_sha256 = body.jump_host_key_sha256.strip() if body.jump_enabled else ""
+    if body.jump_enabled:
+        if not jump_address or any(character.isspace() for character in jump_address):
+            raise HTTPException(status_code=400, detail="Enter a valid SSH jump-host address")
+        if not jump_credential_id:
+            raise HTTPException(status_code=400, detail="Select a stored SSH jump-host credential")
+        if not jump_host_key_sha256.startswith("SHA256:"):
+            raise HTTPException(status_code=400, detail="Test and pin the SSH jump-host key first")
     ssh_user = body.ssh_user.strip()
     saved_ssh_password = ""
     if (
@@ -588,6 +755,28 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         lowered = detail.lower()
         status = 401 if ("password" in lowered or "cannot complete login" in lowered or "incorrect user" in lowered) else 503
         raise HTTPException(status_code=status, detail=detail)
+
+    jump_credential = None
+    jump_secret = ""
+    if body.jump_enabled:
+        try:
+            jump_credential, jump_secret = _automation_credential_for_fingerprint(
+                request,
+                jump_credential_id,
+                info.endpoint_fingerprint,
+                kinds={"ssh", "service"},
+                detail="The selected jump-host credential is not available to this endpoint",
+            )
+        except HTTPException:
+            _close(candidate)
+            raise
+        live.access_jump_enabled = True
+        live.access_jump_address = jump_address
+        live.access_jump_port = body.jump_port
+        live.access_jump_host_type = body.jump_host_type
+        live.access_jump_user = jump_credential.username
+        live.access_jump_password = jump_secret
+        live.access_jump_host_key_sha256 = jump_host_key_sha256
 
     if not body.connect:
         _close(candidate)
@@ -641,6 +830,13 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
     settings.esxi_ssh_password = ssh_password
     settings.esxi_ssh_port = body.ssh_port
     settings.esxi_ssh_host_key_sha256 = body.ssh_host_key_sha256
+    settings.access_jump_enabled = body.jump_enabled
+    settings.access_jump_address = jump_address
+    settings.access_jump_port = body.jump_port
+    settings.access_jump_host_type = body.jump_host_type if body.jump_enabled else "auto"
+    settings.access_jump_user = jump_credential.username if jump_credential is not None else ""
+    settings.access_jump_password = jump_secret
+    settings.access_jump_host_key_sha256 = jump_host_key_sha256
     if body.remember:
         profile_id = saved_profile.id if saved_profile is not None else ""
         if not profile_id:
@@ -661,6 +857,12 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
             ssh_password=ssh_password,
             ssh_port=body.ssh_port,
             ssh_host_key_sha256=body.ssh_host_key_sha256,
+            jump_enabled=body.jump_enabled,
+            jump_address=jump_address,
+            jump_port=body.jump_port,
+            jump_host_type=body.jump_host_type,
+            jump_credential_id=jump_credential_id,
+            jump_host_key_sha256=jump_host_key_sha256,
             last_used_at=datetime.now(timezone.utc).isoformat(),
         )
         profile_store.save(profile)
@@ -852,13 +1054,110 @@ def actions(body: ActionRequest, request: Request) -> ActionResponse:
     )
 
 
-def _guest_os_family(value: str) -> str:
+def _guest_os_family(value: str, name: str = "") -> str:
     label = value.lower()
+    vm_name = name.lower()
     if "windows" in label or label.startswith("win"):
         return "windows"
+    if "pfsense" in label or "pfsense" in vm_name or (
+        "freebsd" in label and any(token in vm_name for token in ("router", "firewall"))
+    ):
+        return "pfsense"
     if any(token in label for token in ("linux", "ubuntu", "debian", "rhel", "red hat", "centos", "suse", "oracle", "photon", "fedora")):
         return "linux"
     return ""
+
+
+@app.post("/api/tools/preflight", dependencies=[Depends(require_token)])
+def preflight_guest_tools(body: ToolsDeploymentRequest, request: Request) -> dict:
+    if len(body.targets) != 1:
+        raise HTTPException(status_code=400, detail="Dry-run preflight requires exactly one virtual machine")
+    target = body.targets[0]
+    snapshot = request.app.state.worker.cached_snapshot()
+    vm = next((item for item in snapshot.vms if item.id == target.vm_id.strip()), None) if snapshot else None
+    if vm is None:
+        raise HTTPException(status_code=400, detail="Unknown VM")
+    if normalize_power_state(vm.power_state) != "POWERED_ON":
+        raise HTTPException(status_code=400, detail=f"{vm.name}: power on the guest before preflight")
+    address = target.address.strip()
+    if not address or any(character.isspace() for character in address):
+        raise HTTPException(status_code=400, detail=f"{vm.name}: enter a valid guest IP address or DNS name")
+    family = target.os_family if target.os_family != "auto" else _guest_os_family(vm.guest_os, vm.name)
+    if family not in {"windows", "linux", "pfsense"}:
+        raise HTTPException(status_code=400, detail=f"{vm.name}: choose Windows, Linux, or pfSense")
+
+    credential_store: AutomationCredentialStore = request.app.state.automation_credentials
+    fingerprint = _current_endpoint_fingerprint(request)
+    credential = credential_store.get(body.credential_id.strip())
+    expected_kind = "windows" if family == "windows" else "ssh"
+    if credential is None or (
+        credential.scope == "endpoint" and credential.endpoint_fingerprint != fingerprint
+    ) or credential.kind not in {expected_kind, "service"}:
+        raise HTTPException(status_code=400, detail=f"Select an available credential for the {family} guest")
+    secret = credential_store.secret(credential.id)
+    if not secret:
+        raise HTTPException(status_code=400, detail="The selected credential has no stored secret")
+    if family == "pfsense" and credential.username != "root":
+        raise HTTPException(status_code=400, detail="pfSense package deployment requires a root SSH credential")
+
+    jump = None
+    jump_address = body.jump_address.strip()
+    if jump_address:
+        if any(character.isspace() for character in jump_address):
+            raise HTTPException(status_code=400, detail="Enter a valid SSH jump-host address")
+        if not body.jump_host_key_sha256.startswith("SHA256:"):
+            raise HTTPException(status_code=400, detail="Review and accept the SSH jump-host key")
+        jump_credential, jump_secret = _automation_credential_for_fingerprint(
+            request,
+            body.jump_credential_id,
+            fingerprint,
+            kinds={"ssh", "service"},
+            detail="Select an available SSH jump-host credential",
+        )
+        jump = {
+            "address": jump_address,
+            "port": body.jump_port,
+            "username": jump_credential.username,
+            "password": jump_secret,
+            "host_key_sha256": body.jump_host_key_sha256,
+        }
+
+    from . import guest_tools
+
+    try:
+        if family == "windows":
+            details = guest_tools.windows_preflight(
+                address,
+                credential.username,
+                secret,
+                transport=body.windows_transport,
+                port=body.windows_port,
+                validate_certificate=body.validate_certificate,
+            )
+        elif family == "pfsense":
+            details = guest_tools.pfsense_preflight(
+                address,
+                credential.username,
+                secret,
+                port=body.linux_port,
+                host_key_sha256=target.ssh_host_key_sha256,
+                jump=jump,
+            )
+        else:
+            details = guest_tools.linux_preflight(
+                address,
+                credential.username,
+                secret,
+                port=body.linux_port,
+                host_key_sha256=target.ssh_host_key_sha256,
+                sudo=body.sudo,
+                jump=jump,
+            )
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "vm_id": vm.id, "vm_name": vm.name, "os_family": family, "details": details}
 
 
 @app.post("/api/tools/deploy", response_model=ToolsDeploymentResponse, dependencies=[Depends(require_token)])
@@ -876,6 +1175,22 @@ def deploy_guest_tools(body: ToolsDeploymentRequest, request: Request) -> ToolsD
         raise HTTPException(status_code=400, detail="Select an available Automation Vault credential")
     if not credential_store.secret(credential.id):
         raise HTTPException(status_code=400, detail="The selected credential has no stored secret")
+    jump_address = body.jump_address.strip()
+    jump_credential = None
+    if jump_address:
+        if any(character.isspace() for character in jump_address):
+            raise HTTPException(status_code=400, detail="Enter a valid SSH jump-host address")
+        if not body.jump_host_key_sha256.startswith("SHA256:"):
+            raise HTTPException(status_code=400, detail="Review and accept the SSH jump-host key")
+        jump_credential = credential_store.get(body.jump_credential_id.strip())
+        if jump_credential is None or (
+            jump_credential.scope == "endpoint" and jump_credential.endpoint_fingerprint != fingerprint
+        ):
+            raise HTTPException(status_code=400, detail="Select an available SSH jump-host credential")
+        if jump_credential.kind not in {"ssh", "service"}:
+            raise HTTPException(status_code=400, detail="The jump host requires an SSH or service credential")
+        if not credential_store.secret(jump_credential.id):
+            raise HTTPException(status_code=400, detail="The selected jump-host credential has no stored secret")
     snapshot = request.app.state.worker.cached_snapshot()
     if snapshot is None:
         raise HTTPException(status_code=503, detail="Inventory is not ready yet")
@@ -897,16 +1212,19 @@ def deploy_guest_tools(body: ToolsDeploymentRequest, request: Request) -> ToolsD
         if normalize_power_state(vm.power_state) != "POWERED_ON":
             failures.append(f"{vm.name}: power on the guest before deploying Tools")
             continue
-        family = target.os_family if target.os_family != "auto" else _guest_os_family(vm.guest_os)
-        if family not in {"windows", "linux"}:
-            failures.append(f"{vm.name}: choose Windows or Linux because the guest OS could not be identified")
+        family = target.os_family if target.os_family != "auto" else _guest_os_family(vm.guest_os, vm.name)
+        if family not in {"windows", "linux", "pfsense"}:
+            failures.append(f"{vm.name}: choose Windows, Linux, or pfSense because the guest OS could not be identified")
             continue
         expected_kind = "windows" if family == "windows" else "ssh"
         if credential.kind not in {expected_kind, "service"}:
             failures.append(f"{vm.name}: the selected {credential.kind} credential cannot manage a {family} guest")
             continue
+        if family == "pfsense" and credential.username != "root":
+            failures.append(f"{vm.name}: pfSense package deployment requires a root SSH credential")
+            continue
         host_key = target.ssh_host_key_sha256.strip()
-        if family == "linux" and not host_key.startswith("SHA256:"):
+        if family in {"linux", "pfsense"} and not host_key.startswith("SHA256:"):
             failures.append(f"{vm.name}: review and accept its SSH host-key fingerprint")
             continue
         payload = {
@@ -921,6 +1239,11 @@ def deploy_guest_tools(body: ToolsDeploymentRequest, request: Request) -> ToolsD
             "linux_port": body.linux_port,
             "sudo": body.sudo,
             "ssh_host_key_sha256": host_key,
+            "jump_address": jump_address,
+            "jump_port": body.jump_port,
+            "jump_host_type": body.jump_host_type,
+            "jump_credential_id": jump_credential.id if jump_credential else "",
+            "jump_host_key_sha256": body.jump_host_key_sha256 if jump_credential else "",
         }
         jobs.append(
             _enqueue(
@@ -989,6 +1312,67 @@ def vm_console(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _hardware_plan(body: VmHardwarePlanRequest, request: Request) -> VmHardwarePlan:
+    snapshot = request.app.state.worker.cached_snapshot()
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="Inventory is not ready yet")
+    try:
+        clean = validate_hardware_request(body)
+        iso_file_exists = None
+        if clean.iso_action == "mount":
+            try:
+                iso_file_exists = request.app.state.adapter.stat_file(clean.iso_datastore_id, clean.iso_path) is not None
+            except Exception:
+                # An offline plan may use cached inventory. The live reconfigure task
+                # still fails closed if vSphere cannot resolve the backing path.
+                iso_file_exists = None
+        return build_vm_hardware_plan(
+            snapshot,
+            request.app.state.store.load_catalog(),
+            clean,
+            iso_file_exists=iso_file_exists,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/vms/hardware/plan",
+    response_model=VmHardwarePlan,
+    dependencies=[Depends(require_token)],
+)
+def plan_vm_hardware(body: VmHardwarePlanRequest, request: Request) -> VmHardwarePlan:
+    return _hardware_plan(body, request)
+
+
+@app.post("/api/vms/hardware", response_model=Job, dependencies=[Depends(require_token)])
+def reconfigure_vm_hardware(body: VmHardwareRequest, request: Request) -> Job:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Review the hardware plan and set confirm=true")
+    try:
+        clean = validate_hardware_request(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    plan = _hardware_plan(clean, request)
+    if plan.plan_token != body.plan_token:
+        raise HTTPException(status_code=409, detail="VM hardware or placement changed; review a fresh hardware plan")
+    eligible_targets = [row for row in plan.targets if row.can_execute]
+    eligible = [row.vm_id for row in eligible_targets]
+    if not eligible:
+        raise HTTPException(status_code=400, detail="No selected VMs have an eligible hardware change")
+    payload = clean.model_dump()
+    payload["vm_ids"] = eligible
+    payload["confirm"] = True
+    title = f"Configure hardware for {eligible_targets[0].name}" if len(eligible) == 1 else f"Configure hardware for {len(eligible)} VM(s)"
+    return _enqueue(
+        request,
+        "vm_hardware",
+        title,
+        payload,
+        idempotency_key=f"vm_hardware:{plan.plan_token}:" + ",".join(sorted(eligible)),
+    )
 
 
 @app.post("/api/vms/{vm_id}/rename", response_model=Job, dependencies=[Depends(require_token)])
@@ -1138,9 +1522,93 @@ def convert_vm_disks(body: DiskConversionRequest, request: Request) -> Job:
         request,
         "disk_convert",
         f"Convert {plan.vm_name} disks to {plan.target.replace('_', ' ')}",
-        {"plan": plan.model_dump(mode="json")},
+        {"plan": plan.model_dump(mode="json"), "reconcile_after": body.reconcile_after},
         idempotency_key=f"disk_convert:{plan.plan_token}",
     )
+
+
+@app.post(
+    "/api/storage/reconciliation",
+    response_model=StorageReconciliationReport,
+    dependencies=[Depends(require_token)],
+)
+def storage_reconciliation_plan(
+    body: StorageReconciliationRequest,
+    request: Request,
+) -> StorageReconciliationReport:
+    try:
+        return build_storage_reconciliation(
+            request.app.state.adapter,
+            request.app.state.store,
+            vm_ids=body.vm_ids,
+            include_unregistered_directories=body.include_unregistered_directories,
+        )
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/storage/reconciliation/cleanup",
+    response_model=StorageCleanupResponse,
+    dependencies=[Depends(require_token)],
+)
+def storage_reconciliation_cleanup(body: StorageCleanupRequest, request: Request) -> StorageCleanupResponse:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Review the reconciliation plan and set confirm=true")
+    if not body.candidate_ids:
+        raise HTTPException(status_code=400, detail="Select at least one reconciliation candidate")
+    try:
+        report = build_storage_reconciliation(
+            request.app.state.adapter,
+            request.app.state.store,
+            vm_ids=body.vm_ids,
+            include_unregistered_directories=body.include_unregistered_directories,
+        )
+    except PermanentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if report.plan_token != body.plan_token:
+        raise HTTPException(status_code=409, detail="Inventory or datastore contents changed; review a fresh reconciliation plan")
+    if report.inventory_stale:
+        raise HTTPException(status_code=409, detail="Inventory is stale; reconnect and refresh before cleanup")
+
+    by_id = {candidate.id: candidate for candidate in report.candidates}
+    manual = set(body.manual_validated_candidate_ids)
+    jobs: List[Job] = []
+    failures: List[str] = []
+    for candidate_id in dict.fromkeys(body.candidate_ids):
+        candidate = by_id.get(candidate_id)
+        if candidate is None:
+            failures.append(f"Candidate {candidate_id[:8]} is no longer present")
+            continue
+        manually_validated = candidate.id in manual
+        if candidate.validation_status == "blocked":
+            failures.append(f"{candidate.datastore_name}/{candidate.path}: {candidate.warning or 'validation is blocked'}")
+            continue
+        if not candidate.can_delete and not manually_validated:
+            failures.append(
+                f"{candidate.datastore_name}/{candidate.path}: acknowledge manual post-boot/storage validation first"
+            )
+            continue
+        jobs.append(
+            _enqueue(
+                request,
+                "delete_file",
+                f"Reconcile remove {candidate.datastore_name}/{candidate.path}",
+                {
+                    "datastore_id": candidate.datastore_id,
+                    "path": candidate.path,
+                    "reconciliation_candidate_id": candidate.id,
+                    "reconciliation_kind": candidate.kind,
+                    "manual_validated": manually_validated,
+                },
+                idempotency_key=f"storage_reconcile_delete:{candidate.id}:{report.plan_token}",
+            )
+        )
+    return StorageCleanupResponse(jobs=jobs, failures=failures)
 
 
 @app.get("/api/host", response_model=HostManagementInfo, dependencies=[Depends(require_token)])

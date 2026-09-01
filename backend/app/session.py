@@ -184,6 +184,12 @@ def forget_vcenter(settings: Settings) -> None:
     settings.esxi_ssh_user = ""
     settings.esxi_ssh_password = ""
     settings.esxi_ssh_host_key_sha256 = ""
+    settings.access_jump_enabled = False
+    settings.access_jump_address = ""
+    settings.access_jump_host_type = "auto"
+    settings.access_jump_user = ""
+    settings.access_jump_password = ""
+    settings.access_jump_host_key_sha256 = ""
 
 
 def apply_runtime(
@@ -213,5 +219,12 @@ def apply_runtime(
             "esxi_ssh_password": ssh_password,
             "esxi_ssh_port": ssh_port,
             "esxi_ssh_host_key_sha256": ssh_host_key_sha256,
+            "access_jump_enabled": False,
+            "access_jump_address": "",
+            "access_jump_port": 22,
+            "access_jump_host_type": "auto",
+            "access_jump_user": "",
+            "access_jump_password": "",
+            "access_jump_host_key_sha256": "",
         }
     )

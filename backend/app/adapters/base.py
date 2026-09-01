@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..models import (
@@ -18,6 +19,7 @@ from ..models import (
     InventorySnapshot,
     MigrateVmRequest,
     NetworkSummary,
+    VmHardwareRequest,
     VmFolder,
     VmTemplate,
 )
@@ -82,6 +84,31 @@ class InventoryAdapter(ABC):
 
     def start_migrate(self, spec: MigrateVmRequest) -> str:
         raise NotImplementedError(f"{type(self).__name__} cannot migrate VMs")
+
+    def start_vm_reconfigure(self, vm_id: str, spec: VmHardwareRequest) -> str:
+        raise NotImplementedError(f"{type(self).__name__} cannot reconfigure VM hardware")
+
+    def vm_power_state(self, vm_id: str) -> str:
+        raise NotImplementedError(f"{type(self).__name__} cannot inspect VM power state")
+
+    def request_guest_shutdown(self, vm_id: str) -> None:
+        raise NotImplementedError(f"{type(self).__name__} cannot request guest shutdown")
+
+    def start_vm_power(self, vm_id: str, *, power_on: bool) -> str:
+        raise NotImplementedError(f"{type(self).__name__} cannot change VM power state")
+
+    def wait_vm_power_state(self, vm_id: str, target_state: str, timeout_seconds: int) -> bool:
+        from ..power import normalize_power_state
+
+        expected = normalize_power_state(target_state)
+        deadline = time.monotonic() + max(0, timeout_seconds)
+        while True:
+            if normalize_power_state(self.vm_power_state(vm_id)) == expected:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(2.0, remaining))
 
     def start_move_into_folder(self, vm_id: str, folder_id: str) -> str:
         raise NotImplementedError(f"{type(self).__name__} cannot move VMs into folders")

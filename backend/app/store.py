@@ -411,6 +411,8 @@ class LocalStore:
         if job.kind in {"migrate", "disk_convert"}:
             progress["task_id"] = ""
             progress["phase"] = "start" if job.kind == "migrate" else ""
+        elif job.kind == "vm_hardware":
+            progress = {}
         now = _now()
         with self._lock:
             self._conn.execute(

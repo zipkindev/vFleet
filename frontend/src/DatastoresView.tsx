@@ -10,6 +10,7 @@ type Props = {
   onQueued: (job: Job, message: string) => void;
   onNotice?: (message: string) => void;
   onNewVmFromTemplate?: (templateId: string) => void;
+  onReconcile?: () => void;
 };
 
 const CHUNK = 4 * 1024 * 1024;
@@ -20,6 +21,7 @@ export const DatastoresView = React.memo(function DatastoresView({
   onQueued,
   onNotice,
   onNewVmFromTemplate,
+  onReconcile,
 }: Props) {
   const datastores = catalog?.datastores ?? [];
   const templates = catalog?.templates ?? [];
@@ -144,7 +146,11 @@ export const DatastoresView = React.memo(function DatastoresView({
       ) : null}
       <div className="panel">
         <header>
-          <h2>Datastores</h2>
+          <div>
+            <h2>Datastores</h2>
+            <p>Run a guarded reconciliation to find preserved conversion sources, unattached disks, and unregistered VM folders.</p>
+          </div>
+          <button className="ghost compact" onClick={onReconcile}>Reconcile inventory</button>
         </header>
         <table>
           <thead>
