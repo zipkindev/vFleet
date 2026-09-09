@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import select
 import shlex
 import socket
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional
+from typing import Dict, Iterator, Literal, Optional
 
 from .errors import PermanentError, TransientError
 
@@ -16,19 +19,32 @@ WINDOWS_PREFLIGHT = r"""
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$network = @(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled } | ForEach-Object {
+  [ordered]@{
+    description = $_.Description
+    mac_address = $_.MACAddress
+    ip_addresses = @($_.IPAddress)
+  }
+})
 [ordered]@{
   computer = $env:COMPUTERNAME
   os = (Get-CimInstance Win32_OperatingSystem).Caption
   architecture = $env:PROCESSOR_ARCHITECTURE
   administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-} | ConvertTo-Json -Compress
+  network = $network
+} | ConvertTo-Json -Compress -Depth 5
 """.strip()
 
 WINDOWS_INSTALL = r"""
 $ErrorActionPreference = 'Stop'
-$cd = Get-CimInstance Win32_LogicalDisk | Where-Object DriveType -eq 5 | Where-Object {
-  Test-Path (Join-Path $_.DeviceID 'setup64.exe')
-} | Select-Object -First 1
+$deadline = (Get-Date).AddSeconds(90)
+$cd = $null
+do {
+  $cd = Get-CimInstance Win32_LogicalDisk | Where-Object DriveType -eq 5 | Where-Object {
+    Test-Path (Join-Path $_.DeviceID 'setup64.exe')
+  } | Select-Object -First 1
+  if (-not $cd) { Start-Sleep -Seconds 3 }
+} while (-not $cd -and (Get-Date) -lt $deadline)
 if (-not $cd) { throw 'The VMware Tools setup64.exe was not found on any CD-ROM drive' }
 $setup = Join-Path $cd.DeviceID 'setup64.exe'
 $process = Start-Process -FilePath $setup -ArgumentList '/S','/v"/qn REBOOT=R"' -Wait -PassThru
@@ -61,31 +77,47 @@ def run_windows_ps(
     port: int,
     validate_certificate: bool,
     timeout_seconds: int = 90,
+    jump: Optional[Dict[str, object]] = None,
 ) -> RemoteResult:
     try:
         import winrm
     except ImportError as exc:
         raise PermanentError("Windows automation support is not installed; install backend requirements") from exc
     scheme = "https" if transport == "https" else "http"
-    endpoint = f"{scheme}://{address}:{port}/wsman"
     try:
-        session = winrm.Session(
-            endpoint,
-            auth=(username, password),
-            transport="ntlm",
-            server_cert_validation="validate" if validate_certificate else "ignore",
-            message_encryption="always",
-            read_timeout_sec=timeout_seconds,
-            operation_timeout_sec=max(5, timeout_seconds - 5),
-        )
-        response = session.run_ps(script)
+        if jump and transport == "https" and validate_certificate:
+            raise PermanentError(
+                "WinRM HTTPS certificate validation cannot be preserved through a loopback SSH tunnel; "
+                "use HTTP with encrypted NTLM messages or disable certificate validation explicitly"
+            )
+        endpoint_context = _jump_tcp_forward(address, port, jump, timeout_seconds) if jump else _direct_endpoint(address, port)
+        with endpoint_context as (connect_address, connect_port):
+            endpoint = f"{scheme}://{connect_address}:{connect_port}/wsman"
+            session = winrm.Session(
+                endpoint,
+                auth=(username, password),
+                transport="ntlm",
+                server_cert_validation="validate" if validate_certificate else "ignore",
+                message_encryption="always",
+                read_timeout_sec=timeout_seconds,
+                operation_timeout_sec=max(5, timeout_seconds - 5),
+            )
+            response = session.run_ps(script)
+    except PermanentError:
+        raise
     except (socket.timeout, OSError) as exc:
-        raise TransientError(f"WinRM could not reach {address}:{port}: {exc}") from exc
+        route = " through the SSH jump host" if jump else ""
+        raise TransientError(f"WinRM could not reach {address}:{port}{route}: {exc}") from exc
     except Exception as exc:
         message = str(exc).replace(password, "[redacted]")
+        if jump:
+            jump_password = str(jump.get("password") or "")
+            if jump_password:
+                message = message.replace(jump_password, "[redacted]")
         lowered = message.lower()
         if any(token in lowered for token in ("timed out", "connection", "temporarily", "reset by peer")):
-            raise TransientError(f"WinRM connection failed for {address}:{port}: {message}") from exc
+            route = " through the SSH jump host" if jump else ""
+            raise TransientError(f"WinRM connection failed for {address}:{port}{route}: {message}") from exc
         raise PermanentError(f"WinRM authentication or command failed for {address}: {message}") from exc
     result = RemoteResult(response.status_code, _safe_text(response.std_out), _safe_text(response.std_err))
     if result.status_code != 0:
@@ -93,7 +125,20 @@ def run_windows_ps(
     return result
 
 
-def windows_preflight(address: str, username: str, password: str, **options) -> Dict[str, object]:
+def _normalize_mac(value: object) -> str:
+    normalized = "".join(character for character in str(value or "").lower() if character in "0123456789abcdef")
+    return normalized if len(normalized) == 12 else ""
+
+
+def windows_preflight(
+    address: str,
+    username: str,
+    password: str,
+    *,
+    expected_mac_addresses: Optional[list[str]] = None,
+    expected_name: str = "",
+    **options,
+) -> Dict[str, object]:
     result = run_windows_ps(address, username, password, WINDOWS_PREFLIGHT, **options)
     try:
         payload = json.loads(result.stdout.splitlines()[-1])
@@ -101,6 +146,25 @@ def windows_preflight(address: str, username: str, password: str, **options) -> 
         raise PermanentError("Windows preflight did not return valid system information") from exc
     if not payload.get("administrator"):
         raise PermanentError("The selected Windows credential is not a local administrator")
+    expected_macs = {_normalize_mac(value) for value in expected_mac_addresses or []} - {""}
+    network = payload.get("network") or []
+    if isinstance(network, dict):
+        network = [network]
+    actual_macs = {
+        _normalize_mac(item.get("mac_address"))
+        for item in network
+        if isinstance(item, dict)
+    } - {""}
+    matches = sorted(expected_macs & actual_macs)
+    if expected_macs and not matches:
+        remote_name = str(payload.get("computer") or address)
+        selected_name = expected_name or "the selected VM"
+        raise PermanentError(
+            f"WinRM reached {remote_name}, but its enabled NIC MAC address does not match {selected_name}; "
+            "verify the guest IP or DNS name"
+        )
+    payload["address_verified"] = bool(matches)
+    payload["matched_mac_address"] = matches[0] if matches else ""
     return payload
 
 
@@ -178,6 +242,104 @@ def _open_jump_channel(address: str, port: int, jump: Dict[str, object], timeout
         jump_client.close()
         raise
     return jump_client, channel
+
+
+@contextmanager
+def _direct_endpoint(address: str, port: int) -> Iterator[tuple[str, int]]:
+    yield address, port
+
+
+@contextmanager
+def _jump_tcp_forward(
+    address: str,
+    port: int,
+    jump: Dict[str, object],
+    timeout_seconds: int,
+) -> Iterator[tuple[str, int]]:
+    """Expose a loopback TCP endpoint carried by a pinned SSH direct-tcpip channel."""
+    jump_client = _connect_pinned_ssh(
+        str(jump.get("address") or ""),
+        str(jump.get("username") or ""),
+        str(jump.get("password") or ""),
+        port=int(jump.get("port") or 22),
+        host_key_sha256=str(jump.get("host_key_sha256") or ""),
+        timeout_seconds=timeout_seconds,
+    )
+    transport = jump_client.get_transport()
+    if transport is None:
+        jump_client.close()
+        raise PermanentError("The SSH jump-host transport is unavailable")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.5)
+    stop = threading.Event()
+    pairs: list[tuple[socket.socket, object]] = []
+    pairs_lock = threading.Lock()
+
+    def bridge(local_socket, channel) -> None:
+        try:
+            while not stop.is_set():
+                readable, _, _ = select.select([local_socket, channel], [], [], 0.5)
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    destination = channel if source is local_socket else local_socket
+                    destination.sendall(data)
+        except (OSError, EOFError):
+            pass
+        finally:
+            try:
+                local_socket.close()
+            finally:
+                channel.close()
+            with pairs_lock:
+                try:
+                    pairs.remove((local_socket, channel))
+                except ValueError:
+                    pass
+
+    def accept_connections() -> None:
+        while not stop.is_set():
+            try:
+                local_socket, source_address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                channel = transport.open_channel(
+                    "direct-tcpip",
+                    (address, port),
+                    source_address,
+                    timeout=timeout_seconds,
+                )
+            except Exception:
+                local_socket.close()
+                continue
+            with pairs_lock:
+                pairs.append((local_socket, channel))
+            threading.Thread(target=bridge, args=(local_socket, channel), daemon=True).start()
+
+    accept_thread = threading.Thread(target=accept_connections, daemon=True)
+    accept_thread.start()
+    try:
+        yield "127.0.0.1", int(listener.getsockname()[1])
+    finally:
+        stop.set()
+        listener.close()
+        with pairs_lock:
+            open_pairs = list(pairs)
+        for local_socket, channel in open_pairs:
+            try:
+                local_socket.close()
+            finally:
+                channel.close()
+        accept_thread.join(timeout=2)
+        jump_client.close()
 
 
 def ssh_host_key_sha256(

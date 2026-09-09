@@ -6,6 +6,7 @@ import { TableFit } from "./TableFit";
 import type { Job, JobList } from "./types";
 
 function progressLabel(job: Job): string {
+  if (job.kind.startsWith("host_upgrade_")) return String(job.progress.phase || job.result.phase || job.status).replace(/_/g, " ");
   const sent = Number(job.progress.bytes_sent ?? 0);
   const total = Number(job.progress.bytes_total ?? job.payload.size ?? 0);
   if (job.kind === "upload" && total > 0) {

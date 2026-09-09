@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { HostUpgradePanel } from "./HostUpgradePanel";
 import {
   fetchHostManagement,
   queueHostAction,
@@ -59,6 +60,8 @@ export function HostManagementView({ onQueued }: { onQueued: (job: Job) => void 
           <div><span>SSH fallback</span><strong>{host.ssh_configured ? "Configured" : "Off"}</strong></div>
         </div>
       </div>
+
+      <HostUpgradePanel />
 
       <div className="split">
         <div className="panel">

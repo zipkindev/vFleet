@@ -275,7 +275,10 @@ def _enqueue(request: Request, kind: str, title: str, payload: dict, idempotency
     bound["_endpoint_fingerprint"] = fingerprint
     bound["_endpoint_kind"] = endpoint_kind
     scoped_key = f"{fingerprint}:{idempotency_key}" if fingerprint and idempotency_key else idempotency_key
-    job = store.enqueue(kind, title, bound, idempotency_key=scoped_key)
+    try:
+        job = store.enqueue(kind, title, bound, idempotency_key=scoped_key)
+    except PermanentError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     worker.wake()
     return job
 
@@ -389,6 +392,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+from .upgrade_api import install_upgrade_routes
+
+install_upgrade_routes(app, require_token, _enqueue, _current_endpoint_fingerprint)
 
 
 @app.get("/api/health")
@@ -778,6 +786,22 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
         live.access_jump_password = jump_secret
         live.access_jump_host_key_sha256 = jump_host_key_sha256
 
+    if body.ssh_enabled and body.ssh_start_service_confirm and not body.ssh_host_key_sha256.strip():
+        try:
+            # Setup uses a separate authenticated candidate; never change a host while jobs are open.
+            with request.app.state.swap_lock:
+                if request.app.state.store.open_jobs():
+                    raise HTTPException(status_code=409, detail="Wait for queued/running jobs before temporary SSH setup")
+                body.ssh_host_key_sha256 = candidate.prepare_ssh_host_key(confirm=True)
+            live.esxi_ssh_host_key_sha256 = body.ssh_host_key_sha256
+            info.ssh_host_key_sha256 = body.ssh_host_key_sha256
+        except HTTPException:
+            _close(candidate)
+            raise
+        except Exception as exc:
+            _close(candidate)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if not body.connect:
         _close(candidate)
         info.message = f"Connection test passed. Detected {info.endpoint_kind.upper()}."
@@ -793,7 +817,7 @@ def login(body: LoginRequest, request: Request) -> ConnectionInfo:
                 "insecure": settings.vcenter_insecure,
                 "ssh_user": settings.esxi_ssh_user,
                 "ssh_port": settings.esxi_ssh_port,
-                "ssh_host_key_sha256": settings.esxi_ssh_host_key_sha256,
+                "ssh_host_key_sha256": body.ssh_host_key_sha256,
                 "has_saved_ssh_password": bool(settings.esxi_ssh_password),
                 "queued_jobs": counts["queued"],
                 "active_jobs": counts["active"],
@@ -1133,6 +1157,9 @@ def preflight_guest_tools(body: ToolsDeploymentRequest, request: Request) -> dic
                 transport=body.windows_transport,
                 port=body.windows_port,
                 validate_certificate=body.validate_certificate,
+                jump=jump,
+                expected_mac_addresses=vm.mac_addresses,
+                expected_name=vm.name,
             )
         elif family == "pfsense":
             details = guest_tools.pfsense_preflight(
@@ -1231,6 +1258,7 @@ def deploy_guest_tools(body: ToolsDeploymentRequest, request: Request) -> ToolsD
             "vm_id": vm_id,
             "vm_name": vm.name,
             "address": address,
+            "expected_mac_addresses": vm.mac_addresses,
             "os_family": family,
             "credential_id": credential.id,
             "windows_transport": body.windows_transport,

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchAutomationCredentials, fetchSshHostKey, login, testSshConnection } from "./api";
+import { fetchAutomationCredentials, fetchSshHostKey, login, saveAutomationCredential, testSshConnection } from "./api";
 import type { AutomationCredential, ConnectionInfo, ConnectionProfile, JumpHostType } from "./types";
 
 type Props = {
@@ -19,6 +19,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
   const [port, setPort] = useState(String(profile?.port || fallback?.saved_port || 443));
   const [insecure, setInsecure] = useState(profile?.insecure ?? fallback?.insecure ?? true);
   const [sshEnabled, setSshEnabled] = useState(profile?.ssh_enabled ?? fallback?.ssh_configured ?? false);
+  const [allowSshStart, setAllowSshStart] = useState(false);
   const [sshUser, setSshUser] = useState(profile?.ssh_user || fallback?.ssh_user || "root");
   const [sshPassword, setSshPassword] = useState("");
   const [sshPort, setSshPort] = useState(String(profile?.ssh_port || fallback?.ssh_port || 22));
@@ -28,9 +29,13 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
   const [jumpPort, setJumpPort] = useState(String(profile?.jump_port || 22));
   const [jumpHostType, setJumpHostType] = useState<JumpHostType>(profile?.jump_host_type || "auto");
   const [jumpCredentialId, setJumpCredentialId] = useState(profile?.jump_credential_id || "");
+  const [newJumpCredential, setNewJumpCredential] = useState(false);
+  const [jumpCredentialName, setJumpCredentialName] = useState("");
+  const [jumpUsername, setJumpUsername] = useState("");
+  const [jumpPassword, setJumpPassword] = useState("");
   const [jumpFingerprint, setJumpFingerprint] = useState(profile?.jump_host_key_sha256 || "");
   const [credentials, setCredentials] = useState<AutomationCredential[]>([]);
-  const [busy, setBusy] = useState<"test" | "save" | "jump" | null>(null);
+  const [busy, setBusy] = useState<"test" | "save" | "jump" | "credential" | "ssh-key" | null>(null);
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
   const savedPassword = Boolean(
@@ -59,9 +64,11 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
   );
 
   useEffect(() => {
+    let cancelled = false;
     void fetchAutomationCredentials({ profileId: profile?.id, globalOnly: blank }).then((result) => {
-      setCredentials(result.credentials);
-    }).catch((err) => setError(err instanceof Error ? err.message : "Could not load jump-host credentials"));
+      if (!cancelled) setCredentials((current) => [...result.credentials, ...current.filter((item) => !result.credentials.some((loaded) => loaded.id === item.id))]);
+    }).catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : "Could not load jump-host credentials"); });
+    return () => { cancelled = true; };
   }, [blank, profile?.id]);
 
   function clearJumpReview() {
@@ -69,8 +76,41 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
     setOk("");
   }
 
+  async function saveJumpCredential() {
+    if (busy !== null) return;
+    if (!jumpCredentialName.trim() || !jumpUsername.trim() || !jumpPassword) {
+      setError("Enter a vault name, SSH username, and password");
+      return;
+    }
+    setBusy("credential");
+    setError("");
+    setOk("");
+    try {
+      const saved = await saveAutomationCredential({
+        name: jumpCredentialName.trim(),
+        kind: "ssh",
+        username: jumpUsername.trim(),
+        secret: jumpPassword,
+        scope: "global",
+      });
+      setCredentials((current) => [...current.filter((item) => item.id !== saved.id), saved]);
+      setJumpCredentialId(saved.id);
+      setJumpPassword("");
+      setJumpUsername("");
+      setJumpCredentialName("");
+      setNewJumpCredential(false);
+      setJumpFingerprint("");
+      setOk("SSH credential saved to the vault and selected. Test the jump host to pin its key.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the SSH credential");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function testJumpHost() {
-    if (!jumpAddress.trim() || !jumpCredentialId) {
+    if (busy !== null) return;
+    if (newJumpCredential || !jumpAddress.trim() || !jumpCredentialId) {
       setError("Enter a jump-host address and select a stored SSH credential");
       return;
     }
@@ -98,7 +138,51 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
     }
   }
 
+  async function detectEsxiHostKey() {
+    let fingerprint: string;
+    try {
+      fingerprint = await fetchSshHostKey(host.trim(), Number(sshPort) || 22);
+    } catch (err) {
+      if (!jumpEnabled || !jumpAddress.trim() || !jumpCredentialId || newJumpCredential || !jumpFingerprint.startsWith("SHA256:")) throw err;
+      fingerprint = await fetchSshHostKey(host.trim(), Number(sshPort) || 22, {
+        address: jumpAddress.trim(),
+        port: Number(jumpPort) || 22,
+        credential_id: jumpCredentialId,
+        host_key_sha256: jumpFingerprint,
+      });
+    }
+    if (!fingerprint.startsWith("SHA256:")) {
+      throw new Error("Could not detect the ESXi SSH host key. Check SSH access and try again.");
+    }
+    return fingerprint;
+  }
+
+  async function pinEsxiHostKey() {
+    if (busy !== null) return;
+    if (allowSshStart && !sshFingerprint.trim()) { await submit("test"); return; }
+    if (!host.trim()) {
+      setError("Enter the ESXi server address first");
+      return;
+    }
+    setBusy("ssh-key");
+    setError("");
+    setOk("");
+    try {
+      const fingerprint = await detectEsxiHostKey();
+      if (sshFingerprint.trim() && fingerprint !== sshFingerprint.trim()) {
+        throw new Error("The ESXi SSH host key differs from the pinned key. Verify the server identity before changing the saved fingerprint.");
+      }
+      setSshFingerprint(fingerprint);
+      setOk("ESXi SSH host key detected and pinned.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not detect the ESXi SSH host key");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function submit(kind: "test" | "save") {
+    if (busy !== null) return;
     if (!host.trim() || !user.trim()) {
       setError("Host, username, and password are required");
       return;
@@ -107,11 +191,11 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
       setError("Host, username, and password are required");
       return;
     }
-    if (sshEnabled && (!sshUser.trim() || !sshFingerprint.trim())) {
-      setError("SSH user and host key fingerprint are required when SSH fallback is enabled");
+    if (sshEnabled && !sshUser.trim()) {
+      setError("SSH user is required when SSH fallback is enabled");
       return;
     }
-    if (jumpEnabled && (!jumpAddress.trim() || !jumpCredentialId || !jumpFingerprint.startsWith("SHA256:"))) {
+    if (jumpEnabled && (newJumpCredential || !jumpAddress.trim() || !jumpCredentialId || !jumpFingerprint.startsWith("SHA256:"))) {
       setError("Test the jump host and pin its host key before saving this access path");
       return;
     }
@@ -119,6 +203,18 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
     setError("");
     setOk("");
     try {
+      let fingerprint = sshFingerprint.trim();
+      if (sshEnabled && !fingerprint) {
+        setOk("Detecting the ESXi SSH host key…");
+        try {
+          fingerprint = await detectEsxiHostKey();
+        } catch (err) {
+          if (!allowSshStart) throw err;
+          setOk("Testing vSphere access and temporarily starting ESXi SSH if needed…");
+        }
+        setSshFingerprint(fingerprint);
+        setOk("");
+      }
       const info = await login({
         host,
         user,
@@ -128,11 +224,12 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
         remember: kind === "save",
         connect: kind === "save",
         endpoint_kind: "auto",
+        ssh_start_service_confirm: sshEnabled && allowSshStart && !fingerprint,
         ssh_enabled: sshEnabled,
         ssh_user: sshUser,
         ssh_password: sshPassword,
         ssh_port: Number(sshPort) || 22,
-        ssh_host_key_sha256: sshFingerprint,
+        ssh_host_key_sha256: fingerprint,
         jump_enabled: jumpEnabled,
         jump_address: jumpEnabled ? jumpAddress.trim() : "",
         jump_port: Number(jumpPort) || 22,
@@ -142,12 +239,14 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
         profile_id: profile?.id,
         profile_name: profileName.trim() || host.trim(),
       });
+      if (sshEnabled && info.ssh_host_key_sha256) setSshFingerprint(info.ssh_host_key_sha256);
       if (kind === "save") {
         onConnected(info);
       } else {
         setOk(info.message || "Credentials work. Password is saved on this machine.");
       }
     } catch (err) {
+      setOk("");
       setError(err instanceof Error ? err.message : "Sign-in failed");
     } finally {
       setBusy(null);
@@ -155,7 +254,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
   }
 
   return (
-    <div className="modal-back" onClick={onClose}>
+    <div className="modal-back" onClick={() => { if (busy === null) onClose(); }}>
       <form
         className="modal login-modal"
         onClick={(event) => event.stopPropagation()}
@@ -164,6 +263,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
           void submit("save");
         }}
       >
+        <fieldset className="login-fields" disabled={busy !== null}>
         <h2>{profile ? "Edit connection" : "Add vSphere connection"}</h2>
         <p>
           Enter either a vCenter Server or a standalone ESXi host. vFleet detects which one it is.
@@ -186,7 +286,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
           <input
             autoFocus
             value={host}
-            onChange={(event) => setHost(event.target.value)}
+            onChange={(event) => { setHost(event.target.value); setSshFingerprint(""); }}
             placeholder="vcenter.example.com or 192.168.1.20"
             autoComplete="off"
             name="vcenter-host"
@@ -240,12 +340,30 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
                 <label>SSH port<input value={jumpPort} onChange={(event) => { setJumpPort(event.target.value); clearJumpReview(); }} inputMode="numeric" /></label>
               </div>
               <label>
-                Jump-host credential
-                <select value={jumpCredentialId} onChange={(event) => { setJumpCredentialId(event.target.value); clearJumpReview(); }}>
+                Jump-host credential from vault
+                <select value={newJumpCredential ? "__new__" : jumpCredentialId} onChange={(event) => {
+                  const creating = event.target.value === "__new__";
+                  setNewJumpCredential(creating);
+                  if (!creating) setJumpCredentialId(event.target.value);
+                  setJumpPassword("");
+                  clearJumpReview();
+                }}>
                   <option value="">Select stored SSH credential…</option>
+                  <option value="__new__">Save a new SSH credential to vault…</option>
                   {jumpCredentials.map((credential) => <option key={credential.id} value={credential.id}>{credential.name} · {credential.username}</option>)}
                 </select>
               </label>
+              {newJumpCredential ? (
+                <div className="jump-credential-editor">
+                  <label>Vault name<input value={jumpCredentialName} onChange={(event) => setJumpCredentialName(event.target.value)} autoComplete="off" placeholder="Office jump host" /></label>
+                  <label>Jump-host username<input value={jumpUsername} onChange={(event) => setJumpUsername(event.target.value)} autoComplete="off" /></label>
+                  <label>Jump-host password<input type="password" value={jumpPassword} onChange={(event) => setJumpPassword(event.target.value)} autoComplete="new-password" /></label>
+                  <p>Save this SSH credential encrypted in the Automation Vault, available to all endpoints. It stays in the vault even if you cancel connection setup.</p>
+                  <button type="button" className="test-btn" disabled={busy !== null} onClick={() => void saveJumpCredential()}>
+                    {busy === "credential" ? "Saving credential…" : "Save to vault & select"}
+                  </button>
+                </div>
+              ) : null}
               <label>
                 Jump-host type
                 <select value={jumpHostType} onChange={(event) => { setJumpHostType(event.target.value as JumpHostType); clearJumpReview(); }}>
@@ -254,9 +372,9 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
                   <option value="unix">Linux or Unix</option>
                 </select>
               </label>
-              {!jumpCredentials.length ? <small>Add a global SSH or service credential in the Automation Vault first.</small> : null}
+              {!jumpCredentials.length ? <small>Choose “Save a new SSH credential to vault…” above to add your first credential here.</small> : null}
               {jumpFingerprint ? <small className="host-key">Pinned jump-host key: {jumpFingerprint}</small> : null}
-              <button type="button" className="test-btn" disabled={busy !== null} onClick={() => void testJumpHost()}>
+              <button type="button" className="test-btn" disabled={busy !== null || newJumpCredential || !jumpCredentialId} onClick={() => void testJumpHost()}>
                 {busy === "jump" ? "Testing jump host…" : "Test jump host & pin key"}
               </button>
             </>
@@ -266,7 +384,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
           <summary>Standalone ESXi SSH fallback (optional)</summary>
           <p>
             Used only for explicitly planned disk conversions when the licensed vSphere API cannot write. Host-key
-            verification is required; arbitrary shell commands are never accepted from the UI.
+            verification uses the pinned key; arbitrary shell commands are never accepted from the UI.
           </p>
           <label className="check">
             <input type="checkbox" checked={sshEnabled} onChange={(event) => setSshEnabled(event.target.checked)} />
@@ -276,7 +394,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
             <>
               <div className="login-grid">
                 <label>SSH user<input value={sshUser} onChange={(event) => setSshUser(event.target.value)} /></label>
-                <label>SSH port<input value={sshPort} onChange={(event) => setSshPort(event.target.value)} inputMode="numeric" /></label>
+                <label>SSH port<input value={sshPort} onChange={(event) => { setSshPort(event.target.value); setSshFingerprint(""); }} inputMode="numeric" /></label>
               </div>
               <label>
                 SSH password
@@ -288,7 +406,16 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
                   placeholder={savedSshPassword && !sshPassword ? "Saved on this machine" : ""}
                 />
               </label>
-              <label>Host key fingerprint<input value={sshFingerprint} onChange={(event) => setSshFingerprint(event.target.value)} placeholder="SHA256:…" /></label>
+              <label className="check">
+                <input type="checkbox" checked={allowSshStart} onChange={(event) => setAllowSshStart(event.target.checked)} />
+                Allow temporary SSH start through the vSphere API
+              </label>
+              <small>If key detection fails, use the supplied vSphere and SSH credentials to start SSH only if stopped, test SSH authentication, pin its key, and restore its previous service state.</small>
+              <button type="button" className="test-btn" disabled={busy !== null} onClick={() => void pinEsxiHostKey()}>
+                {busy === "ssh-key" ? "Detecting ESXi SSH key…" : "Detect & pin ESXi SSH key"}
+              </button>
+              <label>Host key fingerprint (optional)<input value={sshFingerprint} onChange={(event) => setSshFingerprint(event.target.value)} placeholder="Detected automatically when left blank" /></label>
+              <small>Test or Connect &amp; save detects and pins the first SSH key when this is blank, trying direct access first and then your verified jump host if needed. Enter a known SHA256 fingerprint to pin that key instead.</small>
             </>
           ) : null}
         </details>
@@ -303,6 +430,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
             {busy === "save" ? "Connecting…" : "Connect & save"}
           </button>
         </div>
+        </fieldset>
       </form>
     </div>
   );

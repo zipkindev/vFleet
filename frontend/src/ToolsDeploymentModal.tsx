@@ -9,7 +9,7 @@ type Props = {
   onQueued: (jobs: Job[], failures: string[], vmIds: string[]) => void;
 };
 
-type TargetRow = ToolsDeploymentTarget & { name: string; error: string };
+type TargetRow = ToolsDeploymentTarget & { name: string; error: string; verification: string };
 type GuestFamily = "windows" | "linux" | "pfsense";
 
 function guestFamily(guestOs: string): "windows" | "linux" {
@@ -26,6 +26,7 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
       : guestFamily(vm.guest_os),
     ssh_host_key_sha256: "",
     error: "",
+    verification: "",
   })));
   const [credentials, setCredentials] = useState<AutomationCredential[]>([]);
   const [credentialId, setCredentialId] = useState("");
@@ -58,7 +59,7 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
   const hasWindows = families.has("windows");
   const hasSshTargets = families.has("linux") || families.has("pfsense");
   const pfsenseOnly = families.size === 1 && families.has("pfsense");
-  const activeJump = useJump && hasSshTargets;
+  const activeJump = useJump;
   const requiredKind = hasWindows && hasSshTargets ? "service" : hasWindows ? "windows" : "ssh";
   const compatible = credentials.filter((item) =>
     (item.kind === requiredKind || item.kind === "service") && (!pfsenseOnly || item.username.trim().toLowerCase() === "root")
@@ -81,7 +82,7 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
   }, [accessProfile?.jump_credential_id, pfsenseOnly, requiredKind]);
 
   function updateTarget(index: number, update: Partial<TargetRow>) {
-    setTargets((current) => current.map((target, position) => position === index ? { ...target, ...update, ssh_host_key_sha256: update.address !== undefined || update.os_family !== undefined ? "" : target.ssh_host_key_sha256 } : target));
+    setTargets((current) => current.map((target, position) => position === index ? { ...target, ...update, ssh_host_key_sha256: update.address !== undefined || update.os_family !== undefined ? "" : target.ssh_host_key_sha256, verification: "" } : target));
     setReviewed(false);
   }
 
@@ -92,7 +93,7 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
     setJumpError("");
     setJumpHostKey("");
     setDetectedJumpHostType("auto");
-    const next = targets.map((target) => ({ ...target, error: "" }));
+    const next = targets.map((target) => ({ ...target, error: "", verification: "" }));
     let reviewedJumpHostKey = "";
     let reviewedJumpError = "";
     if (activeJump) {
@@ -151,7 +152,7 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
       remotePreflightPassed = true;
       for (const target of next) {
         try {
-          await preflightGuestTools({
+          const checked = await preflightGuestTools({
             targets: [{
               vm_id: target.vm_id,
               address: target.address.trim(),
@@ -170,6 +171,14 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
             jump_credential_id: activeJump ? jumpCredentialId : "",
             jump_host_key_sha256: activeJump ? reviewedJumpHostKey : "",
           });
+          if (target.os_family === "windows") {
+            const computer = typeof checked.details.computer === "string" ? checked.details.computer : target.address.trim();
+            const os = typeof checked.details.os === "string" ? checked.details.os : "Windows";
+            const matched = checked.details.address_verified === true ? "IP matched the VM network adapter" : "Windows identity verified";
+            target.verification = [computer, os, matched].join(" · ");
+          } else {
+            target.verification = "Remote access verified";
+          }
         } catch (err) {
           target.error = err instanceof Error ? err.message : "Guest preflight failed";
           remotePreflightPassed = false;
@@ -226,19 +235,19 @@ export function ToolsDeploymentModal({ vms, accessProfile, onClose, onQueued }: 
       <div className="modal-back" onClick={() => !busy && onClose()}>
         <div className="modal tools-modal" onClick={(event) => event.stopPropagation()}>
           <h2>Deploy VMware Tools · {vms.length} VM{vms.length === 1 ? "" : "s"}</h2>
-          <p>Windows uses WinRM and the ESXi-hosted Tools installer. Linux uses its distribution’s <code>open-vm-tools</code> package. pfSense uses the signed <code>pfSense-pkg-Open-VM-Tools</code> package as root. SSH targets and optional jump hosts use pinned host keys. Every VM becomes an independent persistent job.</p>
+          <p>Windows uses WinRM and the ESXi-hosted Tools installer. Linux uses its distribution’s <code>open-vm-tools</code> package. pfSense uses the signed <code>pfSense-pkg-Open-VM-Tools</code> package as root. WinRM and SSH can travel through a pinned SSH jump host. Every VM becomes an independent persistent job.</p>
           {error ? <div className="banner bad">{error}</div> : null}
           <div className="tools-settings-grid">
             <label>Guest credential<select value={newCredential ? "new" : credentialId} onChange={(event) => { setNewCredential(event.target.value === "new"); setCredentialId(event.target.value === "new" ? "" : event.target.value); setReviewed(false); }}><option value="new">Add and save a new guest credential…</option>{compatible.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.username}</option>)}</select>{pfsenseOnly ? <small>pfSense guest access lists root credentials only.</small> : null}</label>
             {newCredential ? <><label>Credential name<input value={credentialName} onChange={(event) => { setCredentialName(event.target.value); setReviewed(false); }} /></label><label>Username<input autoComplete="username" value={username} onChange={(event) => { setUsername(event.target.value); setReviewed(false); }} /></label><label>Password<input type="password" autoComplete="new-password" value={secret} onChange={(event) => { setSecret(event.target.value); setReviewed(false); }} /></label><label>Availability<select value={credentialScope} onChange={(event) => setCredentialScope(event.target.value as "global" | "endpoint")}><option value="endpoint">Current endpoint</option><option value="global">All endpoints</option></select></label></> : null}
             {families.has("windows") ? <><label>WinRM transport<select value={windowsTransport} onChange={(event) => { const transport = event.target.value as "http" | "https"; setWindowsTransport(transport); setWindowsPort(transport === "https" ? 5986 : 5985); setReviewed(false); }}><option value="http">HTTP with encrypted NTLM messages</option><option value="https">HTTPS</option></select></label><label>WinRM port<input type="number" min={1} max={65535} value={windowsPort} onChange={(event) => { setWindowsPort(Number(event.target.value)); setReviewed(false); }} /></label>{windowsTransport === "https" ? <label className="check"><input type="checkbox" checked={validateCertificate} onChange={(event) => setValidateCertificate(event.target.checked)} /> Validate TLS certificate</label> : null}</> : null}
-            {hasSshTargets ? <><label>SSH port<input type="number" min={1} max={65535} value={linuxPort} onChange={(event) => { setLinuxPort(Number(event.target.value)); setReviewed(false); }} /></label>{families.has("linux") ? <label className="check"><input type="checkbox" checked={sudo} onChange={(event) => setSudo(event.target.checked)} /> Use sudo for Linux package installation</label> : null}<label className="check"><input type="checkbox" checked={useJump} onChange={(event) => { setUseJump(event.target.checked); setJumpError(""); setReviewed(false); }} /> Connect through an SSH jump host</label>{accessProfile?.jump_enabled ? <small>Inherited from connection “{accessProfile.name}”. Disable or edit it for this deployment without changing the saved profile.</small> : null}</> : null}
-            {hasSshTargets && useJump ? <><label>Jump-host address<input value={jumpAddress} onChange={(event) => { setJumpAddress(event.target.value); setJumpHostKey(""); setReviewed(false); }} /></label><label>Jump-host SSH port<input type="number" min={1} max={65535} value={jumpPort} onChange={(event) => { setJumpPort(Number(event.target.value)); setJumpHostKey(""); setReviewed(false); }} /></label><label>Jump-host credential<select value={jumpCredentialId} onChange={(event) => { setJumpCredentialId(event.target.value); setJumpHostKey(""); setReviewed(false); }}><option value="">Select stored SSH credential…</option>{jumpCredentials.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.username}</option>)}</select></label><label>Jump-host type<select value={jumpHostType} onChange={(event) => { setJumpHostType(event.target.value as JumpHostType); setJumpHostKey(""); setDetectedJumpHostType("auto"); setReviewed(false); }}><option value="auto">Auto detect</option><option value="windows">Windows OpenSSH (PowerShell)</option><option value="unix">Linux or Unix</option></select></label>{jumpHostKey ? <small className="host-key">Jump-host key: {jumpHostKey}{jumpHostType === "auto" ? ` · ${detectedJumpHostType === "auto" ? "type undetermined" : `detected ${detectedJumpHostType}`}` : ""}</small> : null}{jumpError ? <small className="bad-text">{jumpError}</small> : null}</> : null}
+            {hasSshTargets ? <><label>SSH port<input type="number" min={1} max={65535} value={linuxPort} onChange={(event) => { setLinuxPort(Number(event.target.value)); setReviewed(false); }} /></label>{families.has("linux") ? <label className="check"><input type="checkbox" checked={sudo} onChange={(event) => setSudo(event.target.checked)} /> Use sudo for Linux package installation</label> : null}</> : null}<label className="check"><input type="checkbox" checked={useJump} onChange={(event) => { setUseJump(event.target.checked); setJumpError(""); setReviewed(false); }} /> Connect through an SSH jump host</label>{accessProfile?.jump_enabled ? <small>Inherited from connection “{accessProfile.name}”. Disable or edit it for this deployment without changing the saved profile.</small> : null}
+            {useJump ? <><label>Jump-host address<input value={jumpAddress} onChange={(event) => { setJumpAddress(event.target.value); setJumpHostKey(""); setReviewed(false); }} /></label><label>Jump-host SSH port<input type="number" min={1} max={65535} value={jumpPort} onChange={(event) => { setJumpPort(Number(event.target.value)); setJumpHostKey(""); setReviewed(false); }} /></label><label>Jump-host credential<select value={jumpCredentialId} onChange={(event) => { setJumpCredentialId(event.target.value); setJumpHostKey(""); setReviewed(false); }}><option value="">Select stored SSH credential…</option>{jumpCredentials.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.username}</option>)}</select></label><label>Jump-host type<select value={jumpHostType} onChange={(event) => { setJumpHostType(event.target.value as JumpHostType); setJumpHostKey(""); setDetectedJumpHostType("auto"); setReviewed(false); }}><option value="auto">Auto detect</option><option value="windows">Windows OpenSSH (PowerShell)</option><option value="unix">Linux or Unix</option></select></label>{jumpHostKey ? <small className="host-key">Jump-host key: {jumpHostKey}{jumpHostType === "auto" ? ` · ${detectedJumpHostType === "auto" ? "type undetermined" : `detected ${detectedJumpHostType}`}` : ""}</small> : null}{jumpError ? <small className="bad-text">{jumpError}</small> : null}</> : null}
             <label className="check"><input type="checkbox" checked={runDryRun} onChange={(event) => { setRunDryRun(event.target.checked); setReviewed(false); setDryRunPassed(false); }} /> Run a remote dry run before queueing</label>
             <small>The dry run verifies credentials, platform access, reachability, and pinned SSH keys without installing VMware Tools.</small>
           </div>
           <div className="tools-targets">
-            {targets.map((target, index) => <article key={target.vm_id} className="tools-target"><strong>{target.name}</strong><label>Guest address<input value={target.address} onChange={(event) => updateTarget(index, { address: event.target.value })} /></label><label>Operating system<select value={target.os_family} onChange={(event) => updateTarget(index, { os_family: event.target.value as GuestFamily })}><option value="windows">Windows</option><option value="linux">Linux</option><option value="pfsense">pfSense</option></select></label>{target.os_family === "pfsense" ? <small>Requires a root SSH credential. No reboot is requested.</small> : null}{target.ssh_host_key_sha256 ? <small className="host-key">SSH host key: {target.ssh_host_key_sha256}</small> : null}{target.error ? <small className="bad-text">{target.error}</small> : null}</article>)}
+            {targets.map((target, index) => <article key={target.vm_id} className="tools-target"><strong>{target.name}</strong><label>Guest address<input value={target.address} onChange={(event) => updateTarget(index, { address: event.target.value })} /></label><label>Operating system<select value={target.os_family} onChange={(event) => updateTarget(index, { os_family: event.target.value as GuestFamily })}><option value="windows">Windows</option><option value="linux">Linux</option><option value="pfsense">pfSense</option></select></label>{target.os_family === "pfsense" ? <small>Requires a root SSH credential. No reboot is requested.</small> : null}{target.ssh_host_key_sha256 ? <small className="host-key">SSH host key: {target.ssh_host_key_sha256}</small> : null}{target.verification ? <small className="host-key">{target.verification}</small> : null}{target.error ? <small className="bad-text">{target.error}</small> : null}</article>)}
           </div>
           {reviewed ? <div className="banner">{dryRunPassed ? "Dry run passed: credentials, platform preflight, reachability, and pinned host keys were verified without installing anything." : runDryRun && newCredential ? "Ready. The new credential will be saved when queued; remote dry run requires a previously saved credential. Pinned SSH keys will still be enforced." : "Review passed with the remote dry run skipped. Every SSH host key shown above will be pinned to these jobs; a changed target or jump-host key stops execution."}</div> : null}
           <div className="modal-actions"><button className="ghost" disabled={busy} onClick={onClose}>Cancel</button>{reviewed ? <button className="accent" disabled={busy} onClick={() => setConfirming(true)}>Queue {targets.length} deployment{targets.length === 1 ? "" : "s"}</button> : <button className="accent" disabled={busy} onClick={() => void review()}>{busy ? "Checking…" : "Review deployment"}</button>}</div>

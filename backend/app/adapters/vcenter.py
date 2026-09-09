@@ -970,6 +970,13 @@ class VCenterAdapter(InventoryAdapter):
                 tools_status=tools,
                 tools_installer_mounted=bool(row.get("runtime.toolsInstallerMounted") or False),
                 ip_address=row.get("guest.ipAddress") or None,
+                mac_addresses=sorted(
+                    {
+                        str(getattr(device, "macAddress", "") or "").lower()
+                        for device in devices
+                        if getattr(device, "macAddress", None)
+                    }
+                ),
                 boot_time=boot,
                 last_activity=_utc(last_ts),
                 last_activity_source=last_src,
@@ -1920,6 +1927,31 @@ class VCenterAdapter(InventoryAdapter):
             raise PermanentError("Direct ESXi mode expected exactly one host")
         return self._obj(vim.HostSystem, rows[0]["id"])
 
+    def host_upgrade_context(self) -> Dict[str, Any]:
+        info = self.host_management()
+        host = self._host_obj()
+        config = host.config
+        autostart = host.configManager.autoStartManager.config
+        vms = []
+        for vm in host.vm:
+            if vm.config is None or str(vm.runtime.connectionState) != "connected":
+                raise PermanentError("Resolve inaccessible VM registrations before upgrading")
+            vms.append({
+                "id": _moid(vm), "uuid": str(vm.config.uuid).lower(),
+                "vmx": str(vm.config.files.vmPathName),
+                "name": str(vm.name), "power_state": normalize_power_state(vm.runtime.powerState),
+                "tools_running": str(vm.guest.toolsRunningStatus) == "guestToolsRunning",
+                "template": bool(vm.config.template),
+            })
+        return {
+            "host": info.model_dump(mode="json", exclude={"license_key"}), "vms": vms,
+            "autostart_enabled": bool(autostart.defaults.enabled),
+            "managed_by_vcenter": bool(getattr(host.summary, "managementServerIp", None)),
+            "vsan_enabled": bool(getattr(getattr(config, "vsanHostConfig", None), "enabled", False)),
+            "datastores": [{"uuid": str(ds.info.url), "name": str(ds.name),
+                            "accessible": bool(ds.summary.accessible)} for ds in host.datastore],
+        }
+
     def host_management(self) -> HostManagementInfo:
         if not self._is_esxi():
             raise PermanentError("Host administration is available when connected directly to an ESXi host")
@@ -2042,6 +2074,75 @@ class VCenterAdapter(InventoryAdapter):
         else:
             raise PermanentError("Host action must be maintenance_enter, maintenance_exit, reboot, or shutdown")
         return _moid(task)
+
+    def prepare_ssh_host_key(self, *, confirm: bool = False) -> str:
+        """Explicit setup probe; restore SSH if this probe starts it."""
+        if not confirm:
+            raise PermanentError("Confirm temporary SSH activation before testing")
+        if not self._is_esxi():
+            raise PermanentError("SSH setup requires a direct ESXi API connection")
+        if not self.settings.esxi_ssh_user or not self.settings.esxi_ssh_password:
+            raise PermanentError("SSH username and password are required for the setup test")
+        from ..guest_tools import ssh_host_key_sha256, _connect_pinned_ssh, _open_jump_channel
+
+        service_system = self._host_obj().configManager.serviceSystem
+        service_system.RefreshServices()
+        service = next((item for item in service_system.serviceInfo.service if item.key == "TSM-SSH"), None)
+        if service is None:
+            raise PermanentError("The ESXi SSH service is unavailable")
+        started = not bool(service.running)
+        jump = None
+        if self.settings.access_jump_enabled:
+            jump = {
+                "address": self.settings.access_jump_address,
+                "port": self.settings.access_jump_port,
+                "username": self.settings.access_jump_user,
+                "password": self.settings.access_jump_password,
+                "host_key_sha256": self.settings.access_jump_host_key_sha256,
+            }
+        address = self.settings.vcenter_host
+        port = self.settings.esxi_ssh_port
+        jump_client = None
+        sock = None
+        try:
+            if started:
+                service_system.StartService(id="TSM-SSH")
+            # Give a newly started service a bounded opportunity to accept SSH.
+            for attempt in range(4):
+                try:
+                    try:
+                        fingerprint = ssh_host_key_sha256(address, port)
+                        use_jump = False
+                    except Exception:
+                        if jump is None:
+                            raise
+                        fingerprint = ssh_host_key_sha256(address, port, jump=jump)
+                        use_jump = True
+                    break
+                except Exception:
+                    if not started or attempt == 3:
+                        raise
+                    time.sleep(0.5)
+            if use_jump:
+                jump_client, sock = _open_jump_channel(address, port, jump, 10)
+            client = _connect_pinned_ssh(
+                address, self.settings.esxi_ssh_user, self.settings.esxi_ssh_password,
+                port=port, host_key_sha256=fingerprint, timeout_seconds=10, sock=sock,
+            )
+            client.close()
+            return fingerprint
+        except Exception as exc:
+            raise PermanentError("ESXi SSH setup failed. Check service permissions, SSH access, and credentials.") from exc
+        finally:
+            if sock is not None:
+                sock.close()
+            if jump_client is not None:
+                jump_client.close()
+            if started:
+                try:
+                    service_system.StopService(id="TSM-SSH")
+                except Exception as exc:
+                    raise PermanentError("Could not restore the ESXi SSH service to stopped; check the host service state before retrying.") from exc
 
     def host_service_action(self, service_key: str, action: str, policy: str = "") -> Dict[str, Any]:
         if not self._is_esxi():

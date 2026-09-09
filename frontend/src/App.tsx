@@ -160,13 +160,25 @@ export function App() {
     const setCatalogIfChanged = setIfChanged(setCatalog);
     const setJobsIfChanged = setIfChanged(setJobs);
 
+    let loadedProfiles = profiles;
+    try {
+      loadedProfiles = await fetchConnectionProfiles();
+      setProfiles(loadedProfiles);
+      setProfilesError("");
+    } catch (err) {
+      setProfilesError(err instanceof Error ? err.message : "Could not load saved connections");
+    } finally {
+      setProfilesLoading(false);
+    }
+    const noSavedProfiles = loadedProfiles !== null && loadedProfiles.profiles.length === 0;
+
     try {
       const snapshot = await fetchInventory({ q, owner, cluster, power });
       setDataIfChanged(snapshot);
       setConnectionIfChanged(snapshot.connection);
       setError("");
       const neverSynced = !snapshot.connection.last_sync && snapshot.vms.length === 0;
-      if (snapshot.connection.mode !== "demo" && !snapshot.connection.connected && neverSynced) {
+      if (noSavedProfiles && snapshot.connection.mode !== "demo" && !snapshot.connection.connected && neverSynced) {
         setShowLogin(true);
       }
     } catch (err) {
@@ -174,9 +186,9 @@ export function App() {
       try {
         const info = await fetchConnection();
         setConnectionIfChanged(info);
-        if (info.mode !== "demo" && !info.connected && !info.last_sync) setShowLogin(true);
+        if (noSavedProfiles && info.mode !== "demo" && !info.connected && !info.last_sync) setShowLogin(true);
       } catch {
-        setShowLogin(true);
+        if (noSavedProfiles) setShowLogin(true);
       }
     }
     try {
@@ -188,14 +200,6 @@ export function App() {
       setJobsIfChanged(await fetchJobs());
     } catch {
       /* jobs endpoint should exist once the API is up */
-    }
-    try {
-      setProfiles(await fetchConnectionProfiles());
-      setProfilesError("");
-    } catch (err) {
-      setProfilesError(err instanceof Error ? err.message : "Could not load saved connections");
-    } finally {
-      setProfilesLoading(false);
     }
   }
 

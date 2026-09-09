@@ -118,6 +118,8 @@ The connection card in the left rail opens a searchable drawer of saved vCenter 
 - **Connect & save** tests first, stores non-secret profile metadata in `data/connections.json`, encrypts passwords in `data/credentials.enc.json`, and switches to live inventory.
 - Profile API responses never include passwords. A blank password while editing reuses the retained secret only when the saved endpoint, user, and port still match.
 - **Network access** on Add/Edit connection assigns an optional jump-host address, host type, Automation Vault credential, and pinned host key to that profile. **Auto detect** probes the authenticated SSH shell without changing the host; an explicit Windows OpenSSH/PowerShell or Linux/Unix choice is available for restricted shells. **Test jump host & pin key** verifies authentication and host identity before the association can be saved.
+- **Standalone ESXi SSH fallback** can detect and pin its host key directly from Add/Edit connection. Leaving the fingerprint blank makes Test or Connect & save discover it automatically, trying direct SSH before a verified jump host. An existing fingerprint is retained.
+- **Allow temporary SSH start through the vSphere API** is opt-in. If discovery fails, setup uses the supplied credentials to authenticate to the direct ESXi API, starts TSM-SSH only if stopped, detects the key, tests SSH authentication, and restores the original service state. Open jobs block this temporary setup, and failure to restore SSH is reported explicitly. It does not change SSH startup policy.
 - A referenced jump credential cannot be deleted until it is removed from the connection profile. Connection profiles store only its credential ID; the secret stays in the encrypted Automation Vault.
 - Switching is refused while queued or running work is bound to the current endpoint.
 - **Stay in demo** closes the dialog. **Disconnect** / **Forget saved credentials** are in the rail after you connect.
@@ -250,3 +252,16 @@ See the [GNU AGPL v3](LICENSE) for details.
 
 Key restriction: if you run a modified version of this software as a network service, you must
 make the complete corresponding source code available to users of that service (AGPL §13).
+
+### Assisted ESXi host upgrades
+
+Direct ESXi connections now have an **ESXi upgrade** panel under **Hosts**. It inspects
+an original installer ISO and the live host, then queues guarded configuration backup,
+graceful VM shutdown and maintenance entry. On servers without remote boot control,
+vFleet can enumerate a locally attached USB, require its exact disk identity and typed
+erase phrase, write the verified ISO bit-for-bit through elevated Windows PowerShell,
+and verify the full USB read-back hash. Boot the installer manually; vFleet then verifies
+the upgraded host and restores the saved VM power states. Host inventory, guest shutdown,
+maintenance, and recovery use SOAP; verified SSH is opened only for the host configuration
+backup and closed immediately afterward. See [the upgrade runbook](ESXI_UPGRADE.md) for
+supported scope, version/license checks, failure behavior, and recovery procedures.

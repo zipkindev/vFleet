@@ -86,7 +86,7 @@ class LocalStore:
         self.path = path
         self.staging_dir = path.parent / "staging"
         self.staging_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -193,7 +193,50 @@ class LocalStore:
             ).fetchall()
         return [self._job(row) for row in rows]
 
-    def enqueue(
+    def upgrade_lock(self, fingerprint: str) -> str:
+        row = self._get_kv("host_upgrade:lock:" + fingerprint)
+        return str(row["value"]) if row else ""
+
+    def latest_upgrade_plan(self, fingerprint: str) -> str:
+        with self._lock:
+            rows = self._conn.execute("SELECT value FROM kv WHERE key LIKE 'host_upgrade:run:%' ORDER BY updated_at DESC").fetchall()
+        for row in rows:
+            run = json.loads(row["value"])
+            if run.get("endpoint_fingerprint") == fingerprint:
+                return str(run["id"])
+        return ""
+
+    def release_upgrade(self, fingerprint: str, plan_id: str) -> None:
+        with self._lock:
+            if self.upgrade_lock(fingerprint) == plan_id:
+                self._conn.execute("DELETE FROM kv WHERE key=?", ("host_upgrade:lock:" + fingerprint,))
+                self._conn.commit()
+
+    def enqueue(self, kind: str, title: str, payload: Dict[str, Any], idempotency_key: str = "") -> Job:
+        from .errors import PermanentError
+        fingerprint = str(payload.get("_endpoint_fingerprint") or "")
+        plan_id = str(payload.get("plan_id") or "")
+        with self._lock:
+            locked = self.upgrade_lock(fingerprint)
+            upgrade_write = kind in {"host_upgrade_prepare", "host_upgrade_recover"}
+            recovery_ssh = kind == "host_service" and payload.get("service_key") == "TSM-SSH" and payload.get("action") == "start" and payload.get("confirm") is True
+            if locked and not ((upgrade_write and plan_id == locked) or recovery_ssh):
+                raise PermanentError("An ESXi upgrade owns this host. Finish verification/restoration or abort it before queuing changes.")
+            if upgrade_write:
+                active = [j for j in self.open_jobs() if str(j.payload.get("_endpoint_fingerprint") or "") == fingerprint]
+                if active:
+                    same = next((j for j in active if j.idempotency_key == idempotency_key and j.kind == kind), None)
+                    if same and len(active) == 1:
+                        return same
+                    raise PermanentError("Wait for other endpoint jobs to finish before preparing or recovering an upgrade")
+                if kind == "host_upgrade_recover" and locked != plan_id:
+                    raise PermanentError("This upgrade does not own the host")
+            if kind == "host_upgrade_prepare":
+                # Reserve first: a crash may leave a recoverable reservation, never an unreserved shutdown job.
+                self._put_kv("host_upgrade:lock:" + fingerprint, plan_id)
+            return self._enqueue_unlocked(kind, title, payload, idempotency_key)
+
+    def _enqueue_unlocked(
         self,
         kind: str,
         title: str,

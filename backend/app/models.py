@@ -88,6 +88,7 @@ class LoginRequest(BaseModel):
     remember: bool = False
     connect: bool = True
     endpoint_kind: str = "auto"
+    ssh_start_service_confirm: bool = False
     ssh_enabled: bool = False
     ssh_user: str = ""
     ssh_password: str = ""
@@ -167,6 +168,7 @@ class VirtualMachine(BaseModel):
     tools_status: str = ""
     tools_installer_mounted: bool = False
     ip_address: Optional[str] = None
+    mac_addresses: List[str] = Field(default_factory=list)
     boot_time: Optional[datetime] = None
     last_activity: Optional[datetime] = None
     last_activity_source: str = "unknown"

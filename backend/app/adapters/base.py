@@ -142,6 +142,9 @@ class InventoryAdapter(ABC):
     def endpoint_fingerprint(self) -> str:
         return self.connection().endpoint_fingerprint
 
+    def host_upgrade_context(self) -> Dict[str, Any]:
+        raise NotImplementedError("Host upgrade inspection is not supported by this adapter")
+
     def host_management(self) -> HostManagementInfo:
         raise NotImplementedError(f"{type(self).__name__} cannot inspect host management settings")
 

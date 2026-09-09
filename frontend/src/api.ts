@@ -117,6 +117,7 @@ export async function login(body: {
   remember: boolean;
   connect: boolean;
   endpoint_kind?: string;
+  ssh_start_service_confirm?: boolean;
   ssh_enabled?: boolean;
   ssh_user?: string;
   ssh_password?: string;
@@ -239,8 +240,14 @@ export async function preflightGuestTools(body: {
   jump_host_type: "auto" | "windows" | "unix";
   jump_credential_id: string;
   jump_host_key_sha256: string;
-}): Promise<void> {
-  await request<{ ok: boolean }>("/api/tools/preflight", {
+}): Promise<{
+  ok: boolean;
+  vm_id: string;
+  vm_name: string;
+  os_family: string;
+  details: Record<string, unknown>;
+}> {
+  return request("/api/tools/preflight", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -559,3 +566,70 @@ export function setUiToken(token: string) {
   if (token) localStorage.setItem("vfleet.uiToken", token);
   else localStorage.removeItem("vfleet.uiToken");
 }
+
+export type HostUpgradePlan = {
+  staging_id: string;
+  reserved?: boolean;
+  startup_order?: string[];
+  id: string;
+  phase: string;
+  created_at: string;
+  media: {
+    version: string; build: string; sha256: string; size: number;
+    method?: string; free_edition?: boolean; installer_complete?: boolean;
+    boot_module_count?: number; upgrade_metadata_present?: boolean;
+    image_profile?: string; automation_mode?: string;
+  };
+  context: {
+    host: { version: string; build: string; name: string };
+    vms: Array<{ uuid: string; name: string; power_state: string }>;
+  };
+  blockers: string[];
+  notice: string;
+  sources: Array<{ title: string; url: string }>;
+  shutdown_completed: string[];
+  restored: string[];
+};
+
+export const inspectHostUpgrade = (staging_id: string) => request<Job>("/api/host/upgrade/inspect", {
+  method: "POST", body: JSON.stringify({ staging_id }),
+});
+export const fetchHostUpgrade = (id: string) => request<HostUpgradePlan>(`/api/host/upgrade/plans/${encodeURIComponent(id)}`);
+export const fetchActiveHostUpgrade = () => request<{ plan: HostUpgradePlan | null }>("/api/host/upgrade/active");
+export const fetchUpgradeJob = (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`);
+
+export type UpgradeUsbDevice = {
+  number: number;
+  friendly_name: string;
+  serial_number: string;
+  unique_id: string;
+  size_bytes: number;
+  drive_letters: string[];
+  safe: boolean;
+  blocked_reason: string;
+};
+export type UpgradeUsbInventory = {
+  supported: boolean;
+  platform: string;
+  devices: UpgradeUsbDevice[];
+  message: string;
+};
+export const fetchUpgradeUsbDevices = () => request<UpgradeUsbInventory>("/api/host/upgrade/usb");
+export const writeUpgradeUsb = (body: {
+  plan_id: string;
+  disk_number: number;
+  friendly_name: string;
+  serial_number: string;
+  unique_id: string;
+  size_bytes: number;
+  confirmation: string;
+}) => request<Job>("/api/host/upgrade/usb/write", { method: "POST", body: JSON.stringify(body) });
+
+export const prepareHostUpgrade = (body: {
+  plan_id: string; confirm: boolean; path_verified: boolean; hardware_verified: boolean;
+  vm_backups_verified: boolean; independent_controller: boolean; installer_ready: boolean; manage_ssh_service: boolean;
+  publisher_sha256: string; startup_order: string[]; shutdown_timeout_seconds: number; startup_delay_seconds: number;
+}) => request<Job>("/api/host/upgrade/prepare", { method: "POST", body: JSON.stringify(body) });
+export const recoverHostUpgrade = (plan_id: string, mode: "complete" | "abort") => request<Job>("/api/host/upgrade/recover", {
+  method: "POST", body: JSON.stringify({ plan_id, mode, confirm: true }),
+});

@@ -271,6 +271,21 @@ class RelayWorker(threading.Thread):
             extra["bytes_sent"] = sent
             self.store.save_progress(job.id, extra)
 
+        locked = self.store.upgrade_lock(str(payload.get("_endpoint_fingerprint") or ""))
+        upgrade_write = kind in {"host_upgrade_prepare", "host_upgrade_recover"}
+        recovery_ssh = kind == "host_service" and payload.get("service_key") == "TSM-SSH" and payload.get("action") == "start" and payload.get("confirm") is True
+        if (locked and not ((upgrade_write and str(payload.get("plan_id")) == locked) or recovery_ssh)) or (upgrade_write and locked != str(payload.get("plan_id"))):
+            raise PermanentError("This host is reserved by an ESXi upgrade; finish recovery before other changes")
+        if kind in {"host_upgrade_inspect", "host_upgrade_prepare", "host_upgrade_recover"}:
+            from .host_upgrade import inspect_plan, prepare_host, recover_host
+            operation = {"host_upgrade_inspect": inspect_plan, "host_upgrade_prepare": prepare_host,
+                         "host_upgrade_recover": recover_host}[kind]
+            return operation(adapter, self.store, self.settings, job)
+
+        if kind == "host_upgrade_usb_write":
+            from .usb_media import write_installer_usb
+            return write_installer_usb(self.store, job)
+
         if kind == "power":
             results = adapter.apply_actions(payload["vm_ids"], payload["action"])
             failed = [row for row in results if not row.ok]
@@ -877,7 +892,7 @@ class RelayWorker(threading.Thread):
 
         jump = None
         jump_address = str(payload.get("jump_address") or "")
-        if jump_address and family in {"linux", "pfsense"}:
+        if jump_address:
             jump_credential_id = str(payload.get("jump_credential_id") or "")
             jump_credential = self.automation_credentials.get(jump_credential_id)
             if jump_credential is None:
@@ -907,9 +922,19 @@ class RelayWorker(threading.Thread):
                 "transport": str(payload.get("windows_transport") or "http"),
                 "port": int(payload.get("windows_port") or 5985),
                 "validate_certificate": bool(payload.get("validate_certificate", True)),
+                "jump": jump,
             }
             if phase == "preflight":
-                progress["preflight"] = guest_tools.windows_preflight(address, username, secret, **options)
+                progress["preflight"] = guest_tools.windows_preflight(
+                    address,
+                    username,
+                    secret,
+                    expected_mac_addresses=[
+                        str(value) for value in payload.get("expected_mac_addresses") or []
+                    ],
+                    expected_name=str(payload.get("vm_name") or ""),
+                    **options,
+                )
                 progress["phase"] = "mount"
                 self.store.save_progress(job.id, progress)
                 phase = "mount"
@@ -924,6 +949,9 @@ class RelayWorker(threading.Thread):
                     progress["install"] = guest_tools.windows_install(address, username, secret, **options)
                 except PermanentError:
                     adapter.restore_tools_media(vm_id, dict(progress.get("original_media") or {}))
+                    progress.pop("original_media", None)
+                    progress["phase"] = "mount"
+                    self.store.save_progress(job.id, progress)
                     raise
                 progress["phase"] = "verify"
                 self.store.save_progress(job.id, progress)

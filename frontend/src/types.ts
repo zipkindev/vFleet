@@ -130,6 +130,7 @@ export type VirtualMachine = {
   tools_status: string;
   tools_installer_mounted: boolean;
   ip_address: string | null;
+  mac_addresses: string[];
   boot_time: string | null;
   last_activity: string | null;
   last_activity_source: string;
