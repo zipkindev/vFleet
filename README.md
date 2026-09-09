@@ -1,8 +1,19 @@
 # vFleet
 
-A local web console for **your** vCenter or standalone ESXi host: inventory clusters/hosts/VMs, group labs by naming convention, report resource use by owner, and run guarded operator workflows.
+A local web console and CLI for VMware vCenter and standalone ESXi: browse inventory, monitor resource use, and manage VM, host, and datastore workflows through a persistent local job queue.
 
 This talks only to endpoints you configure. UI-saved credentials live in vFleet's portable encrypted JSON vault; `.env` is retained as an explicit bootstrap option. It is an operator tool, not a scanner for systems you do not administer.
+
+## Highlights
+
+- Browse clusters, hosts, VMs, and datastores; group labs by owner and export resource reports.
+- Monitor CPU, memory, and storage with historical charts and host/datastore filters.
+- Review single or bulk VM hardware changes, power actions, migrations, and disk conversions before execution.
+- Deploy VMware Tools to Windows, Linux, and pfSense guests using encrypted saved credentials and optional SSH jump hosts.
+- Review storage cleanup candidates and reclaim idle labs with explicit confirmations.
+- Keep cached inventory and persistent jobs locally for interrupted VPN connections; try the included demo without a VMware endpoint.
+
+Built with FastAPI, React, TypeScript, SQLite, and pyVmomi. See the [changelog](CHANGELOG.md) for release history.
 
 ## What is possible
 
@@ -70,7 +81,7 @@ Use **Machines → Reconcile storage** for one or more selected VMs, or **Datast
 
 - **Guest last login / “who is using this desktop”** is not collected. The Automation Vault and Tools deployment are explicit opt-in guest access; vFleet does not scan guest accounts or retain command output containing secrets.
 - **vSphere Tags** are a separate tagging service. v1 reads **custom fields** and the **VM name prefix**. Tags can be added if you use them for owner.
-- Historical charts (p95 over 7 days) would use `PerformanceManager`; v1 uses live quickStats plus event recency, which is enough to triage labs.
+- Monitoring retains up to 14 days of samples locally and requests available history from vSphere `PerformanceManager` (up to 14 days for vCenter; one day for direct ESXi). Actual coverage depends on the endpoint's available statistics and how long vFleet has collected samples. Demo history is synthetic.
 - Power actions are **dangerous**. The UI requires an explicit confirm. Default bind is `127.0.0.1`. Optional `UI_TOKEN` gates the API.
 
 ## Local relay (flaky VPN)
@@ -86,10 +97,16 @@ Set `DATA_DIR` if you want the SQLite file and staging directory somewhere other
 
 ## Quick start (demo, no vCenter)
 
+Install Git, Python 3 with `venv` and `pip`, and Node.js with npm. The launch scripts require Bash and install the backend and frontend dependencies locally.
+
 ```bash
+git clone https://github.com/VonZippySays/vFleet.git
+cd vFleet
 chmod +x scripts/dev.sh scripts/run.sh
 ./scripts/dev.sh
 ```
+
+The repository is private, so cloning requires a GitHub account with access and Git authentication. If you already have a local checkout, run the launch commands from that directory.
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a lab cluster with user-prefixed VM names so grouping and reclaim can be clicked through immediately.
 
