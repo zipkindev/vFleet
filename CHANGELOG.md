@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.2] — 2026-09-12
+
+- Expand the README with a page-by-page feature guide, architecture diagram, request and job lifecycles, local storage and security boundaries, configuration reference, source map, validation instructions, and troubleshooting.
+- Integrate the assisted ESXi upgrade/recovery workflow and its architecture with links to the upgrade runbook.
+- Clarify direct API/adapter calls, retry and recovery limits, reclaim scoring, and the CLI/launcher port defaults.
+
 ## [1.2.1] — 2026-08-31
 
 feat: automate VMware Tools deployment
