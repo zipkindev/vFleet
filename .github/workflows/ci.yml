@@ -75,6 +75,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes build-essential curl file wget libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+      - name: Prepare sidecar placeholder for static analysis
+        run: |
+          mkdir -p src-tauri/binaries
+          install -m 755 /dev/null src-tauri/binaries/vfleet-backend-x86_64-unknown-linux-gnu
       - name: Check and test desktop shell
         working-directory: src-tauri
         run: |
