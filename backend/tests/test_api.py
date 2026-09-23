@@ -18,12 +18,12 @@ def test_inventory_groups_and_reclaim():
         assert response.status_code == 200
         payload = response.json()
         owners = {row["owner_key"] for row in payload["owners"]}
-        assert "mzipkin" in owners
-        assert "jdoe" in owners
+        assert "atlasdemo" in owners
+        assert "novademo" in owners
         assert any(vm["idle_score"] >= 40 and vm["power_state"] == "POWERED_ON" for vm in payload["vms"])
-        mzipkin = next(row for row in payload["owners"] if row["owner_key"] == "mzipkin")
-        assert mzipkin["vm_count"] >= 3
-        assert mzipkin["powered_on"] + mzipkin["powered_off"] + mzipkin["suspended"] == mzipkin["vm_count"]
+        atlasdemo = next(row for row in payload["owners"] if row["owner_key"] == "atlasdemo")
+        assert atlasdemo["vm_count"] >= 3
+        assert atlasdemo["powered_on"] + atlasdemo["powered_off"] + atlasdemo["suspended"] == atlasdemo["vm_count"]
         sample = next(vm for vm in payload["vms"] if vm["id"] == "vm-104")
         assert sample["storage_provisioned_bytes"] > 0
         assert sample["disk_provisioning"] in {"thin", "thick", "mixed"}
@@ -32,12 +32,12 @@ def test_inventory_groups_and_reclaim():
 
 def test_inventory_owner_filter_matches_deployed_by():
     with TestClient(app) as client:
-        response = client.get("/api/inventory", params={"owner": "pbogar"})
+        response = client.get("/api/inventory", params={"owner": "emberdemo"})
         assert response.status_code == 200
         payload = response.json()
         assert payload["vms"]
         assert all(
-            vm["deployed_by"] == "pbogar" or vm["owner_key"] == "pbogar" for vm in payload["vms"]
+            vm["deployed_by"] == "emberdemo" or vm["owner_key"] == "emberdemo" for vm in payload["vms"]
         )
         assert any(vm["owner_key"] == "windows" for vm in payload["vms"])
 

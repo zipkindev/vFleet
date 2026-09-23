@@ -16,7 +16,7 @@ from .adapters import build_adapter
 from .adapters.base import InventoryAdapter
 from .adapters.demo import DemoAdapter
 from .adapters.vcenter import VCenterAdapter
-from .config import settings
+from .config import ROOT, settings
 from .credential_vault import CredentialVault
 from .automation_vault import AutomationCredential, AutomationCredentialStore
 from .models import (
@@ -95,7 +95,7 @@ from .storage_reconciliation import build_storage_reconciliation
 from .errors import PermanentError
 from .vm_hardware import build_vm_hardware_plan, validate_hardware_request
 
-FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "mount_tools", "destroy"}
 
 
@@ -375,7 +375,7 @@ async def lifespan(app: FastAPI):
         store.close()
 
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 
 app = FastAPI(title="vFleet", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
@@ -421,7 +421,7 @@ def version() -> dict:
 
 @app.get("/api/changelog")
 def changelog() -> dict:
-    changelog_path = Path(__file__).resolve().parents[2] / "CHANGELOG.md"
+    changelog_path = ROOT / "CHANGELOG.md"
     try:
         text = changelog_path.read_text(encoding="utf-8")
     except FileNotFoundError:

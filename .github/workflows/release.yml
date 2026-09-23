@@ -1,0 +1,317 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (for example v1.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Verify tag and synchronized versions
+        run: |
+          python scripts/check-version.py
+          python -c "import os,pathlib,re; v=pathlib.Path('VERSION').read_text().strip(); tag=os.environ['RELEASE_TAG']; assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag), tag; assert tag == 'v' + v, (tag, v)"
+      - name: Install and audit Python dependencies
+        run: |
+          python -m pip install -r backend/requirements-dev.txt
+          python -m pip_audit -r backend/requirements-dev.txt
+      - name: Run backend suite
+        working-directory: backend
+        run: python -m pytest -q
+      - name: Audit Rust dependencies
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file src-tauri/Cargo.lock
+      - name: Typecheck, build, and audit JavaScript
+        run: |
+          npm ci
+          npm ci --prefix frontend
+          npm run typecheck --prefix frontend
+          npm run build --prefix frontend
+          npm audit --audit-level=high
+          npm audit --prefix frontend --audit-level=high
+
+  container-smoke:
+    name: Validate release container
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Resolve release source
+        id: source
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build release image locally
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: vfleet:release-smoke
+          build-args: |
+            VERSION=${{ steps.source.outputs.version }}
+            VCS_REF=${{ steps.source.outputs.sha }}
+      - name: Scan image for vulnerabilities and secrets
+        run: |
+          docker run --rm --volume /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 \
+            image --image-src docker --scanners vuln,secret \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 vfleet:release-smoke
+      - name: Require a non-empty UI token
+        run: |
+          set +e
+          docker run --rm vfleet:release-smoke > /tmp/vfleet-no-token.log 2>&1
+          status=$?
+          set -e
+          test "$status" = 64
+      - name: Generate container smoke token
+        shell: bash
+        run: echo "SMOKE_UI_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      - name: Smoke hardened runtime
+        run: |
+          docker volume create vfleet-release-data
+          docker volume create vfleet-release-key
+          docker run --detach --name vfleet-release \
+            --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m \
+            --mount source=vfleet-release-data,target=/var/lib/vfleet \
+            --mount source=vfleet-release-key,target=/var/lib/vfleet-key \
+            --publish 127.0.0.1:18080:8080 \
+            --env APP_MODE=demo --env UI_TOKEN="$SMOKE_UI_TOKEN" \
+            vfleet:release-smoke
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18080/api/health > /dev/null; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/api/inventory)" = 401
+          curl --fail --silent --header "X-UI-Token: $SMOKE_UI_TOKEN" http://127.0.0.1:18080/api/inventory > /dev/null
+          test "$(docker inspect vfleet-release --format '{{.Config.User}}')" = 10001:10001
+          test "$(docker inspect vfleet-release --format '{{.HostConfig.ReadonlyRootfs}}')" = true
+          test "$(docker inspect vfleet-release --format '{{json .HostConfig.CapDrop}}')" = '["ALL"]'
+          test "$(docker inspect vfleet-release --format '{{.HostConfig.PidsLimit}}')" = 256
+          test "$(docker inspect vfleet-release --format '{{json .HostConfig.SecurityOpt}}')" = '["no-new-privileges"]'
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs vfleet-release || true
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm --force vfleet-release || true
+          docker volume rm vfleet-release-data vfleet-release-key || true
+
+  desktop:
+    name: Build ${{ matrix.artifact }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: linux-x86_64
+            bundles: deb,rpm
+          - runner: windows-2025
+            artifact: windows-x86_64
+            bundles: nsis,msi
+          - runner: macos-15
+            artifact: macos-aarch64
+            bundles: dmg
+          - runner: macos-15-intel
+            artifact: macos-x86_64
+            bundles: dmg
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file wget libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+      - name: Install build dependencies
+        run: |
+          python -m pip install -r backend/requirements-dev.txt
+          npm ci
+          npm ci --prefix frontend
+      - name: Build and smoke sidecar
+        run: |
+          npm run build --prefix frontend
+          python scripts/build-sidecar.py
+          python scripts/smoke-sidecar.py
+      - name: Build and collect native packages
+        run: |
+          npm run desktop:build -- --bundles ${{ matrix.bundles }}
+          python scripts/collect-desktop-artifacts.py --platform ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.artifact }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-container:
+    name: Publish multi-architecture container
+    needs: [validate, container-smoke, desktop]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Require public repository before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: test "$(gh api repos/${GITHUB_REPOSITORY} --jq .visibility)" = public
+      - name: Compute image tags
+        id: image
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          minor="${version%.*}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vfleet:$version,ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vfleet:$minor,ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vfleet:latest" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish linux/amd64 and linux/arm64 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+            VCS_REF=${{ steps.image.outputs.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Verify anonymous pull
+        run: |
+          docker logout ghcr.io
+          for attempt in $(seq 1 6); do
+            if docker pull "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vfleet:${{ steps.image.outputs.version }}"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [publish-container, desktop]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Verify expected platform packages
+        run: |
+          find release-artifacts -type f -name 'macos-aarch64-*.dmg' -print -quit | grep .
+          find release-artifacts -type f -name 'macos-x86_64-*.dmg' -print -quit | grep .
+          find release-artifacts -type f -name 'windows-x86_64-*.msi' -print -quit | grep .
+          find release-artifacts -type f -name 'windows-x86_64-*.exe' -print -quit | grep .
+          find release-artifacts -type f -name 'linux-x86_64-*.deb' -print -quit | grep .
+          find release-artifacts -type f -name 'linux-x86_64-*.rpm' -print -quit | grep .
+      - name: Create SHA-256 manifest
+        working-directory: release-artifacts
+        run: find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - name: Create or update draft release, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true || {
+              echo "Refusing to replace assets on an already-published release." >&2
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" release-artifacts/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-artifacts/* \
+              --verify-tag \
+              --draft \
+              --title "vFleet $version" \
+              --notes-file docs/RELEASE_NOTES.md
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest

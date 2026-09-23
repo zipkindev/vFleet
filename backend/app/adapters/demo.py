@@ -318,7 +318,7 @@ class DemoAdapter(InventoryAdapter):
             uptime_seconds=12 * 86400,
             current_time=NOW,
             ntp_servers=list(self._ntp_servers),
-            dns_servers=["10.20.0.10"],
+            dns_servers=["203.0.113.53"],
             search_domains=["lab.local"],
             hostname=host.name.split(".")[0],
             domain_name="lab.local",
@@ -965,27 +965,27 @@ class DemoAdapter(InventoryAdapter):
 
         rows = [
             # id, name, power, cpus, mem, cpu_mhz, cpu_pct, mem_used, mem_pct, host, guest, tools, ip, boot_days, activity_days, field_name, field_value, deployed_by
-            ("vm-101", "mzipkin-win11-lab", "POWERED_ON", 4, 16384, 2100, 42, 9200, 56, "host-esx01", "windows2019Guest", "toolsOk", "10.12.4.21", 2, 0.4, "Owner", "mzipkin", ""),
-            ("vm-102", "mzipkin-ubuntu-dev", "POWERED_ON", 2, 8192, 380, 8, 2100, 26, "host-esx01", "ubuntu64Guest", "toolsOk", "10.12.4.22", 18, 16, "Owner", "mzipkin", ""),
-            ("vm-103", "mzipkin-k8s-cp", "POWERED_OFF", 4, 8192, 0, 0, 0, 0, "host-esx02", "ubuntu64Guest", "toolsNotRunning", None, None, 40, "Owner", "mzipkin", ""),
-            ("vm-104", "mzipkin-win-sql", "POWERED_ON", 8, 32768, 420, 3, 1800, 5, "host-esx02", "windows2019Guest", "toolsOk", "10.12.4.40", 47, 45, "Owner", "mzipkin", ""),
-            ("vm-201", "jdoe-rhel-lab01", "POWERED_ON", 4, 16384, 6400, 78, 11000, 67, "host-esx01", "rhel9_64Guest", "toolsOk", "10.12.5.11", 1, 0.2, "", "", "CORP\\jdoe"),
-            ("vm-202", "jdoe-rhel-lab02", "POWERED_ON", 4, 16384, 120, 2, 900, 5, "host-esx03", "rhel9_64Guest", "toolsOk", "10.12.5.12", 22, 21, "", "", "CORP\\jdoe"),
-            ("vm-203", "jdoe-win11-test", "SUSPENDED", 2, 8192, 0, 0, 0, 0, "host-esx03", "windows9_64Guest", "toolsNotRunning", None, 9, 9, "", "", "CORP\\jdoe"),
-            ("vm-301", "achen-ml-gpu01", "POWERED_ON", 16, 65536, 9800, 31, 42000, 64, "host-esx10", "ubuntu64Guest", "toolsOk", "10.20.1.8", 3, 1.1, "User", "achen", ""),
-            ("vm-302", "achen-ml-gpu02", "POWERED_ON", 16, 65536, 400, 1, 2400, 4, "host-esx10", "ubuntu64Guest", "toolsOk", "10.20.1.9", 61, 58, "User", "achen", ""),
-            ("vm-303", "achen-notebook", "POWERED_OFF", 4, 16384, 0, 0, 0, 0, "host-esx11", "ubuntu64Guest", "toolsNotRunning", None, None, 12, "User", "achen", ""),
-            ("vm-401", "rpatel-ad-dc01", "POWERED_ON", 2, 4096, 520, 14, 1800, 44, "host-esx11", "windows2019Guest", "toolsOk", "10.20.8.10", 4, 1, "", "", "rpatel"),
-            ("vm-402", "rpatel-ad-dc02", "POWERED_ON", 2, 4096, 80, 2, 700, 17, "host-esx11", "windows2019Guest", "toolsOk", "10.20.8.11", 4, 3, "", "", "rpatel"),
-            ("vm-403", "rpatel-win11-jump", "POWERED_ON", 2, 8192, 90, 3, 1100, 13, "host-esx02", "windows9_64Guest", "toolsOk", "10.12.8.50", 29, 27, "", "", "rpatel"),
-            ("vm-551", "windows-lab-shared", "POWERED_ON", 4, 16384, 800, 8, 4200, 26, "host-esx01", "windows9_64Guest", "toolsOk", "10.12.8.90", 6, 5, "", "", "pbogar"),
-            ("vm-552", "vm-debug-analyzer", "POWERED_ON", 2, 8192, 220, 4, 1600, 19, "host-esx02", "ubuntu64Guest", "toolsOk", "10.12.8.91", 2, 1, "", "", "skakade"),
-            ("vm-601", "shared-nexus-proxy", "POWERED_ON", 4, 8192, 2100, 28, 4300, 52, "host-esx10", "ubuntu64Guest", "toolsOk", "10.20.0.15", 0.5, 0.1, "Owner", "platform", ""),
-            ("vm-602", "shared-dns01", "POWERED_ON", 2, 2048, 180, 6, 700, 34, "host-esx11", "ubuntu64Guest", "toolsOk", "10.20.0.10", 0.8, 0.2, "Owner", "platform", ""),
-            ("vm-701", "kwong-kali-lab", "POWERED_ON", 2, 8192, 60, 2, 600, 7, "host-esx02", "ubuntu64Guest", "toolsOk", "10.12.9.70", 38, 37, "", "", "kwong"),
-            ("vm-702", "kwong-win-lab", "POWERED_ON", 4, 16384, 110, 2, 800, 5, "host-esx01", "windows9_64Guest", "toolsNotRunning", None, 51, 51, "", "", "kwong"),
-            ("vm-801", "slee-ubuntu-course", "POWERED_OFF", 2, 4096, 0, 0, 0, 0, "host-esx03", "ubuntu64Guest", "toolsNotRunning", None, None, 8, "", "", "slee"),
-            ("vm-802", "slee-docker-lab", "POWERED_ON", 8, 32768, 240, 2, 1500, 5, "host-esx02", "ubuntu64Guest", "toolsOk", "10.12.9.81", 19, 19, "", "", "slee"),
+            ("vm-101", "atlasdemo-win11-lab", "POWERED_ON", 4, 16384, 2100, 42, 9200, 56, "host-esx01", "windows2019Guest", "toolsOk", "192.0.2.21", 2, 0.4, "Owner", "atlasdemo", ""),
+            ("vm-102", "atlasdemo-ubuntu-dev", "POWERED_ON", 2, 8192, 380, 8, 2100, 26, "host-esx01", "ubuntu64Guest", "toolsOk", "192.0.2.22", 18, 16, "Owner", "atlasdemo", ""),
+            ("vm-103", "atlasdemo-k8s-cp", "POWERED_OFF", 4, 8192, 0, 0, 0, 0, "host-esx02", "ubuntu64Guest", "toolsNotRunning", None, None, 40, "Owner", "atlasdemo", ""),
+            ("vm-104", "atlasdemo-win-sql", "POWERED_ON", 8, 32768, 420, 3, 1800, 5, "host-esx02", "windows2019Guest", "toolsOk", "192.0.2.40", 47, 45, "Owner", "atlasdemo", ""),
+            ("vm-201", "novademo-rhel-lab01", "POWERED_ON", 4, 16384, 6400, 78, 11000, 67, "host-esx01", "rhel9_64Guest", "toolsOk", "192.0.2.51", 1, 0.2, "", "", "EXAMPLE\\novademo"),
+            ("vm-202", "novademo-rhel-lab02", "POWERED_ON", 4, 16384, 120, 2, 900, 5, "host-esx03", "rhel9_64Guest", "toolsOk", "192.0.2.52", 22, 21, "", "", "EXAMPLE\\novademo"),
+            ("vm-203", "novademo-win11-test", "SUSPENDED", 2, 8192, 0, 0, 0, 0, "host-esx03", "windows9_64Guest", "toolsNotRunning", None, 9, 9, "", "", "EXAMPLE\\novademo"),
+            ("vm-301", "oriondemo-ml-gpu01", "POWERED_ON", 16, 65536, 9800, 31, 42000, 64, "host-esx10", "ubuntu64Guest", "toolsOk", "198.51.100.8", 3, 1.1, "User", "oriondemo", ""),
+            ("vm-302", "oriondemo-ml-gpu02", "POWERED_ON", 16, 65536, 400, 1, 2400, 4, "host-esx10", "ubuntu64Guest", "toolsOk", "198.51.100.9", 61, 58, "User", "oriondemo", ""),
+            ("vm-303", "oriondemo-notebook", "POWERED_OFF", 4, 16384, 0, 0, 0, 0, "host-esx11", "ubuntu64Guest", "toolsNotRunning", None, None, 12, "User", "oriondemo", ""),
+            ("vm-401", "lumendemo-ad-dc01", "POWERED_ON", 2, 4096, 520, 14, 1800, 44, "host-esx11", "windows2019Guest", "toolsOk", "198.51.100.10", 4, 1, "", "", "lumendemo"),
+            ("vm-402", "lumendemo-ad-dc02", "POWERED_ON", 2, 4096, 80, 2, 700, 17, "host-esx11", "windows2019Guest", "toolsOk", "198.51.100.11", 4, 3, "", "", "lumendemo"),
+            ("vm-403", "lumendemo-win11-jump", "POWERED_ON", 2, 8192, 90, 3, 1100, 13, "host-esx02", "windows9_64Guest", "toolsOk", "198.51.100.50", 29, 27, "", "", "lumendemo"),
+            ("vm-551", "windows-lab-shared", "POWERED_ON", 4, 16384, 800, 8, 4200, 26, "host-esx01", "windows9_64Guest", "toolsOk", "192.0.2.90", 6, 5, "", "", "emberdemo"),
+            ("vm-552", "vm-debug-analyzer", "POWERED_ON", 2, 8192, 220, 4, 1600, 19, "host-esx02", "ubuntu64Guest", "toolsOk", "192.0.2.91", 2, 1, "", "", "quasardemo"),
+            ("vm-601", "shared-nexus-proxy", "POWERED_ON", 4, 8192, 2100, 28, 4300, 52, "host-esx10", "ubuntu64Guest", "toolsOk", "203.0.113.15", 0.5, 0.1, "Owner", "platform", ""),
+            ("vm-602", "shared-dns01", "POWERED_ON", 2, 2048, 180, 6, 700, 34, "host-esx11", "ubuntu64Guest", "toolsOk", "203.0.113.53", 0.8, 0.2, "Owner", "platform", ""),
+            ("vm-701", "zephyrdemo-kali-lab", "POWERED_ON", 2, 8192, 60, 2, 600, 7, "host-esx02", "ubuntu64Guest", "toolsOk", "192.0.2.70", 38, 37, "", "", "zephyrdemo"),
+            ("vm-702", "zephyrdemo-win-lab", "POWERED_ON", 4, 16384, 110, 2, 800, 5, "host-esx01", "windows9_64Guest", "toolsNotRunning", None, 51, 51, "", "", "zephyrdemo"),
+            ("vm-801", "solsticedemo-ubuntu-course", "POWERED_OFF", 2, 4096, 0, 0, 0, 0, "host-esx03", "ubuntu64Guest", "toolsNotRunning", None, None, 8, "", "", "solsticedemo"),
+            ("vm-802", "solsticedemo-docker-lab", "POWERED_ON", 8, 32768, 240, 2, 1500, 5, "host-esx02", "ubuntu64Guest", "toolsOk", "192.0.2.81", 19, 19, "", "", "solsticedemo"),
         ]
 
         host_by_id = {host.id: host for host in hosts}
@@ -1069,7 +1069,7 @@ class DemoAdapter(InventoryAdapter):
             used, provisioned, provisioning = _demo_storage(vm_id, cpus, guest)
             if host.cluster_id == "cluster-shared":
                 folder = support
-            elif owner.startswith("slee") or owner.startswith("kwong"):
+            elif owner.startswith("solsticedemo") or owner.startswith("zephyrdemo"):
                 folder = training
             else:
                 folder = playground
@@ -1188,7 +1188,7 @@ class DemoAdapter(InventoryAdapter):
                 DatastoreFile(name="vmtools.iso", path="tools/vmtools.iso", size=156_237_824, kind="iso"),
             ],
             "ds-lab": [
-                DatastoreFile(name="mzipkin-win11-lab", path="mzipkin-win11-lab", is_directory=True, kind="folder"),
+                DatastoreFile(name="atlasdemo-win11-lab", path="atlasdemo-win11-lab", is_directory=True, kind="folder"),
                 DatastoreFile(name="uploads", path="uploads", is_directory=True, kind="folder"),
             ],
             "ds-nfs": [

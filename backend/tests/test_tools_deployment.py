@@ -86,7 +86,7 @@ def test_pfsense_tools_job_uses_root_ssh_through_pinned_jump(tmp_path, monkeypat
     jump_credential = worker.automation_credentials.save(
         name="jump host",
         kind="ssh",
-        username="mzipkin.wa",
+        username="jump.operator",
         secret="jump-secret",
         scope="global",
         endpoint_fingerprint="",
@@ -116,7 +116,7 @@ def test_pfsense_tools_job_uses_root_ssh_through_pinned_jump(tmp_path, monkeypat
     result = worker._deploy_guest_tools(job, adapter, {})
 
     assert result["os_family"] == "pfsense"
-    assert captured["preflight_jump"]["username"] == "mzipkin.wa"
+    assert captured["preflight_jump"]["username"] == "jump.operator"
     assert captured["install_jump"]["host_key_sha256"] == "SHA256:jump"
     assert "secret" not in str(job.payload)
     assert "jump-secret" not in str(job.payload)

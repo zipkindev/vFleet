@@ -18,8 +18,8 @@ export const PALETTE_LABELS: Record<Palette, string> = {
 };
 
 export const VOICE_LABELS: Record<Voice, string> = {
-  outfit:  "Outfit",
-  inter:   "Inter",
+  outfit:  "Humanist",
+  inter:   "System",
   compact: "Compact",
   rounded: "Rounded",
   mono:    "Terminal",

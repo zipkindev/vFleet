@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import re
 import subprocess
 import sys
@@ -77,6 +78,31 @@ def sync_version_files(old: str, new: str, dry_run: bool) -> list[Path]:
             r'(APP_VERSION\s*=\s*")[^"]+(")',
             rf'\g<1>{new}\2',
         ),
+        (
+            REPO_ROOT / "package.json",
+            r'("version"\s*:\s*")[^"]+(")',
+            rf'\g<1>{new}\2',
+        ),
+        (
+            REPO_ROOT / "pyproject.toml",
+            r'(?m)^(version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new}\2',
+        ),
+        (
+            REPO_ROOT / "src-tauri" / "Cargo.toml",
+            r'(?m)^(version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new}\2',
+        ),
+        (
+            REPO_ROOT / "src-tauri" / "Cargo.lock",
+            r'(?ms)(\[\[package\]\]\s+name\s*=\s*"vfleet"\s+version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new}\2',
+        ),
+        (
+            REPO_ROOT / "src-tauri" / "tauri.conf.json",
+            r'("version"\s*:\s*")[^"]+(")',
+            rf'\g<1>{new}\2',
+        ),
     ]
 
     for path, pattern, replacement in targets:
@@ -85,6 +111,23 @@ def sync_version_files(old: str, new: str, dry_run: bool) -> list[Path]:
             continue
         label = "would update" if dry_run else "updated"
         if _replace_in_file(path, pattern, replacement, dry_run):
+            print(f"  {label}: {path.relative_to(REPO_ROOT)}")
+            changed.append(path)
+
+    for path in (REPO_ROOT / "frontend" / "package-lock.json", REPO_ROOT / "package-lock.json"):
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        before = json.dumps(payload, sort_keys=True)
+        payload["version"] = new
+        root_package = payload.get("packages", {}).get("")
+        if isinstance(root_package, dict):
+            root_package["version"] = new
+        after = json.dumps(payload, sort_keys=True)
+        if before != after:
+            label = "would update" if dry_run else "updated"
+            if not dry_run:
+                path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
             print(f"  {label}: {path.relative_to(REPO_ROOT)}")
             changed.append(path)
 

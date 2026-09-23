@@ -1,0 +1,14 @@
+{
+  "name": "vfleet-desktop",
+  "private": true,
+  "version": "1.3.0",
+  "description": "Native desktop shell for the vFleet VMware operator console",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "tauri": "tauri",
+    "desktop:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5"
+  }
+}

@@ -13,8 +13,8 @@
   --warm: #e3b15a;
   --hot: #e26a4e;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
-  --font: Outfit, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
   --radius-pill: 999px;
 }
 
@@ -64,20 +64,20 @@
 
 /* ── Voices (typography) ── */
 [data-voice="outfit"] {
-  --font: Outfit, "Segoe UI", sans-serif;
+  --font: "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
 }
 [data-voice="inter"] {
-  --font: Inter, "Segoe UI", system-ui, sans-serif;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 [data-voice="compact"] {
   --font: "Segoe UI", system-ui, sans-serif;
   font-size: 13px;
 }
 [data-voice="rounded"] {
-  --font: Nunito, "Segoe UI", system-ui, sans-serif;
+  --font: "Arial Rounded MT Bold", "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
 }
 [data-voice="mono"] {
-  --font: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --font: var(--font-mono);
   font-size: 13px;
 }
 
@@ -1412,7 +1412,7 @@ tr.nested td:first-child {
   display: grid;
   place-items: center;
   font-style: normal;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 
@@ -1534,7 +1534,7 @@ tr.nested td:first-child {
 
 .score,
 .owner-list b {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .reason {
@@ -1944,7 +1944,7 @@ tr.clickable:hover td {
 }
 
 .changelog-body code {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   background: rgba(214, 242, 97, 0.1);
   color: var(--accent);

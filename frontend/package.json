@@ -1,7 +1,14 @@
 {
   "name": "vfleet-ui",
   "private": true,
-  "version": "1.2.2",
+  "version": "1.3.0",
+  "description": "React interface for the vFleet VMware operator console",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/zipkindev/vFleet",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zipkindev/vFleet.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,8 +24,8 @@
   "devDependencies": {
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^5.2.0",
     "typescript": "^5.7.3",
-    "vite": "^5.4.14"
+    "vite": "^7.3.6"
   }
 }
