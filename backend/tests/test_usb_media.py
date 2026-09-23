@@ -55,6 +55,28 @@ def test_usb_inventory_allows_only_stable_non_system_usb(monkeypatch):
     assert "system" in inventory["devices"][1]["blocked_reason"].lower()
 
 
+def test_usb_inventory_explains_container_limitation(monkeypatch):
+    monkeypatch.setenv("VFLEET_RUNTIME", "container")
+    monkeypatch.setattr(usb_media.shutil, "which", lambda _name: None)
+
+    inventory = usb_media.list_usb_devices()
+
+    assert inventory["supported"] is False
+    assert "container image" in inventory["message"]
+    assert "Windows application" in inventory["message"]
+
+
+def test_usb_inventory_rejects_non_windows_even_if_powershell_is_on_path(monkeypatch):
+    monkeypatch.delenv("VFLEET_RUNTIME", raising=False)
+    monkeypatch.setattr(usb_media.sys, "platform", "linux")
+    monkeypatch.setattr(usb_media.shutil, "which", lambda _name: "/mnt/c/powershell.exe")
+
+    inventory = usb_media.list_usb_devices()
+
+    assert inventory["supported"] is False
+    assert "Linux desktop application" in inventory["message"]
+
+
 def test_usb_write_requires_typed_confirmation_and_exact_rescan_identity(monkeypatch, tmp_path):
     plan_id = uuid4()
     plan = {

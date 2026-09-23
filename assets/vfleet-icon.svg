@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">vFleet</title>
+  <desc id="desc">A teal letter V connecting three infrastructure nodes on a navy field.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10243d"/>
+      <stop offset="1" stop-color="#07101d"/>
+    </linearGradient>
+    <linearGradient id="v" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7cf2d7"/>
+      <stop offset="1" stop-color="#2bb8da"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M111 135h73l72 190 72-190h73L292 390h-72z" fill="url(#v)"/>
+  <g fill="#eaf7ff" stroke="#2bb8da" stroke-width="12">
+    <circle cx="111" cy="135" r="29"/>
+    <circle cx="401" cy="135" r="29"/>
+    <circle cx="256" cy="390" r="29"/>
+  </g>
+  <path d="M111 135h73M328 135h73M256 325v65" fill="none" stroke="#94a9c0" stroke-width="10" stroke-linecap="round" opacity=".7"/>
+</svg>

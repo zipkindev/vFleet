@@ -1,11 +1,18 @@
 # vFleet
 
-A local web console and CLI for VMware vCenter and standalone ESXi: browse inventory, monitor resource use, and manage VM, host, and datastore workflows through a persistent local job queue.
+[![CI](https://github.com/zipkindev/vFleet/actions/workflows/ci.yml/badge.svg)](https://github.com/zipkindev/vFleet/actions/workflows/ci.yml)
+[![Release](https://github.com/zipkindev/vFleet/actions/workflows/release.yml/badge.svg)](https://github.com/zipkindev/vFleet/actions/workflows/release.yml)
+[![CodeQL](https://github.com/zipkindev/vFleet/actions/workflows/codeql.yml/badge.svg)](https://github.com/zipkindev/vFleet/actions/workflows/codeql.yml)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-2b8a78.svg)](LICENSE)
+
+A local-first desktop, web, container, and CLI console for VMware vCenter and standalone ESXi: browse inventory, monitor resource use, and manage VM, host, and datastore workflows through a persistent local job queue.
 
 This talks only to endpoints you configure. UI-saved credentials live in vFleet's portable encrypted JSON vault; `.env` is retained as an explicit bootstrap option. It is an operator tool, not a scanner for systems you do not administer.
 
 ## Contents
 
+- [Install the desktop app or container](#install)
+- [Engineering highlights](#engineering-highlights)
 - [Interface and everyday workflows](#interface-and-everyday-workflows)
 - [Feature reference](#what-is-possible)
 - [Standalone ESXi](#standalone-esxi-mode) and [assisted upgrades](#assisted-esxi-host-upgrades)
@@ -18,7 +25,7 @@ This talks only to endpoints you configure. UI-saved credentials live in vFleet'
 - [Saved connections](#manage-connections-from-the-ui)
 - [Environment bootstrap](#connect-your-vcenter-via-env)
 - [CLI](#cli-automation)
-- [Single-port deployment](#production-style-single-port)
+- [Source single-port deployment](#source-based-single-port)
 - [Configuration](#configuration-reference)
 - [Ownership](#naming-convention) and [reclaim scoring](#reclaim-heuristics)
 - [Source layout](#layout), [validation](#tests), and [troubleshooting](#troubleshooting)
@@ -31,8 +38,36 @@ This talks only to endpoints you configure. UI-saved credentials live in vFleet'
 - Deploy VMware Tools to Windows, Linux, and pfSense guests using encrypted saved credentials and optional SSH jump hosts.
 - Review storage cleanup candidates and reclaim idle labs with explicit confirmations.
 - Keep cached inventory and persistent jobs locally for interrupted VPN connections; try the included demo without a VMware endpoint.
+- Run the same modular monolith as a native Windows/macOS/Linux application or as a hardened amd64/arm64 container.
 
-Built with FastAPI, React, TypeScript, SQLite, and pyVmomi. See the [changelog](CHANGELOG.md) for release history.
+Built with FastAPI, React, TypeScript, SQLite, pyVmomi, PyInstaller, and Tauri v2. See the [changelog](CHANGELOG.md) for release history.
+
+![vFleet demo overview](docs/assets/vfleet-overview.png)
+
+## Install
+
+Download the current Windows NSIS (`.exe`) or MSI installer, macOS DMG, or Linux DEB/RPM from [GitHub Releases](https://github.com/zipkindev/vFleet/releases/latest). The initial native artifacts are unsigned and macOS builds are not notarized, so verify `SHA256SUMS` and read the platform warning in [Packaging and installation](docs/PACKAGING.md) before using an operating-system override.
+
+Desktop data remains outside the application so upgrades do not replace it: `%LOCALAPPDATA%\vFleet` on Windows, `~/Library/Application Support/vFleet` on macOS, and `${XDG_DATA_HOME:-~/.local/share}/vfleet` on Linux. The bundled backend listens only on an ephemeral loopback port.
+
+The multi-architecture Linux container is published as `ghcr.io/zipkindev/vfleet` for Docker Engine on Linux and Docker Desktop's Linux-container runtime on Windows or macOS. The checked-in Compose file requires a UI token, exposes only `127.0.0.1`, runs one non-root worker with all capabilities dropped, and keeps data and its credential key on separate volumes:
+
+```bash
+export UI_TOKEN='generate-a-long-random-value'
+docker compose up -d
+```
+
+See [Packaging](docs/PACKAGING.md), [Updates](docs/UPDATES.md), and [Backup/restore](docs/BACKUP_RESTORE.md) for operational details. USB installer writing remains a Windows-native feature; macOS, Linux, and container builds report it unavailable.
+
+## Engineering highlights
+
+- **Durable control plane:** SQLite-backed endpoint-bound jobs retain retry progress, idempotency keys, cached inventory, and vCenter task IDs so interrupted VPN sessions can recover without moving remote work into request handlers.
+- **Guarded infrastructure changes:** destructive actions keep explicit confirmations, fresh-plan validation, least-privilege checks, endpoint fingerprints, and fail-closed state transitions.
+- **Credential isolation:** vSphere and guest secrets are individually encrypted with AES-256-GCM; non-secret profile metadata is portable while the master key stays outside the data directory.
+- **Cross-platform delivery:** matching-OS CI builds a PyInstaller FastAPI sidecar and Tauri v2 shell for Windows, both macOS architectures, and Linux, plus a non-root multi-architecture OCI image with health/auth/hardening smoke tests and a vulnerability/secret scan.
+- **Recovery-oriented operations:** the relay reattaches supported VMware tasks, preserves conversion sources until validation, and persists ESXi upgrade reservations and restoration evidence.
+
+![vFleet demo machines and guarded actions](docs/assets/vfleet-machines.png)
 
 ## Interface and everyday workflows
 
@@ -77,7 +112,7 @@ Capabilities reported by the endpoint drive which actions are available. A visib
 | Create VM | Clone from a template already on the remote side | Small SOAP call. Prefer this over uploading an OVA across a WAN. Resumes by reattaching the vCenter task. |
 | Datastores | Inventory + datastore browser | Capacity, free space, browse folders, mkdir, delete file. Last listing is cached when vCenter is unreachable. |
 | Upload ISO / OVA | Local staging, then resumable push | File lands on this machine first. The relay then uploads via Content Library (byte resume) or datastore PUT with retry. |
-| Group by username / corp prefix | Name regex + optional vCenter custom fields | Default: `mzipkin-win11-lab` → owner `mzipkin`. If a VM has a custom field named Owner/User/CreatedBy, that wins. |
+| Group by username / corp prefix | Name regex + optional vCenter custom fields | Default: `atlasdemo-win11-lab` → owner `atlasdemo`. If a VM has a custom field named Owner/User/CreatedBy, that wins. |
 | Per-user report | Aggregated in the Owners view | VM count, on/off/suspended, total vCPU, total RAM, idle candidates. CSV export. |
 | “Not accessed in a long time” | **Inferred**, not true OS last-login | vCenter does not store Windows/Linux last-login. vFleet uses last console ticket, power events, reconfigure/migrate events (lookback window), and `bootTime`. Idle CPU/RAM on a powered-on VM is the stronger reclaim signal. |
 | Reclaim oversized idle labs | Score + confirm UI | Flags powered-on VMs with low utilization, large configured allocations, and stale activity. You can guest-shutdown, hard power-off, or **delete the VM from disk** (powers off first). Destroy datastore is not exposed. |
@@ -227,6 +262,8 @@ Confirmation is operation-specific. Destructive and infrastructure-changing rout
 
 Use a single backend process for one `DATA_DIR`. The worker, current adapter, and connection-switch lock live in process memory; this is not a distributed queue or a multi-worker deployment design. For a consistent backup, stop vFleet and copy its data directory, then preserve the external key through a separate protected backup process. Restoring queued jobs can make them eligible to run again; review their state and target before reconnecting.
 
+Native and container paths differ from source defaults; the complete matrix and a consistent restore procedure are in [Packaging](docs/PACKAGING.md) and [Backup/restore](docs/BACKUP_RESTORE.md).
+
 ## Local relay (flaky VPN)
 
 The browser submits work to the local backend. Its relay executes queued operations against the active endpoint.
@@ -261,15 +298,13 @@ Set `DATA_DIR` if you want the SQLite file and staging directory somewhere other
 Install Git, Python 3 with `venv` and `pip`, and Node.js with npm. The launch scripts require Bash and install the backend and frontend dependencies locally.
 
 ```bash
-git clone https://github.com/VonZippySays/vFleet.git
+git clone https://github.com/zipkindev/vFleet.git
 cd vFleet
 chmod +x scripts/dev.sh scripts/run.sh
 ./scripts/dev.sh
 ```
 
-If GitHub requires authentication for your checkout, use an account with repository access. If you already have a local checkout, run the launch commands from that directory.
-
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a lab cluster with user-prefixed VM names so grouping and reclaim can be clicked through immediately.
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Demo data is shaped like a lab cluster with user-prefixed VM names so grouping and reclaim can be clicked through immediately. Named demo personas use intentionally fictional `*demo` handles, shared/system rows use generic labels, and displayed addresses use documentation ranges.
 
 ## Manage connections from the UI
 
@@ -326,8 +361,8 @@ scripts/vfleet hardware-config VM_ID_A VM_ID_B --cpu 2 --shutdown-before --force
 scripts/vfleet credentials
 scripts/vfleet credential-add "Linux admins" --kind ssh --user operator
 scripts/vfleet connect vcenter.example.com --user administrator@vsphere.local --jump-address access.example.com --jump-host-type auto --jump-credential-id JUMP_CREDENTIAL_ID
-scripts/vfleet tools-deploy CREDENTIAL_ID VM_ID=10.20.1.8 --yes
-scripts/vfleet tools-deploy PFSENSE_CREDENTIAL_ID VM_ID=10.0.0.1 --os pfsense --jump-address 192.168.1.60 --jump-host-type windows --jump-credential-id JUMP_CREDENTIAL_ID --yes
+scripts/vfleet tools-deploy CREDENTIAL_ID VM_ID=192.0.2.108 --yes
+scripts/vfleet tools-deploy PFSENSE_CREDENTIAL_ID VM_ID=198.51.100.1 --os pfsense --jump-address 203.0.113.60 --jump-host-type windows --jump-credential-id JUMP_CREDENTIAL_ID --yes
 scripts/vfleet jobs
 scripts/vfleet job JOB_ID --wait
 ```
@@ -348,13 +383,13 @@ Keep `.env`, the encrypted vault, and especially the separate master key off git
 - Virtual machine **Inventory** (delete from disk) only if you want reclaim destroy enabled
 - Datastore destroy is **not** used
 
-## Production-style single port
+## Source-based single port
 
 ```bash
 ./scripts/run.sh
 ```
 
-Builds the UI and serves it from FastAPI at `http://127.0.0.1:8081` (8080 is often Homebrew nginx on this machine).
+Builds the UI and serves it from FastAPI at `http://127.0.0.1:8081`, leaving the conventional port 8080 available for other local services.
 
 Set `UI_TOKEN` in `.env` and paste the same value into the left-rail **UI token** field if you bind beyond localhost. `run.sh` reads its bind host and port from the **shell environment**, not by sourcing `.env`; for example, `APP_PORT=8090 ./scripts/run.sh` changes its port. The development script always uses loopback ports 5173 and 8081.
 
@@ -362,16 +397,16 @@ The built frontend is served by FastAPI only when `frontend/dist` exists at back
 
 ## Configuration reference
 
-Backend settings load from the repository-root `.env`, with process environment values taking precedence. See [`.env.example`](.env.example) for the bootstrap template and [`config.py`](backend/app/config.py) for the complete settings definition.
+Source runs load settings from the repository-root `.env`; native packages look for `.env` in their platform data directory; containers are configured through their environment. Process environment values take precedence in every mode. See [`.env.example`](.env.example) for the bootstrap template and [`config.py`](backend/app/config.py) for the complete settings definition.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `APP_MODE` | `auto` | `auto` chooses live credentials when available, otherwise demo; explicit modes are `demo`, `vcenter`, and `esxi`. Startup can restore an active saved profile outside explicit demo mode. |
 | `APP_HOST`, `APP_PORT` | Settings: `127.0.0.1`, `8080`; `run.sh`: `127.0.0.1`, `8081` | Launch binding follows the shell/script behavior described above. |
-| `UI_TOKEN` | Empty | Optional shared `X-UI-Token` header check; required by the deployment guidance before non-loopback exposure. |
+| `UI_TOKEN` | Empty for source/native; required by the container entry point | Shared `X-UI-Token` header check; required before any non-loopback exposure. |
 | `VCENTER_HOST`, `VCENTER_USER`, `VCENTER_PASSWORD`, `VCENTER_PORT` | Empty credentials; port `443` | Explicit endpoint bootstrap; saved profiles are preferred for normal switching. |
 | `VCENTER_INSECURE` | `true` | Whether to bypass VMware certificate validation. |
-| `DATA_DIR` | Repository `data/` | Persistent database, vault metadata/encrypted records, and staging. |
+| `DATA_DIR` | Source: repository `data/`; native: platform data directory above; container: `/var/lib/vfleet` | Persistent database, vault metadata/encrypted records, and staging. |
 | `VFLEET_MASTER_KEY_FILE`, `VFLEET_MASTER_KEY` | `~/.vfleet/credential.key`; no injected key | External master-key file or base64-encoded 32-byte process secret. |
 | `CACHE_TTL_SECONDS` | `20` | Adapter cache lifetime, allowed range 5–300 seconds. |
 | `SYNC_INTERVAL_SECONDS` | `30` | Periodic relay inventory interval, allowed range 10–600 seconds. |
@@ -392,9 +427,9 @@ Default pattern: `^([A-Za-z][A-Za-z0-9]+)`
 
 | VM name | Owner |
 | --- | --- |
-| `mzipkin-win11-lab` | `mzipkin` |
-| `jdoe_rhel_lab01` | `jdoe` |
-| `achen.ml-gpu02` | `achen` |
+| `atlasdemo-win11-lab` | `atlasdemo` |
+| `novademo_rhel_lab01` | `novademo` |
+| `oriondemo.ml-gpu02` | `oriondemo` |
 
 Override with `NAME_GROUP_PATTERN` if your corp prefix is different (for example `^corp-([^-]+)-`).
 
@@ -434,7 +469,8 @@ backend/
     grouping.py, reclaim.py, metrics.py Derived reports and utilization
     migration_access.py, errors.py      Privilege helpers and error classification
   tests/                               Isolated API, adapter, and workflow tests
-  requirements.txt                     Pinned Python dependencies
+  requirements.txt                     Pinned runtime dependencies
+  requirements-dev.txt                 Tests and PyInstaller tooling
 frontend/
   src/
     App.tsx                            Navigation, shared state, inventory views
@@ -445,7 +481,13 @@ frontend/
 scripts/
   vfleet                               CLI launcher
   dev.sh, run.sh                        Development and built-UI launchers
-  bump-version.py, install-hooks.sh     Version synchronization and Git hooks
+  build-sidecar.py, smoke-sidecar.py    Native Python sidecar build/check
+  bump-version.py, check-version.py     Release metadata synchronization
+src-tauri/                              Tauri v2 lifecycle shell and bundle config
+packaging/                              PyInstaller desktop entry/specification
+Dockerfile, compose.yaml                Hardened single-worker container path
+.github/workflows/                      Full CI and gated release automation
+docs/                                   Packaging, update, backup, release runbooks
 ESXI_UPGRADE.md                         Upgrade runbook and lab validation record
 VERSION, CHANGELOG.md                   Release metadata
 AGENTS.md, AGENT_PROJECT_INDEX.md        Contributor guidance and source index
@@ -463,7 +505,7 @@ Run backend validation in an isolated demo environment:
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest
 ```
 
@@ -473,12 +515,12 @@ From the repository root, validate the frontend with:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run typecheck
 npm run build
 ```
 
-The build also runs TypeScript checking. There is no checked-in live-vCenter integration suite or CI workflow. The [upgrade runbook](ESXI_UPGRADE.md) separately records a completed ESXi lab upgrade; that is not automated integration coverage. Changes to VMware operations, privileges, transfers, or deployment paths need operator validation in an appropriate test environment in addition to local tests.
+The build also runs TypeScript checking. GitHub Actions runs the full backend suite, Python/npm/Rust dependency audits, frontend typecheck/build, container health/auth/hardening and vulnerability/secret checks, packaged-sidecar smoke, and native packaging on matching Windows, macOS, and Linux runners. There is still no checked-in live-vCenter integration suite. The [upgrade runbook](ESXI_UPGRADE.md) separately records a completed ESXi lab upgrade; that is not automated integration coverage. Changes to VMware operations, privileges, transfers, or deployment paths need operator validation in an appropriate test environment in addition to CI.
 
 ## Troubleshooting
 
@@ -497,7 +539,7 @@ The build also runs TypeScript checking. There is no checked-in live-vCenter int
 
 ## License
 
-Copyright (C) 2026 Michael Zipkin
+Copyright (C) 2026 vFleet contributors
 
 This program is free software: you can redistribute it and/or modify it under the terms of the
 **GNU Affero General Public License** as published by the Free Software Foundation, either version 3

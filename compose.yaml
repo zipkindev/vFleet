@@ -1,0 +1,30 @@
+services:
+  vfleet:
+    build:
+      context: .
+      args:
+        VERSION: ${VFLEET_VERSION:-dev}
+    image: ${VFLEET_IMAGE:-ghcr.io/zipkindev/vfleet:latest}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${VFLEET_PORT:-8080}:8080"
+    environment:
+      APP_MODE: ${APP_MODE:-auto}
+      UI_TOKEN: ${UI_TOKEN:?Set a non-empty UI_TOKEN before starting vFleet}
+      VCENTER_INSECURE: ${VCENTER_INSECURE:-true}
+    volumes:
+      - vfleet-data:/var/lib/vfleet
+      - vfleet-key:/var/lib/vfleet-key
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+    pids_limit: 256
+
+volumes:
+  vfleet-data:
+  vfleet-key:

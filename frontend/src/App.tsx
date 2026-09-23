@@ -787,7 +787,14 @@ export function App() {
         </div>
 
         <footer className="rail-credit">
-          <a href="mailto:Michael@Zipkin.dev" className="rail-credit-email">Michael@Zipkin.dev</a>
+          <a
+            href="https://github.com/zipkindev/vFleet"
+            className="rail-credit-email"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Source and license
+          </a>
           <span className="rail-credit-license">GNU AGPL v3 — source must be shared if deployed as a service.</span>
         </footer>
       </aside>

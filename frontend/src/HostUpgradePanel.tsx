@@ -247,7 +247,7 @@ export function HostUpgradePanel() {
       </>}
       {usbAllowed && <section className="upgrade-usb stack">
         <div><h3>Create installer USB</h3>
-          <p>vFleet uses the verified staged ISO. Windows writes the complete image directly to the selected USB, so a separate format step is unnecessary. The selected disk is erased.</p>
+          <p>Available only from the native Windows application on the computer with the attached USB. macOS, Linux, and container builds report this writer as unavailable. Windows writes the verified image directly, erasing the selected disk.</p>
         </div>
         <button disabled={Boolean(busy)} onClick={() => void scanUsbDevices()}>{usbInventory ? "Rescan USB disks" : "Scan USB disks"}</button>
         {usbInventory?.supported && <>

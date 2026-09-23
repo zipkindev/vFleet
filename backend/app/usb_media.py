@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import UUID
@@ -184,9 +185,23 @@ catch {
 
 
 def _powershell() -> str:
-    executable = shutil.which("powershell.exe") or (shutil.which("powershell") if os.name == "nt" else None)
-    if not executable:
-        raise PermanentError("USB creation requires local Windows PowerShell; it is unavailable on this vFleet host")
+    executable = None
+    if sys.platform == "win32":
+        executable = shutil.which("powershell.exe") or shutil.which("powershell")
+    if sys.platform != "win32" or not executable:
+        runtime = os.getenv("VFLEET_RUNTIME", "").strip().lower()
+        if runtime == "container":
+            location = "the vFleet container image"
+        elif sys.platform == "darwin":
+            location = "the macOS desktop application"
+        elif sys.platform.startswith("linux"):
+            location = "the Linux desktop application"
+        else:
+            location = "this vFleet host"
+        raise PermanentError(
+            f"USB creation is unavailable in {location}; use the native Windows application "
+            "on the computer where the USB disk is attached"
+        )
     return executable
 
 

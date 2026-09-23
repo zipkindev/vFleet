@@ -137,7 +137,7 @@ export function NewVmModal({
             </label>
             <label>
               Name
-              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="mizipkin-win11-lab2" required />
+              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="atlasdemo-win11-lab2" required />
             </label>
             <div className="login-grid">
               <label>

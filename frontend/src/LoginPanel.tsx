@@ -287,7 +287,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
             autoFocus
             value={host}
             onChange={(event) => { setHost(event.target.value); setSshFingerprint(""); }}
-            placeholder="vcenter.example.com or 192.168.1.20"
+            placeholder="vcenter.example.com"
             autoComplete="off"
             name="vcenter-host"
           />
@@ -336,7 +336,7 @@ export function LoginPanel({ connection, profile, blank = false, onClose, onConn
           {jumpEnabled ? (
             <>
               <div className="login-grid">
-                <label>Jump-host address<input value={jumpAddress} onChange={(event) => { setJumpAddress(event.target.value); clearJumpReview(); }} placeholder="access.example.com or 192.168.1.60" /></label>
+                <label>Jump-host address<input value={jumpAddress} onChange={(event) => { setJumpAddress(event.target.value); clearJumpReview(); }} placeholder="access.example.com" /></label>
                 <label>SSH port<input value={jumpPort} onChange={(event) => { setJumpPort(event.target.value); clearJumpReview(); }} inputMode="numeric" /></label>
               </div>
               <label>

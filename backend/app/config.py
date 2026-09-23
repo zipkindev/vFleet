@@ -1,17 +1,41 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import List, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-ROOT = Path(__file__).resolve().parents[2]
+
+def _runtime_root() -> Path:
+    """Return the source tree or PyInstaller extraction root."""
+
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parents[2]
+
+
+def _packaged_data_dir(platform: str, environ: dict[str, str], home: Path) -> Path:
+    if platform == "win32":
+        base = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        return base / "vFleet"
+    if platform == "darwin":
+        return home / "Library" / "Application Support" / "vFleet"
+    base = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+    return base / "vfleet"
+
+
+ROOT = _runtime_root()
+PACKAGED = bool(getattr(sys, "frozen", False))
+DEFAULT_DATA_DIR = _packaged_data_dir(sys.platform, os.environ, Path.home()) if PACKAGED else ROOT / "data"
+DEFAULT_ENV_FILE = DEFAULT_DATA_DIR / ".env" if PACKAGED else ROOT / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(ROOT / ".env"),
+        env_file=str(DEFAULT_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -56,7 +80,7 @@ class Settings(BaseSettings):
     event_lookback_days: int = 30
 
     cache_ttl_seconds: int = Field(default=20, ge=5, le=300)
-    data_dir: Path = Field(default=ROOT / "data")
+    data_dir: Path = Field(default=DEFAULT_DATA_DIR)
     relay_tick_seconds: float = Field(default=1.0, ge=0.2, le=30)
     sync_interval_seconds: int = Field(default=30, ge=10, le=600)
     connect_timeout_seconds: int = Field(default=20, ge=5, le=120)

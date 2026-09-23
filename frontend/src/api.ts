@@ -268,9 +268,10 @@ export function vcenterVmConsoleUrl(host: string, vmId: string, port = 443): str
 export const VMRC_INSTALL_URL =
   "https://support.broadcom.com/group/ecx/productdownloads?subfamily=VMware%20Remote%20Console";
 
-/** Launch vmrc:// and other custom protocol URIs without leaving a blank browser tab. */
+/** Launch only the external schemes used by vFleet console workflows. */
 export function launchExternalUri(uri: string): void {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(uri) && !/^https?:/i.test(uri)) {
+  const url = new URL(uri);
+  if (url.protocol === "vmrc:") {
     const link = document.createElement("a");
     link.href = uri;
     link.style.display = "none";
@@ -279,7 +280,11 @@ export function launchExternalUri(uri: string): void {
     link.remove();
     return;
   }
-  window.open(uri, "_blank", "noopener,noreferrer");
+  if (url.protocol === "https:") {
+    window.open(uri, "_blank", "noopener,noreferrer");
+    return;
+  }
+  throw new Error(`Blocked unsupported console URL scheme: ${url.protocol}`);
 }
 
 export async function fetchCatalog(): Promise<Catalog> {

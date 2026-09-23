@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.0] — 2026-09-22
+
+- Package the existing React/FastAPI application as a native Tauri desktop app for Windows, macOS, and Linux, with a PyInstaller backend sidecar, loopback-only startup, durable user data, and active-job close protection.
+- Add hardened, non-root Docker and Compose delivery for amd64 and arm64 with a required UI token, read-only root filesystem, dropped capabilities, separate data/key volumes, and single-worker enforcement.
+- Add private CI and public-release automation covering the backend suite, dependency and container-image security audits, frontend typecheck/build, packaged-sidecar smoke tests, native packages on matching operating systems, multi-architecture GHCR publication, checksums, and GitHub Releases.
+- Document platform installation, unsigned-package warnings, updates, backup/restore, security reporting, validation, and the gated release procedure.
+- Make USB installer writing explicitly Windows-native while macOS, Linux, and container builds fail closed with actionable guidance.
+- Replace personal-looking demo identities and addresses with clearly synthetic examples, add current UI screenshots, and synchronize all package metadata under AGPL-3.0-or-later.
+
 ## [1.2.2] — 2026-09-12
 
 - Expand the README with a page-by-page feature guide, architecture diagram, request and job lifecycles, local storage and security boundaries, configuration reference, source map, validation instructions, and troubleshooting.

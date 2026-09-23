@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -11,6 +12,17 @@ from app.relay import RelayWorker
 from app.store import LocalStore
 from app.main import app
 from app.profiles import ConnectionProfile
+
+
+def _wait_job(client: TestClient, job_id: str) -> dict:
+    job = None
+    for _ in range(100):
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.05)
+    assert job is not None
+    return job
 
 
 class ToolsAdapter:
@@ -86,7 +98,7 @@ def test_pfsense_tools_job_uses_root_ssh_through_pinned_jump(tmp_path, monkeypat
     jump_credential = worker.automation_credentials.save(
         name="jump host",
         kind="ssh",
-        username="mzipkin.wa",
+        username="jump.operator",
         secret="jump-secret",
         scope="global",
         endpoint_fingerprint="",
@@ -116,13 +128,18 @@ def test_pfsense_tools_job_uses_root_ssh_through_pinned_jump(tmp_path, monkeypat
     result = worker._deploy_guest_tools(job, adapter, {})
 
     assert result["os_family"] == "pfsense"
-    assert captured["preflight_jump"]["username"] == "mzipkin.wa"
+    assert captured["preflight_jump"]["username"] == "jump.operator"
     assert captured["install_jump"]["host_key_sha256"] == "SHA256:jump"
     assert "secret" not in str(job.payload)
     assert "jump-secret" not in str(job.payload)
 
 
-def test_tools_api_queues_secret_free_job_and_vault_never_returns_secret():
+def test_tools_api_queues_secret_free_job_and_vault_never_returns_secret(monkeypatch):
+    monkeypatch.setattr(
+        RelayWorker,
+        "_deploy_guest_tools",
+        lambda self, job, adapter, progress: {"test": "completed without remote access"},
+    )
     with TestClient(app) as client:
         created = client.post("/api/automation-credentials", json={
             "name": "API Windows admin",
@@ -150,6 +167,7 @@ def test_tools_api_queues_secret_free_job_and_vault_never_returns_secret():
         assert len(queued.json()["jobs"]) == 1
         assert "must-never-appear-in-job" not in queued.text
         assert queued.json()["jobs"][0]["payload"]["credential_id"] == credential_id
+        assert _wait_job(client, queued.json()["jobs"][0]["id"])["status"] == "succeeded"
 
 
 def test_ssh_host_key_review_uses_vaulted_pinned_jump_credential(monkeypatch):
@@ -286,7 +304,12 @@ def test_connection_editor_lists_credentials_scoped_to_that_saved_profile():
             app.state.automation_credentials.delete(credential.id)
 
 
-def test_pfsense_api_queues_root_target_and_jump_credentials_without_secrets():
+def test_pfsense_api_queues_root_target_and_jump_credentials_without_secrets(monkeypatch):
+    monkeypatch.setattr(
+        RelayWorker,
+        "_deploy_guest_tools",
+        lambda self, job, adapter, progress: {"test": "completed without remote access"},
+    )
     with TestClient(app) as client:
         target = client.post("/api/automation-credentials", json={
             "name": "API pfSense root",
@@ -329,6 +352,7 @@ def test_pfsense_api_queues_root_target_and_jump_credentials_without_secrets():
         assert payload["jump_credential_id"] == jump.json()["id"]
         assert "target-password-must-stay-secret" not in queued.text
         assert "jump-password-must-stay-secret" not in queued.text
+        assert _wait_job(client, queued.json()["jobs"][0]["id"])["status"] == "succeeded"
 
 
 def test_pfsense_dry_run_preflight_does_not_queue_install(monkeypatch):

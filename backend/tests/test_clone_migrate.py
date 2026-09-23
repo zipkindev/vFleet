@@ -66,7 +66,7 @@ def test_clone_migrate_just_clone_keeps_source():
 def test_clone_migrate_destroy_replaces_on_host():
     with TestClient(app) as client:
         inventory = client.get("/api/inventory").json()
-        candidates = [item for item in inventory["vms"] if item["name"] == "mzipkin-k8s-cp"]
+        candidates = [item for item in inventory["vms"] if item["name"] == "atlasdemo-k8s-cp"]
         vm = candidates[0] if candidates else next(item for item in inventory["vms"] if item["cluster_id"])
         host = next(h for h in inventory["hosts"] if h["id"] != vm["host_id"] and h["cluster_id"] == vm["cluster_id"])
         original = vm["name"]
