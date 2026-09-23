@@ -319,7 +319,9 @@ jobs:
           find release-artifacts -type f -name 'linux-x86_64-*.rpm' -print -quit | grep .
       - name: Create SHA-256 manifest
         working-directory: release-artifacts
-        run: find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum --check SHA256SUMS
       - name: Create or update draft release, then publish
         env:
           GH_TOKEN: ${{ github.token }}
