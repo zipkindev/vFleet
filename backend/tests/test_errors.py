@@ -21,8 +21,10 @@ NOT_AUTH = (
 
 def test_humanize_nginx_404_mentions_api_path():
     text = humanize_vcenter_error(NGINX_404, host="vcn02.example.com")
-    assert "404" in text
-    assert "vcn02.example.com" in text
+    assert text == (
+        "vCenter (vcn02.example.com) answered HTTP 404 for the API path "
+        "(UI may still work). Check host/port or try again after VPN settles."
+    )
     assert "<html" not in text.lower()
     assert "nginx" not in text.lower()
 
