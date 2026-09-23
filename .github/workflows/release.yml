@@ -58,6 +58,11 @@ jobs:
       - name: Run backend suite
         working-directory: backend
         run: python -m pytest -q
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file wget libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
       - name: Audit Rust dependencies
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml --check

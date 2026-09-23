@@ -70,6 +70,11 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file wget libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
       - name: Check and test desktop shell
         working-directory: src-tauri
         run: |
