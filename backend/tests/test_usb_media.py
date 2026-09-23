@@ -77,6 +77,24 @@ def test_usb_inventory_rejects_non_windows_even_if_powershell_is_on_path(monkeyp
     assert "Linux desktop application" in inventory["message"]
 
 
+def test_usb_inventory_does_not_expose_internal_exception_details(monkeypatch):
+    monkeypatch.setenv("VFLEET_RUNTIME", "container")
+
+    def fail(_script):
+        raise PermanentError(r"C:\\Users\\operator\\secret-path: internal failure")
+
+    monkeypatch.setattr(usb_media, "_run_powershell", fail)
+
+    inventory = usb_media.list_usb_devices()
+
+    assert inventory["supported"] is False
+    assert inventory["message"] == (
+        "USB creation is unavailable in the vFleet container image; use the native Windows application "
+        "on the computer where the USB disk is attached"
+    )
+    assert "secret-path" not in inventory["message"]
+
+
 def test_usb_write_requires_typed_confirmation_and_exact_rescan_identity(monkeypatch, tmp_path):
     plan_id = uuid4()
     plan = {

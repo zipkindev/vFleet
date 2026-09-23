@@ -184,24 +184,30 @@ catch {
 """
 
 
+def _usb_unavailable_message() -> str:
+    runtime = os.getenv("VFLEET_RUNTIME", "").strip().lower()
+    if runtime == "container":
+        location = "the vFleet container image"
+    elif sys.platform == "darwin":
+        location = "the macOS desktop application"
+    elif sys.platform.startswith("linux"):
+        location = "the Linux desktop application"
+    elif sys.platform == "win32":
+        return "USB inventory is unavailable on this Windows host; verify Windows PowerShell and try again"
+    else:
+        location = "this vFleet host"
+    return (
+        f"USB creation is unavailable in {location}; use the native Windows application "
+        "on the computer where the USB disk is attached"
+    )
+
+
 def _powershell() -> str:
     executable = None
     if sys.platform == "win32":
         executable = shutil.which("powershell.exe") or shutil.which("powershell")
     if sys.platform != "win32" or not executable:
-        runtime = os.getenv("VFLEET_RUNTIME", "").strip().lower()
-        if runtime == "container":
-            location = "the vFleet container image"
-        elif sys.platform == "darwin":
-            location = "the macOS desktop application"
-        elif sys.platform.startswith("linux"):
-            location = "the Linux desktop application"
-        else:
-            location = "this vFleet host"
-        raise PermanentError(
-            f"USB creation is unavailable in {location}; use the native Windows application "
-            "on the computer where the USB disk is attached"
-        )
+        raise PermanentError(_usb_unavailable_message())
     return executable
 
 
@@ -242,8 +248,13 @@ def list_usb_devices() -> dict:
             })
         return {"supported": True, "platform": "Windows PowerShell", "devices": devices,
                 "message": "Raw-writing the ISO erases the complete selected USB; no separate formatting step is needed."}
-    except PermanentError as exc:
-        return {"supported": False, "platform": "unavailable", "devices": [], "message": str(exc)}
+    except PermanentError:
+        return {
+            "supported": False,
+            "platform": "unavailable",
+            "devices": [],
+            "message": _usb_unavailable_message(),
+        }
 
 
 def validate_usb_write(store, spec: UsbWriteRequest) -> tuple[dict, Path, dict]:

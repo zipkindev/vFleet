@@ -99,6 +99,11 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 ALLOWED_ACTIONS = {"start", "shutdown", "power_off", "reboot", "reset", "suspend", "mount_tools", "destroy"}
 
 
+def _spa_index_response(_full_path: str = "") -> FileResponse:
+    """Return the SPA entry point without mapping an untrusted route to disk."""
+    return FileResponse(FRONTEND_DIST / "index.html")
+
+
 def get_adapter(request: Request) -> InventoryAdapter:
     return request.app.state.adapter
 
@@ -1989,7 +1994,4 @@ if FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        candidate = FRONTEND_DIST / full_path
-        if full_path and candidate.exists() and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(FRONTEND_DIST / "index.html")
+        return _spa_index_response(full_path)
