@@ -72,6 +72,7 @@ jobs:
           cargo fmt --manifest-path src-tauri/Cargo.toml --check
           cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path src-tauri/Cargo.toml --locked
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --release --test glib_variant_str_iter
           cargo install cargo-audit --version 0.22.2 --locked
           cargo audit --file src-tauri/Cargo.lock
       - name: Typecheck, build, and audit JavaScript

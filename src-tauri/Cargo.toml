@@ -17,6 +17,14 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 
+# GTK3 requires glib 0.18; backport the upstream iterator safety fix until
+# Tauri's Linux stack can use glib >= 0.20. See vendor/glib/VFLEET-PATCH.md.
+[patch.crates-io]
+glib = { path = "vendor/glib" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glib = "0.18"
+
 [profile.release]
 codegen-units = 1
 lto = true
