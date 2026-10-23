@@ -9,6 +9,11 @@ RUN npm run build
 
 FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS runtime
 
+# Apply Debian security fixes newer than the pinned base image.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade libpcre2-8-0 perl-base \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG VERSION=dev
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="vFleet" \
