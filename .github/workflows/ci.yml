@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: "7"
+
 jobs:
   backend:
     name: Backend tests

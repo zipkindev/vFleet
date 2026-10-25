@@ -19,6 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: "7"
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
@@ -239,7 +240,7 @@ jobs:
           name: release-${{ matrix.artifact }}
           path: release-artifacts/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
 
   publish-container:
     name: Publish multi-architecture container
